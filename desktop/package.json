@@ -1,0 +1,58 @@
+{
+  "name": "live-review-desktop",
+  "version": "1.1.0",
+  "description": "尊者直播监控桌面界面",
+  "main": "electron/main.cjs",
+  "author": "Zunzhe",
+  "scripts": {
+    "icons": "node scripts/make-icons.cjs",
+    "dev": "vite",
+    "build": "npm run icons && vite build",
+    "start": "npm run build && electron .",
+    "pack": "npm run build && electron-builder --win portable",
+    "electron:dev": "concurrently \"vite\" \"wait-on http://127.0.0.1:5173 && electron .\""
+  },
+  "build": {
+    "appId": "com.zunzhe.livemonitor",
+    "productName": "尊者直播监控",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**",
+      "electron/**",
+      "assets/**",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "assets/icon.ico"
+    },
+    "portable": {
+      "artifactName": "尊者直播监控-${version}-便携版.exe"
+    }
+  },
+  "dependencies": {
+    "@ant-design/icons": "^5.3.0",
+    "antd": "^5.15.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.2.1",
+    "concurrently": "^8.2.2",
+    "electron": "^29.1.0",
+    "electron-builder": "^26.15.3",
+    "sharp": "^0.35.3",
+    "to-ico": "^1.1.5",
+    "vite": "^5.1.4",
+    "wait-on": "^7.2.0"
+  }
+}

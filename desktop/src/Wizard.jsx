@@ -1,0 +1,104 @@
+import React, { useState } from 'react'
+import { Button, Form, Input, Modal, Steps, Switch, message } from 'antd'
+
+export default function SetupWizard({ open, onDone }) {
+  const [step, setStep] = useState(0)
+  const [form] = Form.useForm()
+  const [saving, setSaving] = useState(false)
+
+  const finish = async () => {
+    setSaving(true)
+    try {
+      const v = form.getFieldsValue()
+      if (v.serverChanKey?.trim()) {
+        await window.desktop.cli('set-config', 'config', '推送配置', 'server酱SendKey', v.serverChanKey.trim())
+      }
+      await window.desktop.cli('set-app-prefs', JSON.stringify({
+        autoStartServices: v.autoStartServices !== false,
+        watchdog: v.watchdog !== false,
+        localNotify: v.localNotify !== false,
+        openAtLogin: !!v.openAtLogin,
+        wizardDone: true,
+      }))
+      if (v.openAtLogin && window.desktop.setLoginItem) {
+        await window.desktop.setLoginItem(true)
+      }
+      await window.desktop.cli('ensure-services')
+      message.success('初始化完成，监控服务已在后台运行')
+      onDone()
+    } catch (e) {
+      message.error(String(e.message || e))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const steps = [
+    {
+      title: '欢迎',
+      content: (
+        <div>
+          <p>欢迎使用 <b>尊者直播监控</b>。下面 30 秒完成基础配置即可开始用。</p>
+          <ul style={{ paddingLeft: 20, lineHeight: 1.8 }}>
+            <li>后台会自动监控直播开播 & 博主新视频</li>
+            <li>重要主播可单独设「微信通知」</li>
+            <li>服务崩溃会自动拉起（可关）</li>
+          </ul>
+        </div>
+      ),
+    },
+    {
+      title: '通知',
+      content: (
+        <>
+          <p style={{ color: '#94a3b8', marginBottom: 12 }}>
+            推荐 Server酱 推微信（免费每天约 5 条）。代理环境下比邮件可靠。
+          </p>
+          <Form form={form} layout="vertical" initialValues={{ localNotify: true }}>
+            <Form.Item label="Server酱 SendKey（可选，稍后可在全局设置里填）" name="serverChanKey">
+              <Input.Password placeholder="SCTxxxxxxxx..." />
+            </Form.Item>
+            <Form.Item label="同时弹出 Windows 桌面通知（兜底）" name="localNotify" valuePropName="checked">
+              <Switch defaultChecked />
+            </Form.Item>
+          </Form>
+        </>
+      ),
+    },
+    {
+      title: '后台',
+      content: (
+        <Form form={form} layout="vertical" initialValues={{ autoStartServices: true, watchdog: true, openAtLogin: false }}>
+          <Form.Item label="打开软件时自动启动监控服务" name="autoStartServices" valuePropName="checked">
+            <Switch defaultChecked />
+          </Form.Item>
+          <Form.Item label="服务异常退出时自动重启（守护）" name="watchdog" valuePropName="checked">
+            <Switch defaultChecked />
+          </Form.Item>
+          <Form.Item label="开机自动启动（登录后托盘运行）" name="openAtLogin" valuePropName="checked">
+            <Switch />
+          </Form.Item>
+        </Form>
+      ),
+    },
+  ]
+
+  return (
+    <Modal
+      title="首次使用向导"
+      open={open}
+      closable={false}
+      maskClosable={false}
+      width={560}
+      footer={[
+        step > 0 && <Button key="prev" onClick={() => setStep(step - 1)}>上一步</Button>,
+        step < steps.length - 1
+          ? <Button key="next" type="primary" onClick={() => setStep(step + 1)}>下一步</Button>
+          : <Button key="done" type="primary" loading={saving} onClick={finish}>完成并开始监控</Button>,
+      ]}
+    >
+      <Steps current={step} size="small" items={steps.map((s) => ({ title: s.title }))} style={{ marginBottom: 20 }} />
+      {steps[step].content}
+    </Modal>
+  )
+}
