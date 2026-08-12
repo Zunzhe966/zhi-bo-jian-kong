@@ -53,3 +53,40 @@ pub fn write_app_prefs(project_dir: &Path, updates: &Value) -> Result<Value> {
     std::fs::write(&path, text + "\n")?;
     Ok(prefs)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_are_stable_and_unknown_keys_are_dropped() {
+        let dir = std::env::temp_dir().join(format!("zunzhe-prefs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+
+        let before = read_app_prefs(&dir);
+        assert_eq!(before["watchdog"], json!(true));
+        assert_eq!(before["openAtLogin"], json!(false));
+
+        let written =
+            write_app_prefs(&dir, &json!({"wizardDone": true, "unknownKey": "应被忽略"})).unwrap();
+        assert_eq!(written["wizardDone"], json!(true));
+        assert!(written.get("unknownKey").is_none());
+
+        // 重新读取验证落盘，而不是只返回内存值。
+        let after = read_app_prefs(&dir);
+        assert_eq!(after["wizardDone"], json!(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_missing_file_returns_defaults() {
+        let dir = std::env::temp_dir().join(format!("zunzhe-prefs-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        let prefs = read_app_prefs(&dir);
+        assert_eq!(prefs["watchdog"], json!(true));
+        assert_eq!(prefs["autoStartServices"], json!(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -141,3 +141,45 @@ pub enum TrainingRecord {
         end_sec: f64,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn video_meta_round_trips_json() {
+        let meta = VideoMeta {
+            id: "BV1xx411c7mD".into(),
+            platform: "bilibili".into(),
+            url: "https://www.bilibili.com/video/BV1xx411c7mD".into(),
+            title: "测试视频".into(),
+            cover: "https://example.com/cover.jpg".into(),
+            published_at: "2026-08-01 12:00:00".into(),
+            duration: 120,
+        };
+        let json = serde_json::to_value(&meta).unwrap();
+        let back: VideoMeta = serde_json::from_value(json).unwrap();
+        assert_eq!(back.id, meta.id);
+        assert_eq!(back.url, meta.url);
+        assert_eq!(back.duration, 120);
+    }
+
+    #[test]
+    fn training_record_serializes_with_type_tag() {
+        let rec = TrainingRecord::Knowledge {
+            anchor: "主播甲".into(),
+            session: "20260801-120000".into(),
+            date: "2026-08-01".into(),
+            output_dir: "/tmp/session".into(),
+            title: "知识点".into(),
+            content: "内容".into(),
+            start_sec: 1.5,
+            end_sec: 3.0,
+            value: 3,
+        };
+        let value = serde_json::to_value(rec).unwrap();
+        assert_eq!(value["type"], json!("knowledge"));
+        assert_eq!(value["anchor"], json!("主播甲"));
+    }
+}

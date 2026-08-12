@@ -145,6 +145,8 @@ enum Command {
     SetConfigBulk { updates: String },
     /// 返回配置结构说明
     Schema,
+    /// 打印 MCP 接入说明（Python 版兼容命令）
+    McpInfo,
     /// 列出复盘产物
     Notes {
         #[arg(default_value = "")]
@@ -483,6 +485,17 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Schema => {
             println!("{}", api.schema());
         }
+        Command::McpInfo => {
+            println!(
+                "{}",
+                json!({
+                    "mcp_command": "zunzhe-core mcp",
+                    "cwd": project_dir,
+                    "config_example": project_dir.join("mcp.json.example"),
+                    "hint": "在 Cursor / OpenCode 等智能体的 MCP 设置中添加 stdio 服务器",
+                })
+            );
+        }
         Command::Notes { name } => {
             let notes = pipeline_bridge::list_notes(&fupan_dir, &name)?;
             println!("{}", json!({"ok": true, "notes": notes}));
@@ -592,4 +605,125 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Python 版 CLI 命令全集必须都能被 Rust 解析（参数以示例形式覆盖）。
+    /// 这里只验证命令解析，不执行真实文件操作。
+    #[test]
+    fn all_python_cli_commands_parse() {
+        let cases: &[&[&str]] = &[
+            &["zunzhe-core", "status"],
+            &[
+                "zunzhe-core",
+                "add-live",
+                "https://live.bilibili.com/1",
+                "主播甲",
+                "原画",
+            ],
+            &["zunzhe-core", "remove-live", "https://live.bilibili.com/1"],
+            &["zunzhe-core", "delete-live", "https://live.bilibili.com/1"],
+            &[
+                "zunzhe-core",
+                "set-notify",
+                "https://live.bilibili.com/1",
+                "邮箱",
+                "主播甲",
+            ],
+            &["zunzhe-core", "list-live"],
+            &["zunzhe-core", "check-live", "https://live.bilibili.com/1"],
+            &[
+                "zunzhe-core",
+                "add-video",
+                "https://space.bilibili.com/1",
+                "博主",
+                "是",
+            ],
+            &[
+                "zunzhe-core",
+                "download-video",
+                "https://www.bilibili.com/video/BV1xx411c7mD",
+                "手动下载",
+            ],
+            &[
+                "zunzhe-core",
+                "blogger-videos",
+                "https://space.bilibili.com/1",
+                "10",
+            ],
+            &["zunzhe-core", "video-library", "src", "anchor", "1"],
+            &[
+                "zunzhe-core",
+                "export-training-data",
+                "主播甲",
+                "/tmp/out.jsonl",
+            ],
+            &["zunzhe-core", "email-status"],
+            &[
+                "zunzhe-core",
+                "email-setup",
+                "me@qq.com",
+                "auth",
+                "me@qq.com",
+            ],
+            &["zunzhe-core", "email-import-legacy", "legacy.ini"],
+            &[
+                "zunzhe-core",
+                "remove-video",
+                "https://space.bilibili.com/1",
+            ],
+            &["zunzhe-core", "list-video"],
+            &["zunzhe-core", "start"],
+            &["zunzhe-core", "ensure-services"],
+            &["zunzhe-core", "stop"],
+            &["zunzhe-core", "tail-logs", "live_monitor", "20"],
+            &["zunzhe-core", "get-app-prefs"],
+            &["zunzhe-core", "set-app-prefs", "{}"],
+            &["zunzhe-core", "wizard-done"],
+            &["zunzhe-core", "doctor"],
+            &["zunzhe-core", "check-videos"],
+            &["zunzhe-core", "process", "/tmp/a.mp4", "主播甲"],
+            &["zunzhe-core", "notes"],
+            &["zunzhe-core", "test-email"],
+            &["zunzhe-core", "test-notify"],
+            &["zunzhe-core", "get-config", "all", "", ""],
+            &[
+                "zunzhe-core",
+                "set-config",
+                "fupan_config",
+                "视频监控",
+                "检查间隔秒",
+                "60",
+            ],
+            &["zunzhe-core", "set-config-bulk", "{}"],
+            &["zunzhe-core", "schema"],
+            &["zunzhe-core", "mcp-info"],
+            &["zunzhe-core", "service-status"],
+            &[
+                "zunzhe-core",
+                "record-live",
+                "https://live.bilibili.com/1",
+                "0",
+            ],
+            &["zunzhe-core", "run-daemon"],
+        ];
+        for case in cases {
+            let result = Cli::try_parse_from(*case);
+            assert!(
+                result.is_ok(),
+                "Python 命令未能解析为 Rust CLI: {:?} -> {:?}",
+                case,
+                result.err()
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_info_requires_no_extra_args() {
+        let cli = Cli::try_parse_from(["zunzhe-core", "mcp-info"]).unwrap();
+        assert!(matches!(cli.command, Command::McpInfo));
+    }
 }
