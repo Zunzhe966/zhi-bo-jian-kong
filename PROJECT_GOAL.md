@@ -50,7 +50,7 @@ Python 工具层  faster-whisper / LLM 提炼 / ffmpeg 切片 / yt-dlp 兜底
 | D | 通知简化（邮箱默认+覆盖+兜底） | ✅ 已完成 |
 | E | Rust 骨架 zunzhe-core（cargo/schema/CLI 对齐/Platform trait/BilibiliAdapter） | ✅ 已完成 |
 | G | QQ 邮箱通知链路：配置助手/状态诊断/老项目迁移/桌面端一键填入 | ✅ 已完成（授权码需用户提供） |
-| F | 交付：git 提交、文档图谱更新、汇报 | 🔄 本次收尾 |
+| F | 交付：git 提交、文档图谱更新、三平台 CI、汇报 | ✅ 已完成 |
 
 ### Rust 三平台 CI
 - `.github/workflows/rust-core.yml` 会在 push/PR 时对 `zunzhe-core` 在
@@ -60,7 +60,7 @@ Python 工具层  faster-whisper / LLM 提炼 / ffmpeg 切片 / yt-dlp 兜底
 
 ### Rust 重构（zunzhe-core）已交付能力
 
-- M0-M12 全部完成并通过 `cargo test`（28 个测试）+ `cargo clippy` + `cargo fmt`
+- M0-M17 全部完成并通过 `cargo test`（50 个测试 + 4 集成契约测试）+ `cargo clippy` + `cargo fmt`
 - M13 组装收尾：macOS 守护脚本、launchd 模板、使用说明、图谱更新
 - CLI/MCP 命令与 Python 版对齐；SQLite 持久化、崩溃可恢复、任务失败只记日志不拖垮 daemon
 - CLI/MCP 已对齐 `delete-live / set-notify / ensure-services / tail-logs /
