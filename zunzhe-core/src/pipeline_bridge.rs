@@ -167,6 +167,17 @@ pub async fn run_pipeline(
         .await
 }
 
+/// 仅凭项目根构造并运行，供录制后台任务使用。
+pub async fn run_pipeline_by_project(
+    project_dir: &Path,
+    media_path: &str,
+    record_name: &str,
+) -> Result<PipelineSummary> {
+    PythonTool::from_project(project_dir)
+        .run_pipeline(media_path, record_name)
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

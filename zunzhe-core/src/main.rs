@@ -3,6 +3,7 @@ mod config;
 mod config_api;
 mod db;
 mod download;
+mod live_monitor;
 mod mcp;
 mod model;
 mod notify;

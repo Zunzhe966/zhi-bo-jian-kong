@@ -5,8 +5,8 @@ use serde_json::json;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
 
 use crate::{
-    config, config_api, db, download, notify, pipeline_bridge, platform, scheduler, service,
-    training_data, video_library, watchlist,
+    config, config_api, db, download, live_monitor, notify, pipeline_bridge, platform, scheduler,
+    service, training_data, video_library, watchlist,
 };
 
 #[derive(Debug, Parser)]
@@ -204,13 +204,26 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             let room = rooms
                 .into_iter()
                 .find(|r| r.url == url || r.url.trim_end_matches('/') == url.trim_end_matches('/'));
+            let status = if let Some(r) = &room {
+                let adapter = live_monitor::resolve_live_with_cookie(
+                    &r.url,
+                    &cfg.get_main("Cookie", "b站cookie"),
+                );
+                match adapter.check(&r.url).await {
+                    Ok(s) => serde_json::to_value(&s).ok(),
+                    Err(e) => Some(json!({"error": e.to_string()})),
+                }
+            } else {
+                None
+            };
             println!(
                 "{}",
                 json!({
                     "url": url,
                     "found": found,
                     "room": room,
-                    "hint": "Rust daemon 运行中会自动检测开播"
+                    "status": status,
+                    "hint": "Rust daemon 运行中会自动检测并录制开播"
                 })
             );
         }
@@ -418,6 +431,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             duration,
             interval,
         } => {
+            // --once 语义：先跑一轮完整 daemon tick，便于验证直播+视频+下载全链路。
+            service::write_rust_daemon_pid(&project_dir, std::process::id());
             scheduler::run_daemon(pool.clone(), &project_dir, &cfg, interval, once, duration)
                 .await?;
         }
@@ -434,15 +449,25 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             println!("{}", serde_json::to_string(&summary)?);
         }
         Command::Start => {
-            let result = service::ensure_started(&project_dir)?;
+            let result = service::ensure_core(&project_dir)?;
             println!("{}", serde_json::to_string(&result)?);
         }
         Command::Stop => {
-            let result = service::stop_all(&project_dir)?;
+            let result = service::stop_rust_daemon(&project_dir)?;
             println!("{}", serde_json::to_string(&result)?);
         }
         Command::ServiceStatus => {
-            let result = service::status(&project_dir)?;
+            let mut result = service::status(&project_dir)?;
+            let sessions = db::list_live_sessions(&pool, "recording", 100).await?;
+            result
+                .as_object_mut()
+                .unwrap()
+                .insert("live_sessions".to_string(), serde_json::to_value(sessions)?);
+            let rust_running = crate::service::rust_daemon_alive(&project_dir);
+            result
+                .as_object_mut()
+                .unwrap()
+                .insert("rust_daemon".to_string(), json!(rust_running));
             println!("{}", serde_json::to_string(&result)?);
         }
     }

@@ -116,6 +116,7 @@ fn tools_list() -> Vec<Value> {
         json!({"name":"live_add","description":"添加直播监控","inputSchema":{"type":"object","properties":{"url":{"type":"string"},"name":{"type":"string"},"quality":{"type":"string"}},"required":["url"]}}),
         json!({"name":"live_remove","description":"移除直播监控","inputSchema":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}),
         json!({"name":"live_check","description":"检查直播监控项","inputSchema":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}),
+        json!({"name":"service_status","description":"查看 Python 服务、Rust daemon 与直播录制会话","inputSchema":{"type":"object","properties":{}}}),
         json!({"name":"video_add","description":"添加博主发视频监控","inputSchema":{"type":"object","properties":{"url":{"type":"string"},"name":{"type":"string"},"download":{"type":"string"}},"required":["url"]}}),
         json!({"name":"video_remove","description":"移除发视频监控","inputSchema":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}),
         json!({"name":"video_list","description":"列出发视频监控","inputSchema":{"type":"object","properties":{}}}),
@@ -184,8 +185,21 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
         "live_check" => {
             let url = args.get("url").and_then(|v| v.as_str()).unwrap_or_default();
             let room = watch.list_live().into_iter().find(|r| r.url == url);
+            let status = if let Some(r) = &room {
+                let adapter = crate::live_monitor::resolve_live_with_cookie(
+                    &r.url,
+                    &cfg.get_main("Cookie", "b站cookie"),
+                );
+                match adapter.check(&r.url).await {
+                    Ok(s) => serde_json::to_value(&s).ok(),
+                    Err(e) => Some(json!({"error": e.to_string()})),
+                }
+            } else {
+                None
+            };
             Ok(serde_json::to_string(
-                &json!({"ok":true,"url":url,"found":room.is_some(),"room":room}),
+                &json!({"ok":true,"url":url,"found":room.is_some(),"room":room,
+                        "status":status,"hint":"Rust daemon 运行中会自动检测并录制开播"}),
             )?)
         }
         "video_add" => {
@@ -345,12 +359,25 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
                 &crate::pipeline_bridge::run_pipeline(cfg, file_path, anchor_name).await?,
             )?)
         }
-        "service_start" => Ok(serde_json::to_string(&crate::service::ensure_started(
+        "service_start" => Ok(serde_json::to_string(&crate::service::ensure_core(
             project_dir,
         )?)?),
-        "service_stop" => Ok(serde_json::to_string(&crate::service::stop_all(
+        "service_stop" => Ok(serde_json::to_string(&crate::service::stop_rust_daemon(
             project_dir,
         )?)?),
+        "service_status" => {
+            let mut result = crate::service::status(project_dir)?;
+            let sessions = db::list_live_sessions(pool, "recording", 100).await?;
+            result
+                .as_object_mut()
+                .unwrap()
+                .insert("live_sessions".to_string(), serde_json::to_value(sessions)?);
+            result.as_object_mut().unwrap().insert(
+                "rust_daemon".to_string(),
+                json!(crate::service::rust_daemon_alive(project_dir)),
+            );
+            Ok(serde_json::to_string(&result)?)
+        }
         "test_email" => {
             let status = cfg.email_status();
             if !status.configured {

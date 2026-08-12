@@ -9,6 +9,7 @@ use tracing::{error, info, warn};
 use crate::config::Config;
 use crate::db;
 use crate::download;
+use crate::live_monitor::LiveMonitor;
 use crate::notify::{Channel, Notifier};
 use crate::platform;
 use crate::video_library::VideoLibrary;
@@ -26,7 +27,14 @@ pub async fn run_daemon(
 ) -> Result<()> {
     let started = Instant::now();
     let fupan_dir = project_dir.join("fupan_output");
+    let watch = Watchlist::new(project_dir.to_path_buf());
+    let monitor = LiveMonitor::new(&pool, project_dir, config, &watch);
     loop {
+        // Rust 直播监控独立于 Python 兼容层运行：检测开播、自动录制、状态持久化。
+        match monitor.run_once().await {
+            Ok(stats) => info!("live monitor tick ok: {:?}", stats),
+            Err(e) => error!("live monitor tick failed: {e:#}"),
+        }
         match tick(&pool, project_dir, &fupan_dir, config).await {
             Ok(stats) => info!("daemon tick ok: {:?}", stats),
             Err(e) => error!("daemon tick failed: {e:#}"),

@@ -69,6 +69,24 @@ pub struct NotifyEvent {
     pub created_at: String,
 }
 
+/// 直播录制会话（SQLite live_sessions 行）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveSession {
+    pub id: i64,
+    pub url: String,
+    pub anchor: String,
+    pub title: String,
+    pub platform: String,
+    pub stream_url: String,
+    pub status: String,
+    pub pid: i64,
+    pub file_path: String,
+    pub started_at: String,
+    pub ended_at: String,
+    pub error: String,
+    pub updated_at: String,
+}
+
 /// 转写片段。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptSegment {

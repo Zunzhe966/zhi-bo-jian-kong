@@ -2,7 +2,7 @@ use anyhow::Context;
 use sqlx::Row;
 use sqlx::sqlite::SqlitePool;
 
-use crate::model::{Anchor, NotifyEvent, Task, Video};
+use crate::model::{Anchor, LiveSession, NotifyEvent, Task, Video};
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS anchors (
@@ -63,6 +63,23 @@ CREATE TABLE IF NOT EXISTS monitor_baseline (
     baseline_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
     updated_at  TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
+
+CREATE TABLE IF NOT EXISTS live_sessions (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    url        TEXT NOT NULL,
+    anchor     TEXT NOT NULL DEFAULT '',
+    title      TEXT NOT NULL DEFAULT '',
+    platform   TEXT NOT NULL DEFAULT '',
+    stream_url TEXT NOT NULL DEFAULT '',
+    status     TEXT NOT NULL DEFAULT 'recording',
+    pid        INTEGER NOT NULL DEFAULT 0,
+    file_path  TEXT NOT NULL DEFAULT '',
+    started_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    ended_at   TEXT NOT NULL DEFAULT '',
+    error      TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_live_sessions_url ON live_sessions(url);
 "#;
 
 pub async fn init_db(pool: &SqlitePool) -> anyhow::Result<()> {
@@ -160,6 +177,130 @@ pub async fn mark_source_baselined(pool: &SqlitePool, source_url: &str) -> anyho
     .await
     .context("记录监控源基线")?;
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)] // 会话字段均为 SQLite 持久化必需
+pub async fn start_live_session(
+    pool: &SqlitePool,
+    url: &str,
+    anchor: &str,
+    title: &str,
+    platform: &str,
+    stream_url: &str,
+    pid: u32,
+    file_path: &str,
+) -> anyhow::Result<i64> {
+    let result = sqlx::query(
+        r#"INSERT INTO live_sessions
+           (url, anchor, title, platform, stream_url, status, pid, file_path)
+           VALUES (?,?,?,?,?, 'recording', ?, ?)"#,
+    )
+    .bind(url)
+    .bind(anchor)
+    .bind(title)
+    .bind(platform)
+    .bind(stream_url)
+    .bind(pid)
+    .bind(file_path)
+    .execute(pool)
+    .await
+    .context("写入直播录制会话")?;
+    Ok(result.last_insert_rowid())
+}
+
+pub async fn end_live_session(
+    pool: &SqlitePool,
+    id: i64,
+    status: &str,
+    error: &str,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"UPDATE live_sessions SET status=?, error=?, pid=0,
+           ended_at=datetime('now','localtime'), updated_at=datetime('now','localtime') WHERE id=?"#,
+    )
+    .bind(status)
+    .bind(error)
+    .bind(id)
+    .execute(pool)
+    .await
+    .context("结束直播录制会话")?;
+    Ok(())
+}
+
+pub async fn list_live_sessions(
+    pool: &SqlitePool,
+    status: &str,
+    limit: i64,
+) -> anyhow::Result<Vec<LiveSession>> {
+    let mut sql = String::from(
+        "SELECT id, url, anchor, title, platform, stream_url, status, pid, file_path,
+                started_at, ended_at, error, updated_at
+         FROM live_sessions WHERE 1=1",
+    );
+    if !status.is_empty() {
+        sql.push_str(" AND status = ?");
+    }
+    sql.push_str(" ORDER BY id DESC LIMIT ?");
+    let mut query = sqlx::query(&sql);
+    if !status.is_empty() {
+        query = query.bind(status);
+    }
+    query = query.bind(limit);
+    let rows = query.fetch_all(pool).await.context("查询直播录制会话")?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(LiveSession {
+            id: row.try_get("id")?,
+            url: row.try_get("url")?,
+            anchor: row.try_get("anchor")?,
+            title: row.try_get("title")?,
+            platform: row.try_get("platform")?,
+            stream_url: row.try_get("stream_url")?,
+            status: row.try_get("status")?,
+            pid: row.try_get("pid")?,
+            file_path: row.try_get("file_path")?,
+            started_at: row.try_get("started_at")?,
+            ended_at: row.try_get("ended_at")?,
+            error: row.try_get("error")?,
+            updated_at: row.try_get("updated_at")?,
+        });
+    }
+    Ok(out)
+}
+
+pub async fn active_live_session(
+    pool: &SqlitePool,
+    url: &str,
+) -> anyhow::Result<Option<LiveSession>> {
+    let row = sqlx::query(
+        r#"SELECT id, url, anchor, title, platform, stream_url, status, pid, file_path,
+                  started_at, ended_at, error, updated_at
+           FROM live_sessions
+           WHERE url=? AND status='recording'
+           ORDER BY id DESC LIMIT 1"#,
+    )
+    .bind(url)
+    .fetch_optional(pool)
+    .await
+    .context("查询活动直播录制会话")?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    Ok(Some(LiveSession {
+        id: row.try_get("id")?,
+        url: row.try_get("url")?,
+        anchor: row.try_get("anchor")?,
+        title: row.try_get("title")?,
+        platform: row.try_get("platform")?,
+        stream_url: row.try_get("stream_url")?,
+        status: row.try_get("status")?,
+        pid: row.try_get("pid")?,
+        file_path: row.try_get("file_path")?,
+        started_at: row.try_get("started_at")?,
+        ended_at: row.try_get("ended_at")?,
+        error: row.try_get("error")?,
+        updated_at: row.try_get("updated_at")?,
+    }))
 }
 
 #[allow(dead_code)] // 直播状态机写入接口
@@ -610,5 +751,38 @@ mod tests {
         assert!(!is_source_baselined(&pool, url).await.unwrap());
         mark_source_baselined(&pool, url).await.unwrap();
         assert!(is_source_baselined(&pool, url).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn live_sessions_persist_and_end() {
+        let pool = test_pool().await;
+        let id = start_live_session(
+            &pool,
+            "https://live.bilibili.com/320",
+            "主播",
+            "测试直播",
+            "bilibili",
+            "https://stream.example/live.m3u8",
+            123,
+            "/tmp/x.ts",
+        )
+        .await
+        .unwrap();
+        let active = active_live_session(&pool, "https://live.bilibili.com/320")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.id, id);
+        assert_eq!(active.status, "recording");
+        end_live_session(&pool, id, "done", "").await.unwrap();
+        assert!(
+            active_live_session(&pool, "https://live.bilibili.com/320")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let sessions = list_live_sessions(&pool, "done", 10).await.unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].error, "");
     }
 }
