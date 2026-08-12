@@ -510,6 +510,19 @@ pub async fn enqueue_task(
     url: &str,
     name: &str,
 ) -> anyhow::Result<i64> {
+    // 同一 kind+url 已有未完成（pending/failed 也会重试）任务时不再重复入队，
+    // 避免 daemon 并发/重复下载同一资源。
+    let existing: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM tasks WHERE kind=? AND url=? AND status IN ('pending','failed') LIMIT 1",
+    )
+    .bind(kind)
+    .bind(url)
+    .fetch_optional(pool)
+    .await
+    .context("查询已有下载任务")?;
+    if let Some(id) = existing {
+        return Ok(id);
+    }
     let result =
         sqlx::query("INSERT INTO tasks (kind, url, name, status) VALUES (?, ?, ?, 'pending')")
             .bind(kind)
@@ -697,6 +710,10 @@ mod tests {
         let id = enqueue_task(&pool, "download", "https://x.test/v", "博主")
             .await
             .unwrap();
+        let dup = enqueue_task(&pool, "download", "https://x.test/v", "博主2")
+            .await
+            .unwrap();
+        assert_eq!(dup, id, "同 URL 未完成下载任务不应重复入队");
         let tasks = list_tasks(&pool, "pending", 10).await.unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].id, id);

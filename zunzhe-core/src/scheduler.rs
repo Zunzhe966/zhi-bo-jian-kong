@@ -92,49 +92,57 @@ async fn run_tick_with_timeout(
     config: &Config,
     watch: &Watchlist,
 ) {
-    let result = tokio::time::timeout(Duration::from_secs(70), async {
-        // 用 owned 快照 + tokio::task::spawn 隔离：单个 tick panic 不会拖垮主循环。
-        let pool = pool.clone();
-        let project_dir = project_dir.to_path_buf();
-        let fupan_dir = fupan_dir.to_path_buf();
-        let config = config.clone();
-        let watch = Watchlist::new(
-            watch
-                .url_config()
-                .parent()
-                .unwrap_or(project_dir.as_path())
-                .to_path_buf(),
-        );
-        let live_task = tokio::task::spawn(run_live_tick(
-            pool.clone(),
-            project_dir.clone(),
-            config.clone(),
-            watch,
-        ));
-        let videos_task = tokio::task::spawn(tick_owned(pool, project_dir, fupan_dir, config));
-        let live = match live_task.await {
+    // 用 owned 快照 + tokio::task::spawn 隔离：单个 tick panic 不会拖垮主循环。
+    let pool = pool.clone();
+    let project_dir = project_dir.to_path_buf();
+    let fupan_dir = fupan_dir.to_path_buf();
+    let config = config.clone();
+    let watch = Watchlist::new(
+        watch
+            .url_config()
+            .parent()
+            .unwrap_or(project_dir.as_path())
+            .to_path_buf(),
+    );
+    let mut live_task = tokio::task::spawn(run_live_tick(
+        pool.clone(),
+        project_dir.clone(),
+        config.clone(),
+        watch,
+    ));
+    let mut videos_task = tokio::task::spawn(tick_owned(pool, project_dir, fupan_dir, config));
+
+    let outcome = tokio::time::timeout(Duration::from_secs(70), async {
+        // 借用句柄而不是移动：超时分支发生后仍然能 abort 两个子任务。
+        let (live, videos) = tokio::join!(&mut live_task, &mut videos_task);
+        let live = match live {
             Ok(v) => v,
             Err(e) => Err(anyhow::anyhow!("直播检查任务 panic: {e}")),
         };
-        let videos = match videos_task.await {
+        let videos = match videos {
             Ok(v) => v,
             Err(e) => Err(anyhow::anyhow!("视频检查任务 panic: {e}")),
         };
         (live, videos)
     })
     .await;
-    match result {
-        Ok((live, videos)) => {
-            match live {
-                Ok(stats) => info!("live monitor tick ok: {:?}", stats),
-                Err(e) => error!("live monitor tick failed: {e:#}"),
-            }
-            match videos {
-                Ok(stats) => info!("daemon tick ok: {:?}", stats),
-                Err(e) => error!("daemon tick failed: {e:#}"),
-            }
+
+    if let Ok((live, videos)) = outcome {
+        match live {
+            Ok(stats) => info!("live monitor tick ok: {:?}", stats),
+            Err(e) => error!("live monitor tick failed: {e:#}"),
         }
-        Err(_) => warn!("daemon tick 超过 70 秒，本轮已跳过，继续下一轮"),
+        match videos {
+            Ok(stats) => info!("daemon tick ok: {:?}", stats),
+            Err(e) => error!("daemon tick failed: {e:#}"),
+        }
+    } else {
+        warn!("daemon tick 超过 70 秒，终止本轮子任务并跳过");
+        // 超时后必须 abort 两个子任务，避免上一轮还在跑、下一轮又启动。
+        live_task.abort();
+        videos_task.abort();
+        let _ = live_task.await;
+        let _ = videos_task.await;
     }
 }
 
