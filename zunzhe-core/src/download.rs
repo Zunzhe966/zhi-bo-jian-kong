@@ -80,12 +80,23 @@ impl Downloader {
         ]);
         // B站风控时带用户 cookie（config/fupan_config.ini [视频监控] b站cookie）
         if url.contains("bilibili.com") || url.contains("b23.tv") {
-            let cookie = crate::config::Config::load(&self.project_dir)
-                .ok()
-                .map(|c| c.get_fupan("视频监控", "b站cookie"))
-                .unwrap_or_default();
-            if !cookie.is_empty() {
-                cmd.args(["--add-header", &format!("Cookie: {cookie}")]);
+            // 桌面端「B站授权」导出的浏览器会话 Cookie 最可靠；没有再回退
+            // config 里粘贴的 cookie。
+            let browser_cookies = self
+                .project_dir
+                .join("fupan_output")
+                .join("run")
+                .join("bilibili_browser_cookies.txt");
+            if browser_cookies.exists() {
+                cmd.args(["--cookies", browser_cookies.display().to_string().as_str()]);
+            } else {
+                let cookie = crate::config::Config::load(&self.project_dir)
+                    .ok()
+                    .map(|c| c.get_fupan("视频监控", "b站cookie"))
+                    .unwrap_or_default();
+                if !cookie.is_empty() {
+                    cmd.args(["--add-header", &format!("Cookie: {cookie}")]);
+                }
             }
         }
         let child = cmd
