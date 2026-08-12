@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -8,7 +8,7 @@ use tracing::{error, info, warn};
 use crate::config::Config;
 use crate::db;
 use crate::download;
-use crate::live_monitor::LiveMonitor;
+use crate::live_monitor::{LiveCheckStats, LiveMonitor};
 use crate::notify::{Channel, Notifier};
 use crate::platform;
 use crate::video_library::VideoLibrary;
@@ -37,17 +37,28 @@ pub async fn run_daemon(
     }
     loop {
         // Rust 直播监控独立于 Python 兼容层运行：检测开播、自动录制、状态持久化。
-        run_tick_with_timeout(&monitor, &pool, project_dir, &fupan_dir, config).await;
+        crate::service::touch_heartbeat(project_dir);
+        run_tick_with_timeout(&pool, project_dir, &fupan_dir, config, &watch).await;
         if once {
             let _ = monitor.stop_all_recordings().await;
+            crate::service::remove_rust_daemon_pid(project_dir);
             return Ok(());
         }
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(interval_secs)) => {}
+            sig = shutdown_signal() => {
+                if sig {
+                    info!("收到中断信号，daemon 优雅退出");
+                    let _ = monitor.stop_all_recordings().await;
+                    crate::service::remove_rust_daemon_pid(project_dir);
+                    return Ok(());
+                }
+            }
             stopped = stop.1.changed() => {
                 if stopped.is_ok() && *stop.1.borrow() {
                     info!("daemon duration reached, exiting cleanly");
                     let _ = monitor.stop_all_recordings().await;
+                    crate::service::remove_rust_daemon_pid(project_dir);
                     return Ok(());
                 }
             }
@@ -55,18 +66,60 @@ pub async fn run_daemon(
     }
 }
 
+/// 监听 SIGINT/SIGTERM；Windows 只处理 Ctrl-C。
+async fn shutdown_signal() -> bool {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate()).expect("注册 SIGTERM 失败");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => true,
+            _ = term.recv() => true,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.is_ok()
+    }
+}
+
 /// 每轮 tick 限制 70 秒：单源最多 50 秒 + 下载/封面等余量。
 /// 单次网络卡顿只记日志，不让 daemon 永久阻塞。
 async fn run_tick_with_timeout(
-    monitor: &LiveMonitor<'_>,
     pool: &SqlitePool,
     project_dir: &Path,
     fupan_dir: &Path,
     config: &Config,
+    watch: &Watchlist,
 ) {
     let result = tokio::time::timeout(Duration::from_secs(70), async {
-        let live = monitor.run_once().await;
-        let videos = tick(pool, project_dir, fupan_dir, config).await;
+        // 用 owned 快照 + tokio::task::spawn 隔离：单个 tick panic 不会拖垮主循环。
+        let pool = pool.clone();
+        let project_dir = project_dir.to_path_buf();
+        let fupan_dir = fupan_dir.to_path_buf();
+        let config = config.clone();
+        let watch = Watchlist::new(
+            watch
+                .url_config()
+                .parent()
+                .unwrap_or(project_dir.as_path())
+                .to_path_buf(),
+        );
+        let live_task = tokio::task::spawn(run_live_tick(
+            pool.clone(),
+            project_dir.clone(),
+            config.clone(),
+            watch,
+        ));
+        let videos_task = tokio::task::spawn(tick_owned(pool, project_dir, fupan_dir, config));
+        let live = match live_task.await {
+            Ok(v) => v,
+            Err(e) => Err(anyhow::anyhow!("直播检查任务 panic: {e}")),
+        };
+        let videos = match videos_task.await {
+            Ok(v) => v,
+            Err(e) => Err(anyhow::anyhow!("视频检查任务 panic: {e}")),
+        };
         (live, videos)
     })
     .await;
@@ -83,6 +136,25 @@ async fn run_tick_with_timeout(
         }
         Err(_) => warn!("daemon tick 超过 70 秒，本轮已跳过，继续下一轮"),
     }
+}
+
+async fn run_live_tick(
+    pool: SqlitePool,
+    project_dir: PathBuf,
+    config: Config,
+    watch: Watchlist,
+) -> Result<LiveCheckStats> {
+    let monitor = LiveMonitor::new(&pool, &project_dir, &config, &watch);
+    monitor.run_once().await
+}
+
+async fn tick_owned(
+    pool: SqlitePool,
+    project_dir: PathBuf,
+    fupan_dir: PathBuf,
+    config: Config,
+) -> Result<TickStats> {
+    tick(&pool, &project_dir, &fupan_dir, &config).await
 }
 
 async fn tick(
@@ -214,7 +286,7 @@ pub async fn check_video_sources(
     tick(pool, project_dir, &fupan_dir, config).await
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct TickStats {
     pub downloads: usize,
     pub anchors_checked: usize,
@@ -239,6 +311,33 @@ mod tests {
             .unwrap_or_else(|_| crate::config::Config::defaults_for_test());
         let result = run_daemon(pool, Path::new("."), &cfg, 1, true, None).await;
         assert!(result.is_ok(), "{result:?}");
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn daemon_duration_exits_and_cleans_pid() {
+        let file = std::env::temp_dir().join(format!("zunzhe-daemon-dur-{}", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let options = SqliteConnectOptions::new()
+            .filename(&file)
+            .create_if_missing(true);
+        let pool = SqlitePool::connect_with(options).await.unwrap();
+        db::init_db(&pool).await.unwrap();
+        let cfg = crate::config::Config::load(Path::new(env!("CARGO_MANIFEST_DIR")))
+            .unwrap_or_else(|_| crate::config::Config::defaults_for_test());
+        let dir = std::env::temp_dir().join(format!("zunzhe-daemon-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::service::write_rust_daemon_pid(&dir, std::process::id());
+        let result = run_daemon(pool, &dir, &cfg, 1, false, Some(1)).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            !dir.join("fupan_output")
+                .join("run")
+                .join("zunzhe-core.pid")
+                .exists()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&file);
     }
 }

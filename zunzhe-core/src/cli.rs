@@ -186,6 +186,8 @@ enum Command {
     WizardDone,
     /// 查看后台服务与最近录制状态
     ServiceStatus,
+    /// 运行环境诊断（日志/磁盘/ffmpeg/守护心跳）
+    Doctor,
     /// 对任意音视频文件跑 Python 复盘流水线（转写/提炼/切片）
     Process {
         file_path: String,
@@ -587,6 +589,12 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 .unwrap()
                 .insert("rust_daemon".to_string(), json!(rust_running));
             println!("{}", serde_json::to_string(&result)?);
+        }
+        Command::Doctor => {
+            println!(
+                "{}",
+                serde_json::to_string(&crate::service::diagnostics(&project_dir)?)?
+            );
         }
     }
     Ok(())

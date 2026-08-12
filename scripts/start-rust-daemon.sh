@@ -15,10 +15,9 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 1
 fi
 
-if [ ! -x "$ROOT/zunzhe-core/target/release/zunzhe-core" ]; then
-  echo "[rust-daemon] 首次运行，构建 release 版本..."
-  (cd "$ROOT/zunzhe-core" && cargo build --release)
-fi
+# 每次启动都确保 release 二进制与最新代码一致；构建失败立即报错，不自欺。
+echo "[rust-daemon] 构建 release 版本..."
+(cd "$ROOT/zunzhe-core" && cargo build --release)
 
 mkdir -p "$ROOT/logs"
 export RUST_LOG="${RUST_LOG:-info}"

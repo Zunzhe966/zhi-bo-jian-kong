@@ -3,6 +3,10 @@ name = "zunzhe-core"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "zunzhe_core"
+path = "src/lib.rs"
+
 [dependencies]
 anyhow = "1"
 chrono = "0.4"

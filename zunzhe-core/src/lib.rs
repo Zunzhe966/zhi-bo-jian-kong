@@ -1,0 +1,17 @@
+pub mod app_prefs;
+pub mod cli;
+pub mod config;
+pub mod config_api;
+pub mod db;
+pub mod download;
+pub mod live_monitor;
+pub mod mcp;
+pub mod model;
+pub mod notify;
+pub mod pipeline_bridge;
+pub mod platform;
+pub mod scheduler;
+pub mod service;
+pub mod training_data;
+pub mod video_library;
+pub mod watchlist;

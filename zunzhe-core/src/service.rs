@@ -84,14 +84,21 @@ pub fn start_rust_daemon(project_dir: &Path, interval_secs: u64) -> Result<serde
     }
     let log_dir = project_dir.join("logs");
     std::fs::create_dir_all(&log_dir)?;
+    let log_file = log_dir.join("zunzhe-core.log");
+    rotate_log(&log_file, 5);
+    let log_handle = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_file)
+        .with_context(|| format!("打开日志文件失败: {}", log_file.display()))?;
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("run-daemon")
         .arg("--interval")
         .arg(interval_secs.to_string())
         .current_dir(project_dir)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdout(log_handle.try_clone().context("复制日志句柄失败")?)
+        .stderr(log_handle);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -187,7 +194,100 @@ pub fn rust_daemon_alive(project_dir: &Path) -> bool {
     let Ok(pid) = text.trim().parse::<u32>() else {
         return false;
     };
-    service_pid_by_raw(pid)
+    if !service_pid_by_raw(pid) {
+        return false;
+    }
+    // 心跳文件最近 30 分钟内更新过，避免“进程还在但调度已僵死”的假健康。
+    heartbeat_fresh(project_dir, 30 * 60)
+}
+
+/// 移除当前 daemon 的 pid 文件（daemon 优雅退出时调用）。
+pub fn remove_rust_daemon_pid(project_dir: &Path) {
+    let _ = std::fs::remove_file(pid_file(project_dir, "zunzhe-core"));
+}
+
+/// daemon 心跳：每次调度 tick 后刷新，供外部存活检查。
+pub fn touch_heartbeat(project_dir: &Path) {
+    let path = heartbeat_file(project_dir);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, chrono::Local::now().to_rfc3339());
+}
+
+fn heartbeat_file(project_dir: &Path) -> std::path::PathBuf {
+    project_dir
+        .join("fupan_output")
+        .join("run")
+        .join("zunzhe-core.heartbeat")
+}
+
+fn heartbeat_fresh(project_dir: &Path, max_age_secs: u64) -> bool {
+    let Ok(meta) = std::fs::metadata(heartbeat_file(project_dir)) else {
+        return false;
+    };
+    let Ok(modified) = meta.modified() else {
+        return false;
+    };
+    let Ok(age) = modified.elapsed() else {
+        return false;
+    };
+    age.as_secs() <= max_age_secs
+}
+
+/// 简单日志轮转：把 log 依次后移，最多保留 max_keep 份历史。
+fn rotate_log(log: &Path, max_keep: usize) {
+    for i in (1..=max_keep).rev() {
+        let from = if i == 1 {
+            log.to_path_buf()
+        } else {
+            log.with_extension(format!("log.{}", i - 1))
+        };
+        let to = log.with_extension(format!("log.{i}"));
+        if from.exists() {
+            let _ = std::fs::rename(&from, &to);
+        }
+    }
+}
+
+/// 诊断项：供桌面端/CLI 快速判断“为什么监控没在跑”。
+pub fn diagnostics(project_dir: &Path) -> Result<serde_json::Value> {
+    let log_dir = project_dir.join("logs");
+    let run_dir = project_dir.join("fupan_output").join("run");
+    let ffmpeg = project_dir.join("ffmpeg").join("ffmpeg");
+    let heartbeat_ok = heartbeat_fresh(project_dir, 30 * 60);
+    let daemon_ok = rust_daemon_alive(project_dir);
+    let disk = disk_free_bytes(project_dir);
+    Ok(json!({
+        "ok": true,
+        "rust_daemon": daemon_ok,
+        "heartbeat_ok": heartbeat_ok,
+        "logs_writable": log_dir.is_dir() || std::fs::create_dir_all(&log_dir).is_ok(),
+        "run_dir_writable": run_dir.is_dir() || std::fs::create_dir_all(&run_dir).is_ok(),
+        "ffmpeg": if ffmpeg.exists() { "ok" } else { "missing（将使用 PATH 中的 ffmpeg）" },
+        "disk_free_mb": disk,
+        "hints": [],
+    }))
+}
+
+fn disk_free_bytes(_project_dir: &Path) -> u64 {
+    #[cfg(unix)]
+    {
+        unsafe {
+            let mut stat = std::mem::zeroed::<libc::statvfs>();
+            let c_path = std::ffi::CString::new("/").unwrap_or_default();
+            if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
+                let avail = u64::from(stat.f_bavail);
+                let frsize = stat.f_frsize;
+                return avail.saturating_mul(frsize) / (1024 * 1024);
+            }
+        }
+        0
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
 }
 
 #[allow(dead_code)] // 供 ensure_started/stop_all 兜底路径使用
@@ -320,6 +420,35 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(std::fs::read_to_string(file.path()).unwrap(), "12345");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn heartbeat_and_diagnostics_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("zunzhe-heartbeat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("fupan_output").join("run")).unwrap();
+        assert!(!rust_daemon_alive(&dir));
+        touch_heartbeat(&dir);
+        let diag = diagnostics(&dir).unwrap();
+        assert!(diag["heartbeat_ok"].as_bool().unwrap());
+        assert!(diag["run_dir_writable"].as_bool().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotate_log_keeps_history() {
+        let dir = std::env::temp_dir().join(format!("zunzhe-rotate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("zunzhe-core.log");
+        std::fs::write(&log, "v1").unwrap();
+        rotate_log(&log, 2);
+        assert!(log.with_extension("log.1").exists());
+        std::fs::write(&log, "v2").unwrap();
+        rotate_log(&log, 2);
+        assert!(log.with_extension("log.1").exists());
+        assert!(log.with_extension("log.2").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
