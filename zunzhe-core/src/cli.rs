@@ -249,8 +249,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 .into_iter()
                 .find(|r| r.url == url || r.url.trim_end_matches('/') == url.trim_end_matches('/'));
             let status = if let Some(r) = &room {
-                let adapter = live_monitor::resolve_live_with_cookie(
+                let adapter = live_monitor::resolve_live_for_project(
                     &r.url,
+                    &cfg.project_dir,
                     &cfg.get_main("Cookie", "b站cookie"),
                 );
                 match adapter.check(&r.url).await {

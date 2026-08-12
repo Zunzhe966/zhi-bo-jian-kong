@@ -14,6 +14,7 @@ use tracing::{error, info, warn};
 use crate::bilibili_auth::cookie_header_from_project;
 use crate::config::Config;
 use crate::db;
+use crate::live_python_bridge::PythonLiveAdapter;
 use crate::notify::{Channel, Notifier};
 use crate::service::write_rust_live_pid;
 use crate::watchlist::{LiveItem, Watchlist};
@@ -295,20 +296,29 @@ impl LiveAdapter for DirectLiveAdapter {
 
 #[allow(dead_code)] // 便捷无 Cookie 构造入口
 pub fn resolve_live(url: &str) -> Box<dyn LiveAdapter> {
-    resolve_live_with_cookie(url, "")
+    resolve_live_for_project(url, Path::new("."), "")
 }
 
 pub fn resolve_live_with_cookie(url: &str, cookie: &str) -> Box<dyn LiveAdapter> {
+    resolve_live_for_project(url, Path::new("."), cookie)
+}
+
+/// 解析直播适配器：B站原生 / 多平台 Python 桥 / m3u8-flv 直链。
+///
+/// `project_dir` 让 Python 桥接器定位项目 `.venv`，而不是从当前工作目录猜测；
+/// 旧 `resolve_live_with_cookie` 保留为无项目路径的便捷入口。
+pub fn resolve_live_for_project(
+    url: &str,
+    project_dir: &Path,
+    cookie: &str,
+) -> Box<dyn LiveAdapter> {
     if url.contains("live.bilibili.com") {
         Box::new(BilibiliLiveAdapter::with_cookie(cookie))
+    } else if PythonLiveAdapter::supports_url(url) {
+        Box::new(PythonLiveAdapter::new(project_dir.to_path_buf()))
     } else {
         Box::new(DirectLiveAdapter::new())
     }
-}
-
-/// 桌面端「B站授权」导出的浏览器 Cookie 转成请求头字符串，供直播检测使用。
-fn bilibili_browser_cookie(project_dir: &Path) -> String {
-    cookie_header_from_project(project_dir)
 }
 
 /// 录制会话状态机：负责把主播标记为直播中、启动/停止 ffmpeg、持久化会话。
@@ -344,11 +354,11 @@ impl<'a> LiveMonitor<'a> {
             }
             let cookie = self.config.get_main("Cookie", "b站cookie");
             let cookie = if cookie.is_empty() {
-                bilibili_browser_cookie(self.project_dir)
+                cookie_header_from_project(self.project_dir)
             } else {
                 cookie
             };
-            let adapter = resolve_live_with_cookie(&item.url, &cookie);
+            let adapter = resolve_live_for_project(&item.url, self.project_dir, &cookie);
             // 单个直播检查总时限 25 秒：B站 room_init/主播名/标题/流地址可能串行
             // 多次网络请求，不设总超时会让整个 daemon tick 被拖到 70 秒上限。
             match tokio::time::timeout(Duration::from_secs(25), adapter.check(&item.url)).await {
@@ -392,6 +402,9 @@ impl<'a> LiveMonitor<'a> {
         if let Some(parent) = output.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("创建录制目录失败: {}", parent.display()))?;
+        }
+        if status.stream_url.is_empty() {
+            anyhow::bail!("未取得直播流地址，跳过录制");
         }
         let args = self.ffmpeg_args(&status.stream_url, &output);
         let ffmpeg = self.ffmpeg_bin();
@@ -651,7 +664,9 @@ impl<'a> LiveMonitor<'a> {
 }
 
 fn adapter_name(url: &str) -> &'static str {
-    if url.contains("live.bilibili.com") {
+    if crate::live_python_bridge::PythonLiveAdapter::supports_url(url) {
+        "python-bridge"
+    } else if url.contains("live.bilibili.com") {
         "bilibili"
     } else if url.contains(".m3u8") || url.contains(".flv") {
         "direct"
@@ -801,11 +816,11 @@ pub async fn record_live_once(
 ) -> Result<String> {
     let cookie = config.get_main("Cookie", "b站cookie");
     let cookie = if cookie.is_empty() {
-        bilibili_browser_cookie(project_dir)
+        cookie_header_from_project(project_dir)
     } else {
         cookie
     };
-    let adapter = resolve_live_with_cookie(url, &cookie);
+    let adapter = resolve_live_for_project(url, project_dir, &cookie);
     let status = adapter.check(url).await.context("直播检测失败")?;
     if !status.is_live {
         bail!("当前未开播，无法录制: {url}");

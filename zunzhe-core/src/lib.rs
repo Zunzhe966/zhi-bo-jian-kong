@@ -7,6 +7,7 @@ pub mod daemon_lock;
 pub mod db;
 pub mod download;
 pub mod live_monitor;
+pub mod live_python_bridge;
 pub mod mcp;
 pub mod model;
 pub mod notify;

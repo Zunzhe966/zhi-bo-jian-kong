@@ -259,8 +259,9 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
             let url = args.get("url").and_then(|v| v.as_str()).unwrap_or_default();
             let room = watch.list_live().into_iter().find(|r| r.url == url);
             let status = if let Some(r) = &room {
-                let adapter = crate::live_monitor::resolve_live_with_cookie(
+                let adapter = crate::live_monitor::resolve_live_for_project(
                     &r.url,
+                    project_dir,
                     &cfg.get_main("Cookie", "b站cookie"),
                 );
                 match adapter.check(&r.url).await {
