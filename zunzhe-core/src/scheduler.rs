@@ -187,6 +187,7 @@ async fn run_tick_with_timeout(
         config.clone(),
         watch,
     ));
+    let recover_pool = pool.clone();
     let mut videos_task = tokio::task::spawn(tick_owned(pool, project_dir, fupan_dir, config));
 
     let outcome = tokio::time::timeout(Duration::from_secs(70), async {
@@ -216,6 +217,8 @@ async fn run_tick_with_timeout(
     } else {
         warn!("daemon tick 超过 70 秒，终止本轮子任务并跳过");
         abort_timed_out_tasks(live_task, videos_task).await;
+        // 被截断的下载任务可能停在 processing，立即归还队列，不等到下一轮。
+        let _ = db::recover_processing(&recover_pool).await;
     }
 }
 
@@ -382,7 +385,19 @@ pub async fn check_video_sources(
     config: &Config,
 ) -> Result<TickStats> {
     let fupan_dir = project_dir.join("fupan_output");
-    tick(pool, project_dir, &fupan_dir, config).await
+    // CLI 手动检查也要有护栏：单源最多 50 秒、整体 70 秒，避免网络卡死挂住命令。
+    match tokio::time::timeout(
+        Duration::from_secs(70),
+        tick(pool, project_dir, &fupan_dir, config),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            let _ = db::recover_processing(pool).await;
+            Err(anyhow!("check-videos 超过 70 秒，已中止本轮检查"))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
