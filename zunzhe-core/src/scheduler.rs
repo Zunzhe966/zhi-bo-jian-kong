@@ -3,7 +3,6 @@ use std::time::Duration;
 
 use anyhow::Result;
 use sqlx::sqlite::SqlitePool;
-use tokio::time::Instant;
 use tracing::{error, info, warn};
 
 use crate::config::Config;
@@ -25,32 +24,61 @@ pub async fn run_daemon(
     once: bool,
     duration_secs: Option<u64>,
 ) -> Result<()> {
-    let started = Instant::now();
     let fupan_dir = project_dir.join("fupan_output");
     let watch = Watchlist::new(project_dir.to_path_buf());
     let monitor = LiveMonitor::new(&pool, project_dir, config, &watch);
+    let mut stop = tokio::sync::watch::channel(false);
+    if let Some(limit) = duration_secs {
+        let tx = stop.0.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(limit)).await;
+            let _ = tx.send(true);
+        });
+    }
     loop {
         // Rust 直播监控独立于 Python 兼容层运行：检测开播、自动录制、状态持久化。
-        match monitor.run_once().await {
-            Ok(stats) => info!("live monitor tick ok: {:?}", stats),
-            Err(e) => error!("live monitor tick failed: {e:#}"),
-        }
-        match tick(&pool, project_dir, &fupan_dir, config).await {
-            Ok(stats) => info!("daemon tick ok: {:?}", stats),
-            Err(e) => error!("daemon tick failed: {e:#}"),
-        }
+        run_tick_with_timeout(&monitor, &pool, project_dir, &fupan_dir, config).await;
         if once {
-            return Ok(());
-        }
-        if let Some(limit) = duration_secs
-            && started.elapsed() >= Duration::from_secs(limit)
-        {
-            info!("daemon duration reached, exiting cleanly");
             return Ok(());
         }
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(interval_secs)) => {}
+            stopped = stop.1.changed() => {
+                if stopped.is_ok() && *stop.1.borrow() {
+                    info!("daemon duration reached, exiting cleanly");
+                    return Ok(());
+                }
+            }
         }
+    }
+}
+
+/// 每轮 tick 限制 30 秒：单次网络卡顿只记日志，不让 daemon 永久阻塞。
+async fn run_tick_with_timeout(
+    monitor: &LiveMonitor<'_>,
+    pool: &SqlitePool,
+    project_dir: &Path,
+    fupan_dir: &Path,
+    config: &Config,
+) {
+    let result = tokio::time::timeout(Duration::from_secs(15), async {
+        let live = monitor.run_once().await;
+        let videos = tick(pool, project_dir, fupan_dir, config).await;
+        (live, videos)
+    })
+    .await;
+    match result {
+        Ok((live, videos)) => {
+            match live {
+                Ok(stats) => info!("live monitor tick ok: {:?}", stats),
+                Err(e) => error!("live monitor tick failed: {e:#}"),
+            }
+            match videos {
+                Ok(stats) => info!("daemon tick ok: {:?}", stats),
+                Err(e) => error!("daemon tick failed: {e:#}"),
+            }
+        }
+        Err(_) => warn!("daemon tick 超过 30 秒，本轮已跳过，继续下一轮"),
     }
 }
 

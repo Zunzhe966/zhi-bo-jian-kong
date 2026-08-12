@@ -46,6 +46,7 @@ impl Default for BilibiliLiveAdapter {
         Self {
             client: reqwest::Client::builder()
                 .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+                .timeout(Duration::from_secs(20))
                 .build()
                 .unwrap_or_default(),
             cookie: String::new(),

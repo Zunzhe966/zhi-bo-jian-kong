@@ -52,6 +52,7 @@ impl Default for BilibiliAdapter {
         Self {
             client: reqwest::Client::builder()
                 .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+                .timeout(std::time::Duration::from_secs(20))
                 .build()
                 .unwrap_or_default(),
             cookie: String::new(),
@@ -62,7 +63,10 @@ impl Default for BilibiliAdapter {
 impl BilibiliAdapter {
     /// 取 B 站 wbi 图片并生成查询签名（w_rid/wts）。失败返回空串，调用方走无签名兜底。
     async fn wbi_query(&self, mid: &str, count: u32) -> anyhow::Result<String> {
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .unwrap_or_default();
         let nav = client
             .get("https://api.bilibili.com/x/web-interface/nav")
             .header("User-Agent", "Mozilla/5.0")
@@ -346,6 +350,7 @@ impl Default for RssAdapter {
         Self {
             client: reqwest::Client::builder()
                 .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+                .timeout(std::time::Duration::from_secs(20))
                 .build()
                 .unwrap_or_default(),
         }
