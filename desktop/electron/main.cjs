@@ -146,6 +146,13 @@ function pollLocalNotifyQueue() {
 async function serviceWatchdog() {
   try {
     pollLocalNotifyQueue()
+    // 每次健康检查都把结果追加到 logs/zunzhe-core.uptime.log，
+    // 与 launchd 看门狗共用同一份 24×30 验收记录。
+    const checker = path.join(PROJECT_DIR, 'scripts', 'check-rust-daemon.sh')
+    if (fs.existsSync(checker)) {
+      const { execFile } = require('child_process')
+      execFile('/bin/bash', [checker], { timeout: 10000 }, () => {})
+    }
     const prefRes = await runCli(['get-app-prefs'])
     const prefs = prefRes.prefs || {}
     if (prefs.watchdog === false) return
