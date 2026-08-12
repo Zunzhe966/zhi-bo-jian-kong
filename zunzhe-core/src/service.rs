@@ -122,8 +122,7 @@ pub fn start_rust_daemon(project_dir: &Path, interval_secs: u64) -> Result<serde
 }
 
 pub fn stop_rust_daemon(project_dir: &Path) -> Result<serde_json::Value> {
-    // Rust daemon 停止后，恢复 Python 直播服务兜底，保证直播监控不断档。
-    let _ = ensure_started(project_dir)?;
+    // 先停 Rust daemon；Python 兜底属于尽力而为，失败不能阻塞停止操作。
     let path = pid_file(project_dir, "zunzhe-core");
     let text = std::fs::read_to_string(&path).unwrap_or_default();
     let pid = text.trim().parse::<u32>();
@@ -135,7 +134,12 @@ pub fn stop_rust_daemon(project_dir: &Path) -> Result<serde_json::Value> {
     let _ = std::fs::remove_file(&path);
     // 清理可能残留的 Rust ffmpeg 录制进程（如果 daemon 未及优雅退出）。
     cleanup_rust_recordings(project_dir);
-    Ok(json!({"ok": true, "rust_daemon": "已停止", "live_monitor": "已由 Python 兜底接管"}))
+    let fallback = ensure_started(project_dir);
+    let fallback_note = match fallback {
+        Ok(v) => format!("已由 Python 兜底接管: {v}"),
+        Err(e) => format!("Python 兜底启动失败（可稍后手动 start）: {e:#}"),
+    };
+    Ok(json!({"ok": true, "rust_daemon": "已停止", "live_monitor": fallback_note}))
 }
 
 /// 兜底清理：读取 fupan_output/run/rust_live/ 下录制 pid 文件，逐个结束。
@@ -220,11 +224,12 @@ pub fn write_rust_live_pid(project_dir: &Path, url: &str, pid: u32) {
         .join("run")
         .join("rust_live");
     let _ = std::fs::create_dir_all(&dir);
-    let name = simple_hash(url);
+    let name = rust_live_pid_name(url);
     let _ = std::fs::write(dir.join(format!("{name}.pid")), pid.to_string());
 }
 
-fn simple_hash(text: &str) -> String {
+/// 直播地址 -> 录制 pid 文件名（同一 URL 稳定映射，供停止兜底清理）。
+pub fn rust_live_pid_name(text: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
@@ -240,7 +245,22 @@ fn service_pid(project_dir: &Path, name: &str) -> Option<u32> {
 }
 
 fn service_pid_by_raw(pid: u32) -> bool {
-    std::path::Path::new(&format!("/proc/{pid}")).exists() || libc_kill(pid as i32, 0).is_ok()
+    #[cfg(unix)]
+    {
+        std::path::Path::new(&format!("/proc/{pid}")).exists() || libc_kill(pid as i32, 0).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows 无 /proc：用 tasklist 查询该 PID 是否存在。
+        std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}")])
+            .output()
+            .map(|o| {
+                let text = String::from_utf8_lossy(&o.stdout);
+                text.contains(&pid.to_string()) && !text.contains("INFO: No tasks")
+            })
+            .unwrap_or(false)
+    }
 }
 
 #[cfg(unix)]

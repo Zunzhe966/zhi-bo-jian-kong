@@ -1,6 +1,11 @@
 use anyhow::{Context, Result, anyhow};
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::process::Stdio;
+use std::time::Duration;
+use tokio::process::Command;
+use tracing::{debug, warn};
 
 use crate::model::VideoMeta;
 
@@ -45,6 +50,7 @@ pub trait Platform: Send + Sync {
 pub struct BilibiliAdapter {
     client: reqwest::Client,
     cookie: String,
+    project_dir: PathBuf,
 }
 
 impl Default for BilibiliAdapter {
@@ -56,6 +62,7 @@ impl Default for BilibiliAdapter {
                 .build()
                 .unwrap_or_default(),
             cookie: String::new(),
+            project_dir: PathBuf::from("."),
         }
     }
 }
@@ -107,13 +114,17 @@ impl BilibiliAdapter {
         Ok(format!("{query}&w_rid={digest}"))
     }
 
-    pub fn new() -> Self {
-        Self::default()
+    pub fn with_project_dir(project_dir: PathBuf) -> Self {
+        Self {
+            project_dir,
+            ..Self::default()
+        }
     }
 
-    pub fn with_cookie(cookie: impl Into<String>) -> Self {
+    pub fn with_cookie_and_project_dir(cookie: impl Into<String>, project_dir: PathBuf) -> Self {
         Self {
             cookie: cookie.into(),
+            project_dir,
             ..Self::default()
         }
     }
@@ -158,6 +169,9 @@ impl BilibiliAdapter {
             Ok(d) => d,
             Err(_) => return fallback,
         };
+        if data.get("code").and_then(|c| c.as_i64()) != Some(0) {
+            return fallback;
+        }
         let d = &data["data"];
         let ts = d["pubdate"].as_i64().unwrap_or(0);
         VideoMeta {
@@ -205,9 +219,14 @@ impl Platform for BilibiliAdapter {
                     "B站投稿列表拉取失败，可能被 412 风控，请配置 B站 cookie 后重试"
                 ));
             }
-            let mut out = Vec::new();
-            for bvid in bvids {
-                out.push(self.view(&bvid).await);
+            // view 补全并发执行：B站接口单次 1-3 秒，10 条串行会拖慢监控轮次。
+            let mut tasks = Vec::with_capacity(bvids.len());
+            for bvid in &bvids {
+                tasks.push(self.view(bvid));
+            }
+            let mut out = Vec::with_capacity(tasks.len());
+            for task in tasks {
+                out.push(task.await);
             }
             Ok(out)
         })
@@ -289,7 +308,9 @@ impl BilibiliAdapter {
     async fn upload_ids_rsshub(&self, mid: &str, count: u32) -> Vec<String> {
         let rss = format!("https://rsshub.app/bilibili/user/video/{mid}");
         if let Ok(resp) = self.client.get(&rss).send().await
+            && resp.status().is_success()
             && let Ok(text) = resp.text().await
+            && text.starts_with('<')
         {
             let ids = extract_bvids(&text);
             if !ids.is_empty() {
@@ -300,22 +321,83 @@ impl BilibiliAdapter {
     }
 
     async fn upload_ids_ytdlp(&self, mid: &str, count: u32) -> Vec<String> {
-        let mut cmd = std::process::Command::new("yt-dlp");
+        // 先找项目 .venv 里的 yt-dlp，再回退到系统 PATH，避免依赖当前工作目录。
+        let candidate = self
+            .project_venv_ytdlp()
+            .unwrap_or_else(|| PathBuf::from("yt-dlp"));
+        debug!(
+            "yt-dlp fallback: {} (cookie={})",
+            candidate.display(),
+            !self.cookie.is_empty()
+        );
+        let mut cmd = Command::new(&candidate);
+        cmd.kill_on_drop(true);
         cmd.args(["--flat-playlist", "--playlist-end"])
             .arg(count.to_string())
             .args(["--print", "%(id)s"])
             .arg(format!("https://space.bilibili.com/{mid}/video"));
-        if let Ok(out) = cmd.output() {
-            let text = String::from_utf8_lossy(&out.stdout);
-            return text
-                .lines()
-                .map(|s| s.trim().to_string())
-                .filter(|s| s.starts_with("BV"))
-                .take(count as usize)
-                .collect();
+        // 带用户 Cookie 可显著降低 B站风控；匿名请求容易被 352/412 拒绝。
+        if !self.cookie.is_empty() {
+            cmd.args(["--add-header", &format!("Cookie: {}", self.cookie)]);
         }
+        let child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+        if let Ok(child) = child {
+            match tokio::time::timeout(Duration::from_secs(30), child.wait_with_output()).await {
+                Ok(Ok(out)) => {
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    let ids: Vec<String> = text
+                        .lines()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| is_plausible_bvid(s))
+                        .take(count as usize)
+                        .collect();
+                    if ids.is_empty() {
+                        let err = String::from_utf8_lossy(&out.stderr);
+                        warn!(
+                            "yt-dlp 未返回 BV 号: {}",
+                            err.chars().take(300).collect::<String>()
+                        );
+                    } else {
+                        debug!("yt-dlp 返回 {} 条", ids.len());
+                    }
+                    return ids;
+                }
+                Ok(Err(e)) => {
+                    warn!("yt-dlp 读取输出失败: {e}");
+                    return Vec::new();
+                }
+                Err(_) => {
+                    warn!("yt-dlp 兜底超时（30 秒）");
+                    return Vec::new();
+                }
+            }
+        }
+        warn!("yt-dlp 启动失败: {candidate:?}");
         Vec::new()
     }
+
+    fn project_venv_ytdlp(&self) -> Option<PathBuf> {
+        let candidates = [
+            self.project_dir.join(".venv").join("bin").join("yt-dlp"),
+            self.project_dir
+                .join(".venv")
+                .join("Scripts")
+                .join("yt-dlp.exe"),
+        ];
+        candidates.into_iter().find(|p| p.exists())
+    }
+}
+
+/// B站 BV 号是 10 位字母数字且以 BV1 开头；用于过滤 RSS/yt-dlp 输出里的脏文本。
+fn is_plausible_bvid(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.len() == 12
+        && text.starts_with("BV1")
+        && bytes[3..].iter().all(|b| b.is_ascii_alphanumeric())
 }
 
 /// 从 RSS/HTML 文本提取 BV 号（保持顺序、去重）。
@@ -492,10 +574,10 @@ fn tag_attr_case(item: &str, attr: &str) -> Option<String> {
     }
 }
 
-/// 平台注册表：后续从配置/链接自动选择适配器。
-pub fn resolve(url: &str) -> Box<dyn Platform> {
+/// 带项目根的平台注册表：yt-dlp 兜底按项目 .venv 查找，跨目录运行也可用。
+pub fn resolve_with_project_dir(url: &str, project_dir: &Path) -> Box<dyn Platform> {
     if url.contains("bilibili.com") || url.contains("b23.tv") {
-        Box::new(BilibiliAdapter::new())
+        Box::new(BilibiliAdapter::with_project_dir(project_dir.to_path_buf()))
     } else {
         Box::new(RssAdapter::new())
     }

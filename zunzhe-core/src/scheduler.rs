@@ -55,7 +55,8 @@ pub async fn run_daemon(
     }
 }
 
-/// 每轮 tick 限制 30 秒：单次网络卡顿只记日志，不让 daemon 永久阻塞。
+/// 每轮 tick 限制 70 秒：单源最多 50 秒 + 下载/封面等余量。
+/// 单次网络卡顿只记日志，不让 daemon 永久阻塞。
 async fn run_tick_with_timeout(
     monitor: &LiveMonitor<'_>,
     pool: &SqlitePool,
@@ -63,7 +64,7 @@ async fn run_tick_with_timeout(
     fupan_dir: &Path,
     config: &Config,
 ) {
-    let result = tokio::time::timeout(Duration::from_secs(15), async {
+    let result = tokio::time::timeout(Duration::from_secs(70), async {
         let live = monitor.run_once().await;
         let videos = tick(pool, project_dir, fupan_dir, config).await;
         (live, videos)
@@ -80,7 +81,7 @@ async fn run_tick_with_timeout(
                 Err(e) => error!("daemon tick failed: {e:#}"),
             }
         }
-        Err(_) => warn!("daemon tick 超过 30 秒，本轮已跳过，继续下一轮"),
+        Err(_) => warn!("daemon tick 超过 70 秒，本轮已跳过，继续下一轮"),
     }
 }
 
@@ -115,10 +116,27 @@ async fn tick(
     }
     let auto_download = config.is_yes("视频监控", "自动下载新视频(是/否)", true);
     let notify_enabled = config.is_yes("复盘邮件", "发现新视频时发送通知(是/否)", true);
+    let item_count = items.len();
     for (source_url, name, item_download) in items {
-        let adapter = platform::resolve(&source_url);
-        match adapter.list_videos(&source_url, 10).await {
-            Ok(videos) => {
+        let adapter = platform::resolve_with_project_dir(&source_url, project_dir);
+        // 首次基线未建立时仍然检查；B站空间接口 403 等失败要明确返回错误，
+        // 不能把“0 条视频”当成成功，避免用户误以为监控已正常工作。
+        // 每个视频源最多 50 秒：B站官方/RSSHub/yt-dlp 多重兜底可能叠加较久，
+        // 单源卡住不能拖垮整个 daemon 轮次。
+        match tokio::time::timeout(
+            Duration::from_secs(50),
+            adapter.list_videos(&source_url, 10),
+        )
+        .await
+        {
+            Ok(Err(e)) => {
+                error!("source {source_url} check failed: {e:#}");
+                if item_count == 1 {
+                    // 单源且是用户手动 check-videos：把失败直接暴露，便于排查。
+                    return Err(anyhow::anyhow!("视频监控源检查失败 {source_url}: {e:#}"));
+                }
+            }
+            Ok(Ok(videos)) => {
                 let known_ids: Vec<String> = db::get_videos(pool, "", "", false)
                     .await?
                     .iter()
@@ -126,6 +144,10 @@ async fn tick(
                     .collect();
                 let first_run = !db::is_source_baselined(pool, &source_url).await?;
                 for v in &videos {
+                    // view 接口失败时只返回占位标题，跳过不写库，避免污染视频库。
+                    if v.title == v.id {
+                        continue;
+                    }
                     let is_new = !known_ids.contains(&v.id);
                     match library.upsert(v, &name, &source_url).await {
                         // 首次监控：只把现有视频写入库作为基线，不通知、不下载。
@@ -170,7 +192,12 @@ async fn tick(
                 }
                 checked += 1;
             }
-            Err(e) => error!("source {source_url} check failed: {e:#}"),
+            Err(_) => {
+                error!("source {source_url} check timeout (50s)");
+                if item_count == 1 {
+                    return Err(anyhow::anyhow!("视频监控源检查超时（50 秒）: {source_url}"));
+                }
+            }
         }
     }
 

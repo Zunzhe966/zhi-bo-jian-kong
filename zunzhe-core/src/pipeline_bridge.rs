@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -121,6 +122,7 @@ impl PythonTool {
             anyhow::bail!("找不到复盘流水线模块: {}", self.module.display());
         }
         let mut cmd = Command::new(&self.python);
+        cmd.kill_on_drop(true);
         cmd.arg(&self.module)
             .arg("--save_file_path")
             .arg(media_path)
@@ -129,7 +131,17 @@ impl PythonTool {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let output = cmd.output().await.context("启动复盘流水线失败")?;
+        let child = cmd
+            .spawn()
+            .with_context(|| format!("启动复盘流水线失败: {}", self.python.display()))?;
+        let output =
+            match tokio::time::timeout(Duration::from_secs(3600), child.wait_with_output()).await {
+                Ok(output) => output?,
+                Err(_) => {
+                    // kill_on_drop 已开启：timeout 返回后 child 被丢弃即自动终止。
+                    anyhow::bail!("复盘流水线超时（60 分钟），已终止任务");
+                }
+            };
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !output.status.success() {

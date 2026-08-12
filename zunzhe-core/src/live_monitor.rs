@@ -760,6 +760,109 @@ pub struct LiveCheckStats {
     pub started: usize,
 }
 
+/// 手动录制一次直播：检测流地址 -> 启动 ffmpeg 录 duration 秒 -> 等待退出。
+/// 用于命令行/界面一键验证。duration=0 时也会监听中断信号并清理 ffmpeg，
+/// 避免 Ctrl-C 后留下孤儿录制进程；不写入 live_sessions（避免和 daemon 状态机冲突）。
+pub async fn record_live_once(
+    pool: &SqlitePool,
+    project_dir: &Path,
+    config: &Config,
+    url: &str,
+    duration_secs: u64,
+) -> Result<String> {
+    let cookie = config.get_main("Cookie", "b站cookie");
+    let adapter = resolve_live_with_cookie(url, &cookie);
+    let status = adapter.check(url).await.context("直播检测失败")?;
+    if !status.is_live {
+        bail!("当前未开播，无法录制: {url}");
+    }
+    let watch = Watchlist::new(project_dir.to_path_buf());
+    let item = LiveItem {
+        url: url.to_string(),
+        remark: status.anchor_name.clone(),
+        quality: String::new(),
+        enabled: true,
+        notify: String::new(),
+    };
+    let monitor = LiveMonitor::new(pool, project_dir, config, &watch);
+    let output = monitor.output_path(&item, &status, &status.anchor_name)?;
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let ffmpeg = monitor.ffmpeg_bin();
+    let mut args = monitor.ffmpeg_args(&status.stream_url, &output);
+    if duration_secs > 0 {
+        args.extend(["-t".into(), duration_secs.to_string()]);
+    }
+    let mut cmd = Command::new(&ffmpeg);
+    let pid_for_cleanup = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let cleanup_path = project_dir
+        .join("fupan_output")
+        .join("run")
+        .join("rust_live");
+    let cleanup_hash = crate::service::rust_live_pid_name(url);
+    let cleanup_file = cleanup_path.join(format!("{cleanup_hash}.pid"));
+    let _ = std::fs::create_dir_all(&cleanup_path);
+    cmd.args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setpgid(0, 0);
+                Ok(())
+            });
+        }
+    }
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("启动 ffmpeg 失败: {}", ffmpeg.display()))?;
+    let pid = child.id().unwrap_or(0);
+    pid_for_cleanup.store(pid, std::sync::atomic::Ordering::SeqCst);
+    if pid > 0 {
+        let _ = std::fs::create_dir_all(&cleanup_path);
+        let _ = std::fs::write(&cleanup_file, pid.to_string());
+    }
+    // 异步等待 Ctrl-C/SIGTERM；到点后结束 ffmpeg 进程组，避免孤儿。
+    let cleanup_pid_2 = pid_for_cleanup.clone();
+    let cleanup_file_2 = cleanup_file.clone();
+    let cleanup_task = tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+            } else {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        let pid = cleanup_pid_2.load(std::sync::atomic::Ordering::SeqCst);
+        if pid > 0 {
+            terminate_process(pid);
+        }
+        let _ = std::fs::remove_file(&cleanup_file_2);
+    });
+    let (code, log) = wait_child(&mut child).await;
+    cleanup_task.abort();
+    let _ = std::fs::remove_file(&cleanup_file);
+    if code != 0 {
+        if code == -1 {
+            anyhow::bail!("录制被中断: {}", last_log_lines(&log, 300));
+        }
+        anyhow::bail!("录制失败 code={code}: {}", last_log_lines(&log, 300));
+    }
+    Ok(output.display().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

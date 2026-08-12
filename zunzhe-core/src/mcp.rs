@@ -249,7 +249,10 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
             let count = args.get("count").and_then(|v| v.as_u64()).unwrap_or(30) as u32;
             let cookie = cfg.get_fupan("视频监控", "b站cookie");
             let adapter: Box<dyn platform::Platform> = if url.contains("bilibili.com") {
-                Box::new(platform::BilibiliAdapter::with_cookie(cookie))
+                Box::new(platform::BilibiliAdapter::with_cookie_and_project_dir(
+                    cookie,
+                    project_dir.to_path_buf(),
+                ))
             } else {
                 Box::new(platform::RssAdapter::new())
             };

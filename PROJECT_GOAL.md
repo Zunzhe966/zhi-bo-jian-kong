@@ -59,7 +59,9 @@ Python 工具层  faster-whisper / LLM 提炼 / ffmpeg 切片 / yt-dlp 兜底
 - CLI/MCP 命令与 Python 版对齐；SQLite 持久化、崩溃可恢复、任务失败只记日志不拖垮 daemon
 - 视频监控支持监控列表/偏好/服务管理，首次监控只记录基线，之后只对新视频通知/下载
 - 平台适配器：B站原生接口（Cookie 防 412）+ RSS 兜底；抖音/快手走 RSSHub 或 yt-dlp
-- 已知待补：邮箱授权码需用户提供；B站/抖音风控时需配置 Cookie；直播录制引擎仍由 Python 层负责
+- 已知待补：邮箱授权码需用户提供；B站/抖音风控时需配置 Cookie
+- 已知待补：B站视频监控当前环境匿名访问被 352/412 风控，需在
+  `config/fupan_config.ini` 的 `[视频监控] b站cookie` 填入浏览器 Cookie
 
 ## 五、关键约定
 

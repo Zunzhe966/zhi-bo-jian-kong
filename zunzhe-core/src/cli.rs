@@ -48,6 +48,12 @@ enum Command {
     ListAnchors,
     /// 检查单个直播间监控状态
     CheckLive { url: String },
+    /// 手动录制一次直播（秒数，0=一直录到结束）
+    RecordLive {
+        url: String,
+        #[arg(default_value_t = 0)]
+        duration_secs: u64,
+    },
     /// 添加博主发视频监控
     AddVideo {
         url: String,
@@ -227,6 +233,20 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 })
             );
         }
+        Command::RecordLive { url, duration_secs } => {
+            match live_monitor::record_live_once(&pool, &project_dir, &cfg, &url, duration_secs)
+                .await
+            {
+                Ok(file) => println!(
+                    "{}",
+                    json!({"ok": true, "url": url, "file": file, "duration_secs": duration_secs})
+                ),
+                Err(e) => println!(
+                    "{}",
+                    json!({"ok": false, "url": url, "error": e.to_string()})
+                ),
+            }
+        }
         Command::AddVideo {
             url,
             name,
@@ -292,7 +312,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::BloggerVideos { url, count } => {
             let cookie = cfg.get_fupan("视频监控", "b站cookie");
             let adapter: Box<dyn platform::Platform> = if url.contains("bilibili.com") {
-                Box::new(platform::BilibiliAdapter::with_cookie(cookie))
+                Box::new(platform::BilibiliAdapter::with_cookie_and_project_dir(
+                    cookie,
+                    project_dir.clone(),
+                ))
             } else {
                 Box::new(platform::RssAdapter::new())
             };

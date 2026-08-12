@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
@@ -28,8 +29,9 @@ impl Downloader {
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("创建下载目录失败: {}", dir.display()))?;
 
-        let ytdlp = find_ytdlp().await;
+        let ytdlp = find_ytdlp(&self.project_dir).await;
         let mut cmd = Command::new(&ytdlp);
+        cmd.kill_on_drop(true);
         cmd.args([
             "-f",
             "bv*+ba/b",
@@ -50,13 +52,21 @@ impl Downloader {
                 cmd.args(["--add-header", &format!("Cookie: {cookie}")]);
             }
         }
-        let output = cmd
+        let child = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
-            .await
+            .spawn()
             .with_context(|| format!("启动 yt-dlp 失败: {ytdlp}"))?;
+
+        let output =
+            match tokio::time::timeout(Duration::from_secs(600), child.wait_with_output()).await {
+                Ok(output) => output?,
+                Err(_) => {
+                    // kill_on_drop 已开启：timeout 返回后 child 被丢弃即自动终止。
+                    anyhow::bail!("yt-dlp 下载超时（10 分钟），已终止任务");
+                }
+            };
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -80,15 +90,15 @@ impl Downloader {
     }
 }
 
-async fn find_ytdlp() -> String {
+async fn find_ytdlp(project_dir: &Path) -> String {
     if let Ok(found) = Command::new("yt-dlp").arg("--version").output().await
         && found.status.success()
     {
         return "yt-dlp".to_string();
     }
     let candidates = [
-        Path::new(".venv").join("bin").join("yt-dlp"),
-        Path::new(".venv").join("Scripts").join("yt-dlp.exe"),
+        project_dir.join(".venv").join("bin").join("yt-dlp"),
+        project_dir.join(".venv").join("Scripts").join("yt-dlp.exe"),
     ];
     for c in candidates {
         if c.exists() {
@@ -147,12 +157,17 @@ pub async fn process_pending(pool: &SqlitePool, project_dir: &Path) -> Result<us
                 done += 1;
             }
             Err(_) => {
-                // 重试 3 次后标记 failed，避免死循环；具体错误可看日志。
-                if task.attempts >= 3 {
-                    db::update_task_status(pool, task.id, "failed").await?;
-                } else {
-                    db::update_task_status(pool, task.id, "pending").await?;
-                }
+                // 前 2 次失败留 pending 重试，第 3 次失败标记 failed，避免队列无限卡住。
+                db::update_task_status(
+                    pool,
+                    task.id,
+                    if task.attempts + 1 >= 3 {
+                        "failed"
+                    } else {
+                        "pending"
+                    },
+                )
+                .await?;
             }
         }
     }
