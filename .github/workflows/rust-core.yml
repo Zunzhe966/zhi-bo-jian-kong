@@ -1,0 +1,54 @@
+name: Rust Core CI
+
+on:
+  push:
+    paths:
+      - 'zunzhe-core/**'
+      - '.github/workflows/rust-core.yml'
+  pull_request:
+    paths:
+      - 'zunzhe-core/**'
+      - '.github/workflows/rust-core.yml'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: fmt + clippy + test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: zunzhe-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: zunzhe-core -> target
+      - name: Format check
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --all-targets
+      - name: Release build
+        run: cargo build --release
+      - name: CLI contract smoke
+        run: |
+          ./target/release/zunzhe-core --help > /dev/null
+          ./target/release/zunzhe-core mcp-info | grep mcp_command
+        if: runner.os != 'Windows'
+      - name: CLI contract smoke (Windows)
+        shell: pwsh
+        run: |
+          .\target\release\zunzhe-core.exe --help | Out-Null
+          .\target\release\zunzhe-core.exe mcp-info | Select-String mcp_command
+        if: runner.os == 'Windows'

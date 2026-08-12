@@ -52,6 +52,12 @@ Python 工具层  faster-whisper / LLM 提炼 / ffmpeg 切片 / yt-dlp 兜底
 | G | QQ 邮箱通知链路：配置助手/状态诊断/老项目迁移/桌面端一键填入 | ✅ 已完成（授权码需用户提供） |
 | F | 交付：git 提交、文档图谱更新、汇报 | 🔄 本次收尾 |
 
+### Rust 三平台 CI
+- `.github/workflows/rust-core.yml` 会在 push/PR 时对 `zunzhe-core` 在
+  macOS / Windows / Ubuntu 三平台跑 `cargo fmt --check`、`clippy -D warnings`、
+  `cargo test --all-targets`、release 构建与 CLI 契约冒烟，作为“三平台可编译运行”
+  的自动化证据。
+
 ### Rust 重构（zunzhe-core）已交付能力
 
 - M0-M12 全部完成并通过 `cargo test`（28 个测试）+ `cargo clippy` + `cargo fmt`

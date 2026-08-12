@@ -10,6 +10,10 @@
 
 一款**简易**的可循环值守的直播录制工具，基于FFmpeg实现多平台直播源录制，支持自定义配置录制以及直播状态推送。
 
+> Rust 核心 `zunzhe-core` 正在逐步接管旧 Python 版能力；三平台 CI
+> （macOS / Windows / Ubuntu）在 `.github/workflows/rust-core.yml`，每次改动自动跑
+> fmt / clippy / 全量测试 / release 构建。
+
 </div>
 
 ## 😺已支持平台
