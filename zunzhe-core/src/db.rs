@@ -574,16 +574,31 @@ pub async fn enqueue_task(
 /// 认领后崩溃会把任务留在 processing，下次启动用 `recover_processing` 归还队列；
 /// 单实例 daemon 下也防止同批任务被并发重复执行。
 pub async fn claim_pending_task(pool: &SqlitePool, limit: i64) -> anyhow::Result<Option<Task>> {
-    let row = sqlx::query(
+    claim_pending_task_by_kind(pool, "", limit).await
+}
+
+/// 认领指定 kind 的待处理任务；kind 为空时认领任意 pending 任务。
+/// 下载/复盘各自只认领自己的任务，避免并发 worker 互相抢任务。
+pub async fn claim_pending_task_by_kind(
+    pool: &SqlitePool,
+    kind: &str,
+    limit: i64,
+) -> anyhow::Result<Option<Task>> {
+    let mut sql = String::from(
         "SELECT id, kind, url, name, status, attempts, payload, created_at, updated_at
          FROM tasks
-         WHERE status = 'pending'
-         ORDER BY id LIMIT ?",
-    )
-    .bind(limit)
-    .fetch_optional(pool)
-    .await
-    .context("查询待处理任务")?;
+         WHERE status = 'pending'",
+    );
+    if !kind.is_empty() {
+        sql.push_str(" AND kind = ?");
+    }
+    sql.push_str(" ORDER BY id LIMIT ?");
+    let mut query = sqlx::query(&sql);
+    if !kind.is_empty() {
+        query = query.bind(kind);
+    }
+    query = query.bind(limit);
+    let row = query.fetch_optional(pool).await.context("查询待处理任务")?;
     let Some(row) = row else {
         return Ok(None);
     };
@@ -612,11 +627,26 @@ pub async fn claim_pending_task(pool: &SqlitePool, limit: i64) -> anyhow::Result
 }
 
 /// 启动/每轮 tick 前把上次崩溃遗留的 processing 任务归还 pending 重试。
+/// 注意：下载 worker 与复盘 worker 各自认领前只恢复自己 kind 的任务，
+/// 避免把另一个 worker 正在处理的任务误判成崩溃残留。
 pub async fn recover_processing(pool: &SqlitePool) -> anyhow::Result<u64> {
     let result = sqlx::query("UPDATE tasks SET status='pending', updated_at=datetime('now','localtime') WHERE status='processing'")
         .execute(pool)
         .await
         .context("恢复处理中任务")?;
+    Ok(result.rows_affected())
+}
+
+/// 只恢复指定 kind 的 processing 任务（下载/复盘队列各自独立恢复）。
+pub async fn recover_processing_by_kind(pool: &SqlitePool, kind: &str) -> anyhow::Result<u64> {
+    let result = sqlx::query(
+        "UPDATE tasks SET status='pending', updated_at=datetime('now','localtime')
+         WHERE status='processing' AND kind=?",
+    )
+    .bind(kind)
+    .execute(pool)
+    .await
+    .context("恢复指定类型处理中任务")?;
     Ok(result.rows_affected())
 }
 

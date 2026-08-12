@@ -54,6 +54,8 @@ impl Downloader {
         // 下载成功但视频库还没有该记录时补一行，保证“已下载”有事实源。
         let _ = db::ensure_video_row(pool, &video_id, url, name, name).await;
         let _ = db::mark_downloaded(pool, &video_id, true).await;
+        // 下载完成后入队复盘任务（转写/提炼/切片），不阻塞下载调用方。
+        let _ = enqueue_pipeline_after_download(pool, &file, name).await;
         Ok(DownloadResult {
             ok: true,
             file,
@@ -335,10 +337,10 @@ pub struct DownloadResult {
 /// 把 pending 下载任务逐个执行（失败重试，成功标记）。
 pub async fn process_pending(pool: &SqlitePool, project_dir: &Path) -> Result<usize> {
     // 上次崩溃遗留的 processing 任务先归还队列，避免永久卡死。
-    db::recover_processing(pool).await?;
+    db::recover_processing_by_kind(pool, "download").await?;
     let downloader = Downloader::new(project_dir.to_path_buf());
     let mut done = 0;
-    while let Some(task) = db::claim_pending_task(pool, 1).await? {
+    while let Some(task) = db::claim_pending_task_by_kind(pool, "download", 1).await? {
         let outcome =
             run_single_task_with_timeout(pool, &task, &downloader, Duration::from_secs(600)).await;
         if outcome {
@@ -351,6 +353,27 @@ pub async fn process_pending(pool: &SqlitePool, project_dir: &Path) -> Result<us
     Ok(done)
 }
 
+/// 下载完成后立即入队复盘任务：kind="process"、url 是媒体文件绝对路径、
+/// name 是主播/博主名，避免阻塞下载 worker，也避免并发 spawn 无限堆积。
+pub async fn enqueue_pipeline_after_download(
+    pool: &SqlitePool,
+    file: &str,
+    name: &str,
+) -> anyhow::Result<i64> {
+    // 同一媒体文件已经排队或正在处理时不再重复入队。
+    let existing: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM tasks WHERE kind='process' AND url=? AND status IN ('pending','processing','failed') LIMIT 1",
+    )
+    .bind(file)
+    .fetch_optional(pool)
+    .await
+    .context("查询已有复盘任务")?;
+    if let Some(id) = existing {
+        return Ok(id);
+    }
+    db::enqueue_task(pool, "process", file, name).await
+}
+
 /// 独立下载队列 worker：不参与 70 秒 tick 护栏，每个任务自身有 600 秒超时，
 /// 下载耗时不会阻塞直播/视频检查，也不会被 tick abort 后永远卡 processing。
 pub async fn run_download_worker(
@@ -361,7 +384,7 @@ pub async fn run_download_worker(
     poll_interval: Duration,
 ) -> anyhow::Result<()> {
     // 启动前把上次崩溃/被 tick 截断遗留的 processing 任务归还队列。
-    let recovered = db::recover_processing(&pool)
+    let recovered = db::recover_processing_by_kind(&pool, "download")
         .await
         .context("下载 worker 恢复处理中任务")?;
     if recovered > 0 {
@@ -409,7 +432,7 @@ async fn drain_pending(
     stop: &tokio::sync::watch::Receiver<bool>,
 ) -> Result<usize> {
     let mut done = 0usize;
-    while let Some(task) = db::claim_pending_task(pool, 1).await? {
+    while let Some(task) = db::claim_pending_task_by_kind(pool, "download", 1).await? {
         let outcome = run_single_task_with_timeout(pool, &task, downloader, task_timeout).await;
         if outcome {
             done += 1;
@@ -453,7 +476,7 @@ async fn run_single_task_with_timeout(
             } else {
                 "pending"
             };
-            let _ = db::set_task_status(pool, task.id, next).await;
+            let _ = db::update_task_status(pool, task.id, next).await;
             false
         }
         Err(_) => {
@@ -467,7 +490,7 @@ async fn run_single_task_with_timeout(
             } else {
                 "pending"
             };
-            let _ = db::set_task_status(pool, task.id, next).await;
+            let _ = db::update_task_status(pool, task.id, next).await;
             false
         }
     }
@@ -553,6 +576,48 @@ mod tests {
         assert!(
             rows.iter().any(|t| t.id == id),
             "失败任务应回到 pending 等待重试，而不是卡 processing"
+        );
+        std::mem::forget(file);
+    }
+
+    #[tokio::test]
+    async fn repeated_failures_finally_mark_failed_and_stop() {
+        let file = std::env::temp_dir().join(format!(
+            "zunzhe-dl-fail-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pool = crate::db::open_pool(&file).await.unwrap();
+        let id = crate::db::enqueue_task(&pool, "download", "https://example.invalid/x", "测试")
+            .await
+            .unwrap();
+        let downloader = Downloader::new(std::env::temp_dir().join("zunzhe-nonexistent"));
+        for _ in 0..3 {
+            let task = crate::db::claim_pending_task_by_kind(&pool, "download", 1)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                !run_single_task_with_timeout(&pool, &task, &downloader, Duration::from_secs(1))
+                    .await,
+                "失败任务不应成功"
+            );
+        }
+        let rows: Vec<crate::model::Task> =
+            crate::db::list_tasks(&pool, "failed", 10).await.unwrap();
+        assert!(
+            rows.iter().any(|t| t.id == id),
+            "第三次失败后应标 failed，当前: {rows:?}"
+        );
+        assert!(
+            crate::db::claim_pending_task_by_kind(&pool, "download", 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "failed 后不能再被自动认领"
         );
         std::mem::forget(file);
     }

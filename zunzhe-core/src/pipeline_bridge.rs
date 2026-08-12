@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::Serialize;
+use sqlx::sqlite::SqlitePool;
 use tokio::process::Command;
 
 use crate::config::Config;
@@ -118,16 +119,21 @@ impl PythonTool {
         if !self.python.exists() {
             anyhow::bail!("找不到 Python 虚拟环境: {}", self.python.display());
         }
-        if !self.module.exists() {
-            anyhow::bail!("找不到复盘流水线模块: {}", self.module.display());
-        }
         let mut cmd = Command::new(&self.python);
         cmd.kill_on_drop(true);
-        cmd.arg(&self.module)
+        // 用 -m 以包方式运行，fupan 内部相对导入才能正常工作。
+        cmd.arg("-m")
+            .arg("fupan.pipeline")
             .arg("--save_file_path")
             .arg(media_path)
             .arg("--record_name")
             .arg(record_name)
+            .current_dir(
+                self.module
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .unwrap_or_else(|| Path::new(".")),
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -190,6 +196,123 @@ pub async fn run_pipeline_by_project(
         .await
 }
 
+/// 独立复盘队列 worker：处理 kind="process" 的任务（下载完成后自动转写/提炼/切片）。
+/// 不参与 70 秒 tick 护栏，单个任务最多 60 分钟；失败重试 3 次后标 failed。
+pub async fn run_pipeline_worker(
+    pool: SqlitePool,
+    project_dir: PathBuf,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+    task_timeout: Duration,
+    poll_interval: Duration,
+) -> anyhow::Result<()> {
+    let recovered = crate::db::recover_processing_by_kind(&pool, "process")
+        .await
+        .context("复盘 worker 恢复处理中任务")?;
+    if recovered > 0 {
+        tracing::info!("复盘 worker 启动，恢复 {recovered} 条 processing 任务");
+    }
+    let mut idle = 0u64;
+    loop {
+        tokio::select! {
+            _ = stop.changed() => {
+                if *stop.borrow() {
+                    tracing::info!("复盘 worker 收到停止信号，退出");
+                    return Ok(());
+                }
+            }
+            _ = tokio::time::sleep(poll_interval) => {
+                idle += 1;
+            }
+        }
+        match drain_process_tasks(&pool, &project_dir, task_timeout, &stop).await {
+            Ok(done) => {
+                if done > 0 {
+                    tracing::info!("复盘 worker 本轮处理 {done} 个任务");
+                    idle = 0;
+                } else if idle >= 12 {
+                    tracing::info!("复盘 worker 空闲中，等待复盘队列");
+                    idle = 0;
+                }
+            }
+            Err(e) => {
+                tracing::error!("复盘 worker 处理队列失败，稍后重试: {e:#}");
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+        }
+    }
+}
+
+/// 认领并执行复盘任务，直到队列暂时为空或收到停止信号。
+async fn drain_process_tasks(
+    pool: &SqlitePool,
+    project_dir: &Path,
+    task_timeout: Duration,
+    stop: &tokio::sync::watch::Receiver<bool>,
+) -> Result<usize> {
+    let mut done = 0usize;
+    while let Some(task) = crate::db::claim_pending_task_by_kind(pool, "process", 1).await? {
+        if run_single_process_task(pool, project_dir, &task, task_timeout).await {
+            done += 1;
+        }
+        if *stop.borrow() {
+            tracing::info!("复盘 worker 在任务间收到停止信号，退出");
+            return Ok(done);
+        }
+    }
+    Ok(done)
+}
+
+/// 执行单个复盘任务并更新状态。超时/失败都显式落定，绝不永久卡 processing。
+async fn run_single_process_task(
+    pool: &SqlitePool,
+    project_dir: &Path,
+    task: &crate::model::Task,
+    timeout_duration: Duration,
+) -> bool {
+    if task.kind != "process" {
+        let _ = crate::db::update_task_status(pool, task.id, "failed").await;
+        return false;
+    }
+    let outcome = tokio::time::timeout(
+        timeout_duration,
+        run_pipeline_by_project(project_dir, &task.url, &task.name),
+    )
+    .await;
+    match outcome {
+        Ok(Ok(_)) => crate::db::update_task_status(pool, task.id, "done")
+            .await
+            .is_ok(),
+        Ok(Err(e)) => {
+            tracing::warn!(
+                "复盘任务 id={} 失败（attempts={}）: {e:#}",
+                task.id,
+                task.attempts + 1
+            );
+            let next = if task.attempts + 1 >= 3 {
+                "failed"
+            } else {
+                "pending"
+            };
+            let _ = crate::db::update_task_status(pool, task.id, next).await;
+            false
+        }
+        Err(_) => {
+            tracing::warn!(
+                "复盘任务 id={} 超时（attempts={}），已显式结束本轮",
+                task.id,
+                task.attempts + 1
+            );
+            let next = if task.attempts + 1 >= 3 {
+                "failed"
+            } else {
+                "pending"
+            };
+            let _ = crate::db::update_task_status(pool, task.id, next).await;
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,11 +321,98 @@ mod tests {
     fn python_tool_paths_are_relative_to_project() {
         let tool = PythonTool::from_project(Path::new("/tmp/proj"));
         assert!(tool.python.to_string_lossy().contains(".venv"));
-        // 路径分隔符随平台不同：只要模块定位到 fupan/pipeline.py 即可。
-        let module = tool.module.to_string_lossy();
+        assert!(tool.module.ends_with("pipeline.py"));
+    }
+
+    #[tokio::test]
+    async fn pipeline_worker_marks_stuck_task_failed() {
+        let file = std::env::temp_dir().join(format!(
+            "zunzhe-pipeline-worker-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pool = crate::db::open_pool(&file).await.unwrap();
+        let id = crate::db::enqueue_task(&pool, "process", "/tmp/不存在.mp4", "测试")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE tasks SET attempts=2 WHERE id=?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let worker = tokio::spawn(super::run_pipeline_worker(
+            pool.clone(),
+            std::env::temp_dir().join("zunzhe-nonexistent"),
+            rx,
+            Duration::from_millis(100),
+            Duration::from_millis(5),
+        ));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let _ = tx.send(true);
+        worker.await.unwrap().unwrap();
+        let rows: Vec<crate::model::Task> =
+            crate::db::list_tasks(&pool, "failed", 10).await.unwrap();
         assert!(
-            module.contains("fupan") && module.contains("pipeline.py"),
-            "unexpected module path: {module}"
+            rows.iter().any(|t| t.id == id),
+            "超时复盘任务应标 failed，当前: {rows:?}"
         );
+        assert!(
+            crate::db::claim_pending_task_by_kind(&pool, "process", 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "failed 复盘任务不应被自动重新认领"
+        );
+        std::mem::forget(file);
+    }
+
+    #[tokio::test]
+    async fn pipeline_repeated_failures_stop_after_three_attempts() {
+        let file = std::env::temp_dir().join(format!(
+            "zunzhe-pipeline-fail-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pool = crate::db::open_pool(&file).await.unwrap();
+        let id = crate::db::enqueue_task(&pool, "process", "/tmp/不存在.mp4", "测试")
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            let task = crate::db::claim_pending_task_by_kind(&pool, "process", 1)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                !run_single_process_task(
+                    &pool,
+                    &std::env::temp_dir().join("zunzhe-nonexistent"),
+                    &task,
+                    Duration::from_millis(100),
+                )
+                .await,
+                "失败复盘任务不应成功"
+            );
+        }
+        let rows: Vec<crate::model::Task> =
+            crate::db::list_tasks(&pool, "failed", 10).await.unwrap();
+        assert!(
+            rows.iter().any(|t| t.id == id),
+            "第三次失败后应标 failed，当前: {rows:?}"
+        );
+        assert!(
+            crate::db::claim_pending_task_by_kind(&pool, "process", 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "failed 复盘任务不能再被自动认领"
+        );
+        std::mem::forget(file);
     }
 }

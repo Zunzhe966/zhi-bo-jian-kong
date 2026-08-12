@@ -63,6 +63,14 @@ pub async fn run_daemon(
         std::time::Duration::from_secs(600),
         std::time::Duration::from_secs(5),
     ));
+    // 独立复盘队列 worker：下载/录制完成后自动转写、提炼、切片。
+    let mut pipeline_worker = tokio::spawn(crate::pipeline_bridge::run_pipeline_worker(
+        pool.clone(),
+        project_dir.to_path_buf(),
+        stop.1.clone(),
+        std::time::Duration::from_secs(3600),
+        std::time::Duration::from_secs(5),
+    ));
     // 独立心跳记录器：每 60 秒把“daemon 进程仍在运行”写入 uptime 日志，
     // 不依赖 launchd/桌面端 watchdog；launchd 被 macOS TCC 挡在 ~/Desktop 外时
     // 也能持续留下 24×30 验收记录。
@@ -124,6 +132,7 @@ pub async fn run_daemon(
         if once || exited || *stop.1.borrow() {
             let _ = monitor.stop_all_recordings().await;
             stop_download_worker(&pool, &stop.0, &mut download_worker).await;
+            stop_pipeline_worker(&pool, &stop.0, &mut pipeline_worker).await;
             return Ok(());
         }
         // duration 未到点且 tick 提前结束后，等待下一轮；期间继续响应退出。
@@ -140,6 +149,7 @@ pub async fn run_daemon(
         if wait_exit || *stop.1.borrow() {
             let _ = monitor.stop_all_recordings().await;
             stop_download_worker(&pool, &stop.0, &mut download_worker).await;
+            stop_pipeline_worker(&pool, &stop.0, &mut pipeline_worker).await;
             return Ok(());
         }
     }
@@ -157,7 +167,21 @@ async fn stop_download_worker(
         worker.abort();
         let _ = worker.await;
     }
-    let _ = db::recover_processing(pool).await;
+    let _ = db::recover_processing_by_kind(pool, "download").await;
+}
+
+/// 退出 daemon 时停止复盘 worker：abort 当前任务并归还 process 队列。
+async fn stop_pipeline_worker(
+    pool: &SqlitePool,
+    stop: &tokio::sync::watch::Sender<bool>,
+    worker: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
+    let _ = stop.send(true);
+    if !worker.is_finished() {
+        worker.abort();
+        let _ = worker.await;
+    }
+    let _ = db::recover_processing_by_kind(pool, "process").await;
 }
 
 /// 锁持有者的 pid 清理器：无论正常返回、错误返回还是 panic，都会移除本实例 pid。
