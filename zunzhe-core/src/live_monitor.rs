@@ -717,6 +717,8 @@ fn process_alive(pid: u32) -> bool {
             .map(|o| {
                 String::from_utf8_lossy(&o.stdout).lines().any(|line| {
                     let mut parts = line.split_whitespace();
+                    // tasklist 输出首列是 Image Name，第二列才是 PID。
+                    let _image = parts.next();
                     parts
                         .next()
                         .and_then(|p| p.parse::<u32>().ok())

@@ -392,6 +392,8 @@ fn service_pid_by_raw(pid: u32) -> bool {
                 // 逐行解析 tasklist，避免 pid 子串误匹配其它进程。
                 text.lines().any(|line| {
                     let mut parts = line.split_whitespace();
+                    // tasklist 输出首列是 Image Name，第二列才是 PID。
+                    let _image = parts.next();
                     parts
                         .next()
                         .and_then(|p| p.parse::<u32>().ok())
@@ -488,5 +490,28 @@ mod tests {
         assert!(log.with_extension("log.1").exists());
         assert!(log.with_extension("log.2").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn tasklist_pid_is_second_column() {
+        let sample =
+            "zunzhe-core.exe 12345 Console 1 1,234 K\nzunzhe-core.exe 67890 Console 2 5,678 K\n";
+        assert!(tasklist_lines_contain_pid(sample, 12345));
+        assert!(!tasklist_lines_contain_pid(sample, 1234));
+        assert!(!tasklist_lines_contain_pid(sample, 99999));
+    }
+
+    #[cfg(not(unix))]
+    fn tasklist_lines_contain_pid(text: &str, pid: u32) -> bool {
+        text.lines().any(|line| {
+            let mut parts = line.split_whitespace();
+            let _image = parts.next();
+            parts
+                .next()
+                .and_then(|p| p.parse::<u32>().ok())
+                .map(|p| p == pid)
+                .unwrap_or(false)
+        })
     }
 }
