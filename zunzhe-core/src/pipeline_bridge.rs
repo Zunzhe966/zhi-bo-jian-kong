@@ -198,6 +198,11 @@ mod tests {
     fn python_tool_paths_are_relative_to_project() {
         let tool = PythonTool::from_project(Path::new("/tmp/proj"));
         assert!(tool.python.to_string_lossy().contains(".venv"));
-        assert!(tool.module.to_string_lossy().contains("fupan/pipeline.py"));
+        // 路径分隔符随平台不同：只要模块定位到 fupan/pipeline.py 即可。
+        let module = tool.module.to_string_lossy();
+        assert!(
+            module.contains("fupan") && module.contains("pipeline.py"),
+            "unexpected module path: {module}"
+        );
     }
 }

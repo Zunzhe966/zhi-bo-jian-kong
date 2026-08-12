@@ -307,7 +307,7 @@ fn disk_free_bytes(_project_dir: &Path) -> u64 {
             let mut stat = std::mem::zeroed::<libc::statvfs>();
             let c_path = std::ffi::CString::new("/").unwrap_or_default();
             if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
-                let avail = u64::from(stat.f_bavail);
+                let avail = stat.f_bavail as u64;
                 let frsize = stat.f_frsize;
                 return avail.saturating_mul(frsize) / (1024 * 1024);
             }
