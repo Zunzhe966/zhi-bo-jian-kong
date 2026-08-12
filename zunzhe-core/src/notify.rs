@@ -84,6 +84,10 @@ impl<'a> Notifier<'a> {
         };
         if sent {
             db::mark_notify_done(self.pool, id).await?;
+        } else if channel == Channel::Email {
+            // SMTP 明确失败/超时后不留在 pending，避免配置错误时每轮都重试并
+            // 无限膨胀通知队列；临时网络抖动可由用户重试或重新触发。
+            db::fail_notify(self.pool, id).await?;
         }
         Ok(sent)
     }
@@ -127,19 +131,19 @@ impl<'a> Notifier<'a> {
         match tokio::time::timeout(Duration::from_secs(20), join).await {
             Ok(Ok(Ok(true))) => true,
             Ok(Ok(Ok(false))) => {
-                tracing::warn!("SMTP 未返回成功，通知保持 pending 待重试");
+                tracing::warn!("SMTP 未返回成功，通知标记 failed 防止无限重试");
                 false
             }
             Ok(Ok(Err(e))) => {
-                tracing::warn!("SMTP 发送失败，通知保持 pending 待重试: {e:#}");
+                tracing::warn!("SMTP 发送失败，通知标记 failed 防止无限重试: {e:#}");
                 false
             }
             Ok(Err(e)) => {
-                tracing::warn!("SMTP 发送任务失败，通知保持 pending 待重试: {e:#}");
+                tracing::warn!("SMTP 发送任务失败，通知标记 failed 防止无限重试: {e:#}");
                 false
             }
             Err(_) => {
-                tracing::warn!("SMTP 发送超时（20 秒），通知保持 pending 待重试");
+                tracing::warn!("SMTP 发送超时（20 秒），通知标记 failed 防止无限重试");
                 false
             }
         }

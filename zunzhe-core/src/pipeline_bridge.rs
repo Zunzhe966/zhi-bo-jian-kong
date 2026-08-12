@@ -286,9 +286,9 @@ async fn run_single_process_task(
             tracing::warn!(
                 "复盘任务 id={} 失败（attempts={}）: {e:#}",
                 task.id,
-                task.attempts + 1
+                task.attempts
             );
-            let next = if task.attempts + 1 >= 3 {
+            let next = if task.attempts >= 3 {
                 "failed"
             } else {
                 "pending"
@@ -300,9 +300,9 @@ async fn run_single_process_task(
             tracing::warn!(
                 "复盘任务 id={} 超时（attempts={}），已显式结束本轮",
                 task.id,
-                task.attempts + 1
+                task.attempts
             );
-            let next = if task.attempts + 1 >= 3 {
+            let next = if task.attempts >= 3 {
                 "failed"
             } else {
                 "pending"

@@ -604,7 +604,7 @@ pub async fn claim_pending_task_by_kind(
     };
     let id: i64 = row.try_get("id")?;
     let updated = sqlx::query(
-        "UPDATE tasks SET status='processing', updated_at=datetime('now','localtime') WHERE id=? AND status = 'pending'",
+        "UPDATE tasks SET status='processing', attempts=attempts+1, updated_at=datetime('now','localtime') WHERE id=? AND status = 'pending'",
     )
     .bind(id)
     .execute(pool)
@@ -613,13 +613,15 @@ pub async fn claim_pending_task_by_kind(
     if updated.rows_affected() == 0 {
         return Ok(None);
     }
+    let attempts: i64 = row.try_get("attempts")?;
     Ok(Some(Task {
         id,
         kind: row.try_get("kind")?,
         url: row.try_get("url")?,
         name: row.try_get("name")?,
         status: "processing".to_string(),
-        attempts: row.try_get("attempts")?,
+        // 认领时 DB 里已经 `attempts+1`，这里返回最新值，调用方据此决定是否落定 failed。
+        attempts: attempts + 1,
         payload: row.try_get("payload")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
@@ -682,7 +684,9 @@ pub async fn list_tasks(pool: &SqlitePool, status: &str, limit: i64) -> anyhow::
 }
 
 pub async fn update_task_status(pool: &SqlitePool, id: i64, status: &str) -> anyhow::Result<()> {
-    sqlx::query("UPDATE tasks SET status=?, attempts=attempts+1, updated_at=datetime('now','localtime') WHERE id=?")
+    // 本函数只负责终态更新（done/failed/pending），attempts 在认领时递增，
+    // 避免“超时”与“失败”两个分支重复计数，也让同一条任务每次真正执行都计一次。
+    sqlx::query("UPDATE tasks SET status=?, updated_at=datetime('now','localtime') WHERE id=?")
         .bind(status)
         .bind(id)
         .execute(pool)

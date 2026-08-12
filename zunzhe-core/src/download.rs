@@ -479,10 +479,10 @@ async fn run_single_task_with_timeout(
             tracing::warn!(
                 "下载任务 id={} 失败（attempts={}）: {e:#}",
                 task.id,
-                task.attempts + 1
+                task.attempts
             );
             // 失败后前 3 次回到 pending 重试；超过上限标 failed 并停止重试。
-            let next = if task.attempts + 1 >= 3 {
+            let next = if task.attempts >= 3 {
                 "failed"
             } else {
                 "pending"
@@ -494,9 +494,9 @@ async fn run_single_task_with_timeout(
             tracing::warn!(
                 "下载任务 id={} 超时（attempts={}），已显式结束本轮",
                 task.id,
-                task.attempts + 1
+                task.attempts
             );
-            let next = if task.attempts + 1 >= 3 {
+            let next = if task.attempts >= 3 {
                 "failed"
             } else {
                 "pending"
