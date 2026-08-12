@@ -225,7 +225,7 @@ impl Watchlist {
             "" | "跟随全局" => {
                 prefs.remove(url.trim());
             }
-            "微信" | "邮箱" | "不通知" => {
+            "微信" | "邮箱" | "PushPlus" | "Bark" | "ntfy" | "不通知" => {
                 let entry = prefs.entry(url.trim().to_string()).or_default();
                 entry.insert("notify".to_string(), channel.trim().to_string());
                 if !name.is_empty() {

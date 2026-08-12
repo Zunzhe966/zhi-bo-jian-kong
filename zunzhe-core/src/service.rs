@@ -60,7 +60,11 @@ pub fn ensure_core(project_dir: &Path) -> Result<serde_json::Value> {
     let rust = start_rust_daemon(project_dir, 900)?;
     // Rust daemon 已统一接管直播检测/录制和视频监控；不再并行启动 Python
     // video_monitor，避免同一批视频源被两套逻辑重复检查/通知/下载。
-    Ok(json!({"ok": true, "rust_daemon": rust, "services": {}}))
+    let rust_status = rust
+        .get("rust_daemon")
+        .cloned()
+        .unwrap_or(serde_json::Value::Bool(true));
+    Ok(json!({"ok": true, "rust_daemon": rust_status, "services": {}}))
 }
 
 /// 启动 Rust 核心 daemon 并写入 pid 文件（供桌面端/兼容层调用）。

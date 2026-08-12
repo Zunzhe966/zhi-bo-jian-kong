@@ -11,22 +11,38 @@ use std::time::Duration;
 use crate::config::{Config, EmailSettings};
 use crate::db;
 
-/// 通知通道：邮箱 / 微信 / 不通知（微信后续接 Server酱）。
+/// 通知通道：邮箱 / 微信(Server酱) / PushPlus / Bark / ntfy / 不通知。
 #[derive(Debug, Clone, Serialize, PartialEq)]
-#[allow(dead_code)] // 每主播覆盖通道（微信/不通知）预留
+#[allow(dead_code)] // 旧 Python 有 PushPlus/Bark/ntfy，保留通道以便逐项对齐
 pub enum Channel {
     Email,
     Wechat,
+    PushPlus,
+    Bark,
+    Ntfy,
     None,
 }
 
 impl Channel {
-    #[allow(dead_code)] // 按监控偏好字符串解析通道
     pub fn parse(value: &str) -> Self {
         match value.trim() {
             "微信" => Channel::Wechat,
+            "PushPlus" => Channel::PushPlus,
+            "Bark" => Channel::Bark,
+            "ntfy" => Channel::Ntfy,
             "不通知" => Channel::None,
             _ => Channel::Email,
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Channel::Email => "邮箱",
+            Channel::Wechat => "微信",
+            Channel::PushPlus => "PushPlus",
+            Channel::Bark => "Bark",
+            Channel::Ntfy => "ntfy",
+            Channel::None => "不通知",
         }
     }
 }
@@ -50,16 +66,13 @@ impl<'a> Notifier<'a> {
         content: &str,
         channel: Channel,
     ) -> Result<bool> {
+        // 只有“邮箱”需要特殊跳过：未配置邮箱不落库，避免通知表被空配置撑满。
+        // 其它 HTTPS 通道即便未配置也会写一条 failed，供用户定位配置缺口。
         if channel == Channel::Email && !self.config.email_configured() {
             tracing::warn!("邮箱未配置，跳过发送并保持通知可审计性（不写入 pending 队列）");
             return Ok(false);
         }
-        let channel_name = match channel {
-            Channel::Email => "邮箱",
-            Channel::Wechat => "微信",
-            Channel::None => "不通知",
-        };
-        let id = db::add_notify(self.pool, event, anchor, title, content, channel_name).await?;
+        let id = db::add_notify(self.pool, event, anchor, title, content, channel.name()).await?;
         if channel == Channel::None {
             // “不通知”本身是有效投递策略：保留审计记录但立即完成。
             db::mark_notify_done(self.pool, id).await?;
@@ -72,21 +85,17 @@ impl<'a> Notifier<'a> {
                 let body = content.to_string();
                 Self::send_email_with_timeout(settings, subject, body).await
             }
-            Channel::Wechat => {
-                tracing::warn!(
-                    "微信通道尚未接入，通知 id={} 标记 failed，避免无限 pending",
-                    id
-                );
-                db::fail_notify(self.pool, id).await?;
-                return Ok(false);
-            }
+            Channel::Wechat => self.send_wechat(title, content).await,
+            Channel::PushPlus => self.send_pushplus(title, content).await,
+            Channel::Bark => self.send_bark(title, content).await,
+            Channel::Ntfy => self.send_ntfy(title, content).await,
             Channel::None => false,
         };
         if sent {
             db::mark_notify_done(self.pool, id).await?;
-        } else if channel == Channel::Email {
-            // SMTP 明确失败/超时后不留在 pending，避免配置错误时每轮都重试并
-            // 无限膨胀通知队列；临时网络抖动可由用户重试或重新触发。
+        } else {
+            // SMTP/HTTPS 明确失败或超时后不留在 pending，避免配置错误时每轮重试
+            // 并无限膨胀通知队列；临时网络抖动可由用户重试或重新触发。
             db::fail_notify(self.pool, id).await?;
         }
         Ok(sent)
@@ -95,7 +104,7 @@ impl<'a> Notifier<'a> {
     /// 重试通知队列中的 pending 通知：一次最多处理 50 条，失败保留 pending，
     /// 成功标记 sent。发送失败只记日志，不拖垮 daemon tick。
     pub async fn flush_pending(&self, limit: i64) -> Result<usize> {
-        if !self.config.email_configured() {
+        if !self.config.email_configured() && !self.config.push_channels().configured() {
             return Ok(0);
         }
         let pending = db::list_notify(self.pool, "pending", limit).await?;
@@ -118,6 +127,43 @@ impl<'a> Notifier<'a> {
             }
         }
         Ok(sent_count)
+    }
+
+    /// HTTPS 通道的发送实现；请求自带 15 秒超时，网络失败只记日志不 panic。
+    async fn send_wechat(&self, title: &str, content: &str) -> bool {
+        let key = self.config.push_channels().serverchan;
+        if key.is_empty() {
+            tracing::warn!("微信(Server酱) 未配置 SendKey，通知标记 failed");
+            return false;
+        }
+        send_serverchan(&key, title, content).await
+    }
+
+    async fn send_pushplus(&self, title: &str, content: &str) -> bool {
+        let token = self.config.push_channels().pushplus;
+        if token.is_empty() {
+            tracing::warn!("PushPlus 未配置 token，通知标记 failed");
+            return false;
+        }
+        send_pushplus(&token, title, content).await
+    }
+
+    async fn send_bark(&self, title: &str, content: &str) -> bool {
+        let api = self.config.push_channels().bark;
+        if api.is_empty() {
+            tracing::warn!("Bark 未配置接口链接，通知标记 failed");
+            return false;
+        }
+        send_bark(&api, title, content).await
+    }
+
+    async fn send_ntfy(&self, title: &str, content: &str) -> bool {
+        let api = self.config.push_channels().ntfy;
+        if api.is_empty() {
+            tracing::warn!("ntfy 未配置订阅地址，通知标记 failed");
+            return false;
+        }
+        send_ntfy(&api, title, content).await
     }
 
     /// 把阻塞 SMTP 调用放进 blocking 线程池并限时执行，避免卡住 daemon tick。
@@ -158,19 +204,7 @@ impl<'a> Notifier<'a> {
         content: &str,
         channel: Channel,
     ) -> Result<()> {
-        let id = db::add_notify(
-            self.pool,
-            event,
-            anchor,
-            title,
-            content,
-            match channel {
-                Channel::Email => "邮箱",
-                Channel::Wechat => "微信",
-                Channel::None => "不通知",
-            },
-        )
-        .await?;
+        let id = db::add_notify(self.pool, event, anchor, title, content, channel.name()).await?;
         db::mark_notify_done(self.pool, id).await?;
         Ok(())
     }
@@ -224,6 +258,169 @@ pub fn send_email(cfg: EmailSettings, subject: &str, body: &str) -> Result<bool>
     Ok(true)
 }
 
+/// 使用 443 HTTPS 的 Server酱³ 推送，避免代理/TUN 环境只依赖 SMTP 失败。
+/// 成功判定与旧 Python `fupan/notify.py` 保持一致：`code == 0` 或返回 pushid。
+pub async fn send_serverchan(sendkey: &str, title: &str, content: &str) -> bool {
+    if sendkey.is_empty() {
+        return false;
+    }
+    let url = format!("https://sctapi.ftqq.com/{sendkey}.send");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build();
+    let Ok(client) = client else {
+        tracing::warn!("Server酱客户端初始化失败");
+        return false;
+    };
+    let result = client
+        .post(url)
+        .form(&[
+            ("title", title.chars().take(32).collect::<String>()),
+            ("desp", content.to_string()),
+        ])
+        .send()
+        .await;
+    let Ok(resp) = result else {
+        tracing::warn!("Server酱请求失败");
+        return false;
+    };
+    if !resp.status().is_success() {
+        tracing::warn!("Server酱返回 HTTP {}", resp.status());
+        return false;
+    }
+    match resp.json::<serde_json::Value>().await {
+        Ok(v) => {
+            v.get("code").and_then(|c| c.as_i64()) == Some(0) || v.pointer("/data/pushid").is_some()
+        }
+        Err(e) => {
+            tracing::warn!("Server酱响应解析失败: {e:#}");
+            false
+        }
+    }
+}
+
+/// PushPlus 推送：`code == 200` 视为成功。
+pub async fn send_pushplus(token: &str, title: &str, content: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build();
+    let Ok(client) = client else {
+        tracing::warn!("PushPlus 客户端初始化失败");
+        return false;
+    };
+    let result = client
+        .post("https://www.pushplus.plus/send")
+        .json(&serde_json::json!({"token": token, "title": title, "content": content}))
+        .send()
+        .await;
+    let Ok(resp) = result else {
+        tracing::warn!("PushPlus 请求失败");
+        return false;
+    };
+    match resp.json::<serde_json::Value>().await {
+        Ok(v) => v.get("code").and_then(|c| c.as_i64()) == Some(200),
+        Err(e) => {
+            tracing::warn!("PushPlus 响应解析失败: {e:#}");
+            false
+        }
+    }
+}
+
+/// Bark 推送：`code == 200` 视为成功。
+pub async fn send_bark(api: &str, title: &str, content: &str) -> bool {
+    if api.is_empty() {
+        return false;
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build();
+    let Ok(client) = client else {
+        tracing::warn!("Bark 客户端初始化失败");
+        return false;
+    };
+    let result = client
+        .post(api)
+        .json(&serde_json::json!({
+            "title": title,
+            "body": content,
+            "level": "active",
+            "badge": 1,
+            "autoCopy": 1,
+            "sound": "",
+            "icon": "",
+            "group": "",
+            "isArchive": 1,
+            "url": ""
+        }))
+        .send()
+        .await;
+    let Ok(resp) = result else {
+        tracing::warn!("Bark 请求失败");
+        return false;
+    };
+    match resp.json::<serde_json::Value>().await {
+        Ok(v) => v.get("code").and_then(|c| c.as_i64()) == Some(200),
+        Err(e) => {
+            tracing::warn!("Bark 响应解析失败: {e:#}");
+            false
+        }
+    }
+}
+
+/// ntfy 推送：服务端响应无 `error` 字段视为成功；多个地址以英文逗号分隔。
+pub async fn send_ntfy(api: &str, title: &str, content: &str) -> bool {
+    if api.is_empty() {
+        return false;
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build();
+    let Ok(client) = client else {
+        tracing::warn!("ntfy 客户端初始化失败");
+        return false;
+    };
+    let mut success = false;
+    for endpoint in api.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let (server, topic) = match endpoint.rsplit_once('/') {
+            Some(pair) => pair,
+            None => {
+                tracing::warn!("ntfy 地址缺少 topic: {endpoint}");
+                continue;
+            }
+        };
+        let result = client
+            .post(server)
+            .json(&serde_json::json!({
+                "topic": topic,
+                "title": title,
+                "message": content,
+                "tags": ["partying_face"],
+                "priority": 3,
+                "actions": [],
+                "markdown": false,
+                "icon": "",
+                "delay": "",
+                "email": "",
+                "call": ""
+            }))
+            .send()
+            .await;
+        let Ok(resp) = result else {
+            tracing::warn!("ntfy 请求失败: {endpoint}");
+            continue;
+        };
+        if let Ok(v) = resp.json::<serde_json::Value>().await
+            && v.get("error").is_none()
+        {
+            success = true;
+        }
+    }
+    success
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,8 +429,89 @@ mod tests {
     fn parses_channel() {
         assert_eq!(Channel::parse("邮箱"), Channel::Email);
         assert_eq!(Channel::parse("微信"), Channel::Wechat);
+        assert_eq!(Channel::parse("PushPlus"), Channel::PushPlus);
+        assert_eq!(Channel::parse("Bark"), Channel::Bark);
+        assert_eq!(Channel::parse("ntfy"), Channel::Ntfy);
         assert_eq!(Channel::parse("不通知"), Channel::None);
         assert_eq!(Channel::parse("跟随全局"), Channel::Email);
+    }
+
+    #[tokio::test]
+    async fn unconfigured_wechat_marks_failed_not_pending() {
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-notify-wx-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::write(dir.join("config").join("config.ini"), "[推送配置]\n").unwrap();
+        std::fs::write(dir.join("config").join("fupan_config.ini"), "").unwrap();
+        let file = std::env::temp_dir().join(format!(
+            "zunzhe-notify-wx-missing-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pool = db::open_pool(&file).await.unwrap();
+        let cfg = crate::config::Config::load(&dir).unwrap();
+        let notifier = Notifier::new(&pool, &cfg);
+        let sent = notifier
+            .send("video", "博主", "新视频", "内容", Channel::Wechat)
+            .await
+            .unwrap();
+        assert!(!sent);
+        let rows = db::list_notify(&pool, "failed", 10).await.unwrap();
+        assert_eq!(rows.len(), 1, "微信未配置应标记 failed");
+        assert_eq!(rows[0].channel, "微信");
+        assert_eq!(
+            db::list_notify(&pool, "pending", 10).await.unwrap().len(),
+            0
+        );
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_file(file.with_extension("db-shm"));
+        let _ = std::fs::remove_file(file.with_extension("db-wal"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn channel_name_is_serialized_in_record_sent() {
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-notify-name-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::write(dir.join("config").join("config.ini"), "[推送配置]\n").unwrap();
+        std::fs::write(dir.join("config").join("fupan_config.ini"), "").unwrap();
+        let file = std::env::temp_dir().join(format!(
+            "zunzhe-notify-name-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pool = db::open_pool(&file).await.unwrap();
+        let cfg = crate::config::Config::load(&dir).unwrap();
+        let notifier = Notifier::new(&pool, &cfg);
+        notifier
+            .record_sent("test", "", "标题", "内容", Channel::PushPlus)
+            .await
+            .unwrap();
+        let rows = db::list_notify(&pool, "sent", 10).await.unwrap();
+        assert_eq!(rows[0].channel, "PushPlus");
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_file(file.with_extension("db-shm"));
+        let _ = std::fs::remove_file(file.with_extension("db-wal"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

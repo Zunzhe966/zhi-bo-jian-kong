@@ -130,6 +130,10 @@ impl ConfigApi {
                     "录制设置": {"循环时间(秒)": "监控轮询间隔", "视频保存格式ts|mkv|flv|mp4|mp3音频|m4a音频": "保存格式"},
                     "推送配置": {
                         "直播状态推送渠道": "填「邮箱」启用邮件通知",
+                        "server酱SendKey": "Server酱 SendKey，可推微信（secret）",
+                        "pushplus推送token": "PushPlus token（secret）",
+                        "bark推送接口链接": "iOS Bark 推送地址（secret）",
+                        "ntfy推送地址": "ntfy 订阅地址（secret）",
                         "SMTP邮件服务器": "如 smtp.qq.com",
                         "是否使用SMTP服务SSL加密(是/否)": "是/否",
                         "SMTP邮件服务器端口": "SSL 通常 465",

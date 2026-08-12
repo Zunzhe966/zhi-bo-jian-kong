@@ -156,6 +156,15 @@ impl Config {
             to: self.get_main("推送配置", "收件人邮箱"),
         }
     }
+
+    pub fn push_channels(&self) -> PushChannels {
+        PushChannels {
+            serverchan: clean_push_value(&self.get_main("推送配置", "server酱SendKey")),
+            pushplus: clean_push_value(&self.get_main("推送配置", "pushplus推送token")),
+            bark: clean_push_value(&self.get_main("推送配置", "bark推送接口链接")),
+            ntfy: clean_push_value(&self.get_main("推送配置", "ntfy推送地址")),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -254,6 +263,44 @@ pub struct EmailSettings {
     pub sender: String,
     pub sender_name: String,
     pub to: String,
+}
+
+/// HTTPS 推送通道配置。与旧 Python `fupan/notify.py::_push_channels` 对齐，
+/// 避免代理/TUN 环境只依赖 SMTP 时通知失效。
+#[derive(Debug, Clone, Default)]
+pub struct PushChannels {
+    pub serverchan: String,
+    pub pushplus: String,
+    pub bark: String,
+    pub ntfy: String,
+}
+
+impl PushChannels {
+    /// 至少有一个真实凭据才认为已配置，避免把空占位符当成可发送通道。
+    pub fn configured(&self) -> bool {
+        !self.serverchan.is_empty()
+            || !self.pushplus.is_empty()
+            || !self.bark.is_empty()
+            || !self.ntfy.is_empty()
+    }
+}
+
+/// 过滤基础项目遗留的占位符，但保留真实 Server酱/PushPlus 密钥。
+fn clean_push_value(value: &str) -> String {
+    let v = value.trim();
+    if v.is_empty() {
+        return String::new();
+    }
+    let low = v.to_lowercase();
+    if low == "sctxxxxxxxx" || low == "sctxxxxxxxx..." {
+        return String::new();
+    }
+    if (low.contains("xxx") && low.chars().filter(|c| *c == 'x').count() > 6)
+        || (low.contains("key/") && low.contains("xxx"))
+    {
+        return String::new();
+    }
+    v.to_string()
 }
 
 fn mask(value: &str) -> String {
