@@ -54,6 +54,15 @@ pub async fn run_daemon(
     let watch = Watchlist::new(project_dir.to_path_buf());
     let monitor = LiveMonitor::new(&pool, project_dir, config, &watch);
     let mut stop = tokio::sync::watch::channel(false);
+    // 独立下载队列 worker：不参与 70 秒 tick 护栏，每个任务自身有 600 秒超时。
+    // 下载耗时不会阻塞直播/视频检查，也不会被 tick abort 后永远卡 processing。
+    let mut download_worker = tokio::spawn(download::run_download_worker(
+        pool.clone(),
+        project_dir.to_path_buf(),
+        stop.1.clone(),
+        std::time::Duration::from_secs(600),
+        std::time::Duration::from_secs(5),
+    ));
     // 独立心跳记录器：每 60 秒把“daemon 进程仍在运行”写入 uptime 日志，
     // 不依赖 launchd/桌面端 watchdog；launchd 被 macOS TCC 挡在 ~/Desktop 外时
     // 也能持续留下 24×30 验收记录。
@@ -114,6 +123,7 @@ pub async fn run_daemon(
         crate::service::touch_heartbeat(project_dir);
         if once || exited || *stop.1.borrow() {
             let _ = monitor.stop_all_recordings().await;
+            stop_download_worker(&pool, &stop.0, &mut download_worker).await;
             return Ok(());
         }
         // duration 未到点且 tick 提前结束后，等待下一轮；期间继续响应退出。
@@ -129,9 +139,25 @@ pub async fn run_daemon(
         }
         if wait_exit || *stop.1.borrow() {
             let _ = monitor.stop_all_recordings().await;
+            stop_download_worker(&pool, &stop.0, &mut download_worker).await;
             return Ok(());
         }
     }
+}
+
+/// 退出 daemon 时停止下载 worker：先通知停止，再 abort 当前下载并归还
+/// processing 队列，避免优雅退出被 10 分钟下载拖住，也避免任务永久卡死。
+async fn stop_download_worker(
+    pool: &SqlitePool,
+    stop: &tokio::sync::watch::Sender<bool>,
+    worker: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
+    let _ = stop.send(true);
+    if !worker.is_finished() {
+        worker.abort();
+        let _ = worker.await;
+    }
+    let _ = db::recover_processing(pool).await;
 }
 
 /// 锁持有者的 pid 清理器：无论正常返回、错误返回还是 panic，都会移除本实例 pid。
@@ -187,7 +213,6 @@ async fn run_tick_with_timeout(
         config.clone(),
         watch,
     ));
-    let recover_pool = pool.clone();
     let mut videos_task = tokio::task::spawn(tick_owned(pool, project_dir, fupan_dir, config));
 
     let outcome = tokio::time::timeout(Duration::from_secs(70), async {
@@ -217,8 +242,6 @@ async fn run_tick_with_timeout(
     } else {
         warn!("daemon tick 超过 70 秒，终止本轮子任务并跳过");
         abort_timed_out_tasks(live_task, videos_task).await;
-        // 被截断的下载任务可能停在 processing，立即归还队列，不等到下一轮。
-        let _ = db::recover_processing(&recover_pool).await;
     }
 }
 
@@ -265,10 +288,7 @@ async fn tick(
     let notifier = Notifier::new(pool, config);
     let notified_retry = notifier.flush_pending(50).await.unwrap_or(0);
 
-    // 1. 处理待下载任务
-    let downloads = download::process_pending(pool, project_dir)
-        .await
-        .unwrap_or(0);
+    // 1. 下载队列由独立后台 worker 处理，不在 70 秒 tick 里同步执行。
 
     // 2. 对每个视频监控源拉一次最新视频并写入库；新出现的不重复通知。
     // 只检查“视频监控列表.ini”里的源；anchors 里的直播主播不能当成视频源，
@@ -371,7 +391,7 @@ async fn tick(
     }
 
     Ok(TickStats {
-        downloads: downloads + enqueued,
+        downloads: enqueued,
         anchors_checked: checked,
         videos_notified: notified,
         notify_retried: notified_retry,
@@ -393,10 +413,7 @@ pub async fn check_video_sources(
     .await
     {
         Ok(result) => result,
-        Err(_) => {
-            let _ = db::recover_processing(pool).await;
-            Err(anyhow!("check-videos 超过 70 秒，已中止本轮检查"))
-        }
+        Err(_) => Err(anyhow!("check-videos 超过 70 秒，已中止本轮检查")),
     }
 }
 

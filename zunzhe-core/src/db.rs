@@ -549,7 +549,7 @@ pub async fn enqueue_task(
     // 同一 kind+url 已有未完成（pending/failed 也会重试）任务时不再重复入队，
     // 避免 daemon 并发/重复下载同一资源。
     let existing: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM tasks WHERE kind=? AND url=? AND status IN ('pending','failed') LIMIT 1",
+        "SELECT id FROM tasks WHERE kind=? AND url=? AND status = 'pending' LIMIT 1",
     )
     .bind(kind)
     .bind(url)
@@ -570,14 +570,14 @@ pub async fn enqueue_task(
     Ok(result.last_insert_rowid())
 }
 
-/// 原子认领一条待处理任务：把 `pending/failed` 置为 `processing` 并返回任务。
+/// 原子认领一条待处理任务：把 `pending` 置为 `processing` 并返回任务。
 /// 认领后崩溃会把任务留在 processing，下次启动用 `recover_processing` 归还队列；
 /// 单实例 daemon 下也防止同批任务被并发重复执行。
 pub async fn claim_pending_task(pool: &SqlitePool, limit: i64) -> anyhow::Result<Option<Task>> {
     let row = sqlx::query(
         "SELECT id, kind, url, name, status, attempts, payload, created_at, updated_at
          FROM tasks
-         WHERE status IN ('pending','failed')
+         WHERE status = 'pending'
          ORDER BY id LIMIT ?",
     )
     .bind(limit)
@@ -589,7 +589,7 @@ pub async fn claim_pending_task(pool: &SqlitePool, limit: i64) -> anyhow::Result
     };
     let id: i64 = row.try_get("id")?;
     let updated = sqlx::query(
-        "UPDATE tasks SET status='processing', updated_at=datetime('now','localtime') WHERE id=? AND status IN ('pending','failed')",
+        "UPDATE tasks SET status='processing', updated_at=datetime('now','localtime') WHERE id=? AND status = 'pending'",
     )
     .bind(id)
     .execute(pool)
@@ -653,6 +653,17 @@ pub async fn list_tasks(pool: &SqlitePool, status: &str, limit: i64) -> anyhow::
 
 pub async fn update_task_status(pool: &SqlitePool, id: i64, status: &str) -> anyhow::Result<()> {
     sqlx::query("UPDATE tasks SET status=?, attempts=attempts+1, updated_at=datetime('now','localtime') WHERE id=?")
+        .bind(status)
+        .bind(id)
+        .execute(pool)
+        .await
+        .context("更新任务状态")?;
+    Ok(())
+}
+
+/// 更新任务状态但不增加 attempts（用于达到重试上限后落定 failed）。
+pub async fn set_task_status(pool: &SqlitePool, id: i64, status: &str) -> anyhow::Result<()> {
+    sqlx::query("UPDATE tasks SET status=?, updated_at=datetime('now','localtime') WHERE id=?")
         .bind(status)
         .bind(id)
         .execute(pool)
@@ -838,6 +849,13 @@ mod tests {
         assert_eq!(recovered, 1);
         let again = claim_pending_task(&pool, 1).await.unwrap().unwrap();
         assert_eq!(again.id, id);
+
+        // 达到重试上限后标 failed，之后不能再被自动认领（防止无限循环）。
+        set_task_status(&pool, id, "failed").await.unwrap();
+        assert!(
+            claim_pending_task(&pool, 1).await.unwrap().is_none(),
+            "failed 任务不应被下载 worker 自动重新认领"
+        );
     }
 
     #[tokio::test]

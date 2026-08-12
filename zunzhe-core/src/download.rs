@@ -351,6 +351,77 @@ pub async fn process_pending(pool: &SqlitePool, project_dir: &Path) -> Result<us
     Ok(done)
 }
 
+/// 独立下载队列 worker：不参与 70 秒 tick 护栏，每个任务自身有 600 秒超时，
+/// 下载耗时不会阻塞直播/视频检查，也不会被 tick abort 后永远卡 processing。
+pub async fn run_download_worker(
+    pool: SqlitePool,
+    project_dir: PathBuf,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+    task_timeout: Duration,
+    poll_interval: Duration,
+) -> anyhow::Result<()> {
+    // 启动前把上次崩溃/被 tick 截断遗留的 processing 任务归还队列。
+    let recovered = db::recover_processing(&pool)
+        .await
+        .context("下载 worker 恢复处理中任务")?;
+    if recovered > 0 {
+        tracing::info!("下载 worker 启动，恢复 {recovered} 条 processing 任务");
+    }
+    let downloader = Downloader::new(project_dir);
+    let mut idle = 0u64;
+    loop {
+        tokio::select! {
+            _ = stop.changed() => {
+                if *stop.borrow() {
+                    tracing::info!("下载 worker 收到停止信号，退出");
+                    return Ok(());
+                }
+            }
+            _ = tokio::time::sleep(poll_interval) => {
+                idle += 1;
+            }
+        }
+        // 每轮最多处理 10 个任务；处理完即使还有队列，也先回到 select 响应停止。
+        match drain_pending(&pool, &downloader, task_timeout, &stop).await {
+            Ok(done) => {
+                if done > 0 {
+                    tracing::info!("下载 worker 本轮处理 {done} 个任务");
+                    idle = 0;
+                } else if idle >= 12 {
+                    // 队列连续空闲约 1 分钟时写一条可见日志，便于确认 worker 活着。
+                    tracing::info!("下载 worker 空闲中，等待下载队列");
+                    idle = 0;
+                }
+            }
+            Err(e) => {
+                tracing::error!("下载 worker 处理队列失败，稍后重试: {e:#}");
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+        }
+    }
+}
+
+/// 认领并执行队列里的下载任务，直到队列暂时为空或收到停止信号。
+async fn drain_pending(
+    pool: &SqlitePool,
+    downloader: &Downloader,
+    task_timeout: Duration,
+    stop: &tokio::sync::watch::Receiver<bool>,
+) -> Result<usize> {
+    let mut done = 0usize;
+    while let Some(task) = db::claim_pending_task(pool, 1).await? {
+        let outcome = run_single_task_with_timeout(pool, &task, downloader, task_timeout).await;
+        if outcome {
+            done += 1;
+        }
+        if *stop.borrow() {
+            tracing::info!("下载 worker 在任务间收到停止信号，退出");
+            return Ok(done);
+        }
+    }
+    Ok(done)
+}
+
 /// 执行单个下载任务并更新状态。返回是否成功完成。
 /// 超时/失败都会显式更新状态，绝不把任务永久留在 processing。
 async fn run_single_task_with_timeout(
@@ -376,12 +447,13 @@ async fn run_single_task_with_timeout(
                 task.id,
                 task.attempts + 1
             );
+            // 失败后前 3 次回到 pending 重试；超过上限标 failed 并停止重试。
             let next = if task.attempts + 1 >= 3 {
                 "failed"
             } else {
                 "pending"
             };
-            let _ = db::update_task_status(pool, task.id, next).await;
+            let _ = db::set_task_status(pool, task.id, next).await;
             false
         }
         Err(_) => {
@@ -395,7 +467,7 @@ async fn run_single_task_with_timeout(
             } else {
                 "pending"
             };
-            let _ = db::update_task_status(pool, task.id, next).await;
+            let _ = db::set_task_status(pool, task.id, next).await;
             false
         }
     }
@@ -481,6 +553,61 @@ mod tests {
         assert!(
             rows.iter().any(|t| t.id == id),
             "失败任务应回到 pending 等待重试，而不是卡 processing"
+        );
+        std::mem::forget(file);
+    }
+
+    #[tokio::test]
+    async fn download_worker_marks_stuck_task_failed() {
+        let file = std::env::temp_dir().join(format!(
+            "zunzhe-dl-worker-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pool = crate::db::open_pool(&file).await.unwrap();
+        let id = crate::db::enqueue_task(&pool, "download", "https://example.invalid/x", "测试")
+            .await
+            .unwrap();
+        // 预置两次重试次数：worker 超时一次后 attempts=3，直接标 failed。
+        sqlx::query("UPDATE tasks SET attempts=2 WHERE id=?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let worker = tokio::spawn(super::run_download_worker(
+            pool.clone(),
+            std::env::temp_dir().join("zunzhe-nonexistent"),
+            rx,
+            Duration::from_millis(100),
+            Duration::from_millis(5),
+        ));
+        // 给 worker 一个短窗口处理任务，随后触发停止信号。
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let _ = tx.send(true);
+        worker.await.unwrap().unwrap();
+        let rows: Vec<crate::model::Task> =
+            crate::db::list_tasks(&pool, "failed", 10).await.unwrap();
+        assert!(
+            rows.iter().any(|t| t.id == id),
+            "超时任务应标 failed，当前: {rows:?}"
+        );
+        assert!(
+            crate::db::claim_pending_task(&pool, 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "failed 任务不应被下载 worker 重新认领"
+        );
+        let stuck: Vec<crate::model::Task> = crate::db::list_tasks(&pool, "processing", 10)
+            .await
+            .unwrap();
+        assert!(
+            stuck.iter().all(|t| t.id != id),
+            "任务不能卡在 processing: {stuck:?}"
         );
         std::mem::forget(file);
     }
