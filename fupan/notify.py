@@ -195,6 +195,13 @@ def send_live_alert(anchor_name: str, live_url: str, content: str | None = None)
 
 
 def send_test() -> bool:
+    """发送测试通知。未配置邮箱时给出明确修复提示，不再只报发送失败。"""
+    from .email_setup import email_status
+    status = email_status()
+    if not status['configured']:
+        print('邮箱未配置：' + status['hint'])
+        print('可运行: .venv/bin/python -m fupan.cli email-setup 你的QQ邮箱 SMTP授权码 [收件人]')
+        return False
     _queue_local('【尊者直播监控】通知测试', '收到这条消息说明通知通道配置成功。')
     return _send('【尊者直播监控】通知测试', '收到这条消息说明通知通道配置成功。')
 

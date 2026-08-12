@@ -149,6 +149,8 @@ export default function App() {
   const [videoForm] = Form.useForm()
   const [emailForm] = Form.useForm()
   const [emailSaving, setEmailSaving] = useState(false)
+  const [emailStatusText, setEmailStatusText] = useState('')
+  const [emailConfigured, setEmailConfigured] = useState(false)
   const [historyOpen, setHistoryOpen] = useState(false)
   const [historyLoading, setHistoryLoading] = useState(false)
   const [historyVideos, setHistoryVideos] = useState([])
@@ -183,6 +185,9 @@ export default function App() {
       const tx = fupanCfg['fupan_config.ini']?.['转写'] || {}
       const llm = fupanCfg['fupan_config.ini']?.['知识提炼'] || {}
       const prefs = prefRes.prefs || {}
+      const mail = await window.desktop.cli('email-status')
+      setEmailStatusText(mail.hint || (mail.configured ? '已配置' : '未配置'))
+      setEmailConfigured(!!mail.configured)
       emailForm.setFieldsValue({
         smtpHost: pickCfg(push, 'smtp邮件服务器', 'smtp.qq.com'),
         smtpPort: pickCfg(push, 'SMTP邮件服务器端口', '465'),
@@ -276,12 +281,29 @@ export default function App() {
   const testEmail = async () => {
     try {
       const r = await window.desktop.cli('test-notify')
-      message[r.ok ? 'success' : 'error'](r.ok
-        ? '测试通知已发出，请查收（邮箱/微信/App）'
-        : '所有通道均失败。代理开 TUN 时邮件常被拦截，建议配 Server酱（走微信，不怕代理）')
+      if (r.ok) {
+        message.success('测试通知已发出，请查收邮箱')
+      } else {
+        message.error('邮箱未配置或发送失败：请先在下方填写 QQ 邮箱与 SMTP 授权码')
+      }
     } catch (e) {
       message.error(String(e.message || e))
     }
+  }
+
+  const setupQqMail = async () => {
+    const v = emailForm.getFieldsValue()
+    const login = v.loginEmail?.trim()
+    if (!login) return message.warning('请先填写发件邮箱（QQ 邮箱地址）')
+    emailForm.setFieldsValue({
+      smtpHost: 'smtp.qq.com',
+      smtpPort: '465',
+      loginEmail: login,
+      senderEmail: login,
+      senderName: v.senderName || '尊者直播监控',
+      toEmail: v.toEmail?.trim() || login,
+    })
+    message.success('已填入 QQ 邮箱模板，填好授权码后点「保存配置」')
   }
 
   const biliLogin = async () => {
@@ -931,6 +953,10 @@ export default function App() {
           </Form.Item>
 
           <div style={{ fontWeight: 600, margin: '16px 0 8px' }}>邮箱推送</div>
+          <div style={{ marginBottom: 8, padding: '8px 12px', borderRadius: 6, background: emailConfigured ? '#f6ffed' : '#fff7e6', border: `1px solid ${emailConfigured ? '#b7eb8f' : '#ffd591'}` }}>
+            {emailConfigured ? '✅ 邮箱已配置' : `⚠️ ${emailStatusText || '邮箱未配置'}`}
+            <Button size="small" style={{ marginLeft: 12 }} onClick={setupQqMail}>QQ 邮箱一键填入</Button>
+          </div>
           <Form.Item label="SMTP 服务器" name="smtpHost"><Input placeholder="smtp.qq.com" /></Form.Item>
           <Form.Item label="SMTP 端口" name="smtpPort"><Input placeholder="465" /></Form.Item>
           <Form.Item label="发件邮箱" name="loginEmail"><Input placeholder="xxx@qq.com" /></Form.Item>

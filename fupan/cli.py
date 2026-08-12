@@ -12,6 +12,10 @@
   blogger-videos <博主地址> [数量]   列出博主历史视频供批量勾选下载
   export-training-data [主播名] [输出文件]
                                   把转写+知识点导出为 JSONL 训练数据
+  email-status                  查看邮箱配置状态（不显示授权码）
+  email-setup <邮箱> <授权码> [收件人]
+                                  写入 QQ 邮箱配置并启用邮件通知
+  email-import-legacy           尝试从老项目 zunzhe-dev 迁移 QQ 邮箱账号
   start | stop | process | notes | test-email
   get-config | set-config | set-config-bulk | schema
   mcp-info                      打印 MCP 接入说明
@@ -294,6 +298,24 @@ def export_training_data(anchor: str = '', output: str = '') -> dict:
     return _export(anchor=anchor, output=output)
 
 
+def email_status() -> dict:
+    """查看邮箱配置状态（不回显授权码）。"""
+    from .email_setup import email_status as _status
+    return _status()
+
+
+def email_setup(email: str, auth: str, to: str = '') -> dict:
+    """写入 QQ 邮箱 SMTP 配置并启用邮件通知。"""
+    from .email_setup import write_email_config
+    return write_email_config(email=email, auth=auth, to=to)
+
+
+def email_import_legacy(legacy_file: str = '') -> dict:
+    """尝试从老项目 zunzhe-dev 迁移 QQ 邮箱账号。"""
+    from .email_setup import import_legacy_account
+    return import_legacy_account(legacy_file)
+
+
 def remove_video(url: str) -> dict:
     lines = _read_lines(WATCHLIST)
     kept = [line for line in lines if line.strip().partition(',')[0].strip() != url]
@@ -519,6 +541,14 @@ def main() -> None:
         elif cmd == 'export-training-data':
             _out(export_training_data(rest[0] if len(rest) > 0 else '',
                                       rest[1] if len(rest) > 1 else ''))
+        elif cmd == 'email-status':
+            _out(email_status())
+        elif cmd == 'email-setup':
+            _out(email_setup(rest[0] if len(rest) > 0 else '',
+                             rest[1] if len(rest) > 1 else '',
+                             rest[2] if len(rest) > 2 else ''))
+        elif cmd == 'email-import-legacy':
+            _out(email_import_legacy(rest[0] if len(rest) > 0 else ''))
         elif cmd == 'remove-video':
             _out(remove_video(rest[0]))
         elif cmd == 'list-video':

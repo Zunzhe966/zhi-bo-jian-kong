@@ -23,6 +23,14 @@ def main() -> int:
         issues.append('缺少 main.py')
     if not (PROJECT_DIR / 'config' / 'config.ini').exists():
         issues.append('缺少 config/config.ini')
+    try:
+        from .email_setup import email_status
+        email = email_status()
+        if not email['configured']:
+            issues.append('邮件通知未配置: ' + email['hint'])
+            issues.append('配置方法: .venv/bin/python -m fupan.cli email-setup 你的QQ邮箱 SMTP授权码 [收件人]')
+    except Exception as e:
+        issues.append(f'邮件配置检查失败: {e}')
     ffmpeg = shutil.which('ffmpeg')
     if not ffmpeg:
         issues.append('未检测到 ffmpeg（录制/合并视频需要，可从 ffmpeg.org 安装并加入 PATH）')
