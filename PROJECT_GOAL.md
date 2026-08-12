@@ -44,11 +44,11 @@ Python 工具层  faster-whisper / LLM 提炼 / ffmpeg 切片 / yt-dlp 兜底
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | 前置 | 仓库克隆、跨平台修复、ffmpeg官方源、测试/CI修复、配置模板、图谱、需求文档 | ✅ 已完成 |
-| A | macOS 全链路：ffmpeg 装好、doctor 通过、CLI/MCP 可用 | 🔄 进行中 |
-| B | 历史视频浏览+选择性下载（封面/已下载标记/批量/全部） | ⏳ |
-| C | 训练数据导出 JSONL | ⏳ |
-| D | 通知简化（邮箱默认+覆盖+兜底） | ⏳ |
-| E | Rust 骨架 zunzhe-core（cargo/schema/CLI 对齐/Platform trait/BilibiliAdapter） | ⏳ |
+| A | macOS 全链路：ffmpeg 装好、doctor 通过、CLI/MCP 可用 | ✅ 已完成 |
+| B | 历史视频浏览+选择性下载（封面/已下载标记/批量/全部） | ✅ 已完成 |
+| C | 训练数据导出 JSONL | ✅ 已完成 |
+| D | 通知简化（邮箱默认+覆盖+兜底） | ✅ 已完成 |
+| E | Rust 骨架 zunzhe-core（cargo/schema/CLI 对齐/Platform trait/BilibiliAdapter） | ✅ 已完成 |
 | F | 交付：git 提交、文档图谱更新、汇报 | ⏳ |
 
 ## 五、关键约定

@@ -10,6 +10,8 @@
   add-video <地址> <名称> [是/否] | remove-video | list-video | check-videos
   download-video <视频链接> [名称]   立即下载单个视频并跑复盘
   blogger-videos <博主地址> [数量]   列出博主历史视频供批量勾选下载
+  export-training-data [主播名] [输出文件]
+                                  把转写+知识点导出为 JSONL 训练数据
   start | stop | process | notes | test-email
   get-config | set-config | set-config-bulk | schema
   mcp-info                      打印 MCP 接入说明
@@ -286,6 +288,12 @@ def video_library(source_url: str = '', anchor: str = '', downloaded_only: str =
     return {'ok': True, 'videos': rows, 'count': len(rows), 'db': str(DB_PATH)}
 
 
+def export_training_data(anchor: str = '', output: str = '') -> dict:
+    """把转写+知识点导出为 JSONL 训练数据。"""
+    from .training_data import export_training_data as _export
+    return _export(anchor=anchor, output=output)
+
+
 def remove_video(url: str) -> dict:
     lines = _read_lines(WATCHLIST)
     kept = [line for line in lines if line.strip().partition(',')[0].strip() != url]
@@ -508,6 +516,9 @@ def main() -> None:
             _out(video_library(rest[0] if len(rest) > 0 else '',
                                rest[1] if len(rest) > 1 else '',
                                rest[2] if len(rest) > 2 else ''))
+        elif cmd == 'export-training-data':
+            _out(export_training_data(rest[0] if len(rest) > 0 else '',
+                                      rest[1] if len(rest) > 1 else ''))
         elif cmd == 'remove-video':
             _out(remove_video(rest[0]))
         elif cmd == 'list-video':

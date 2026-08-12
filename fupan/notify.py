@@ -147,20 +147,18 @@ def _channels_for_pref(pref: str) -> set[str] | None:
         return {'邮箱'}
     if pref == 'PushPlus':
         return {'PushPlus'}
-    # 跟随全局：微信优先（省邮箱配额问题），再试其它已配通道
+    # 跟随全局：邮箱优先（用户默认用邮箱），其余已配通道作为兜底
     ch = _push_channels()
-    out = set()
-    if ch['serverchan']:
-        out.add('微信')
-    if ch['pushplus']:
-        out.add('PushPlus')
-    if ch['bark']:
-        out.add('Bark')
-    if ch['ntfy']:
-        out.add('ntfy')
+    configured = {
+        '微信' if ch['serverchan'] else None,
+        'PushPlus' if ch['pushplus'] else None,
+        'Bark' if ch['bark'] else None,
+        'ntfy' if ch['ntfy'] else None,
+    }
+    out = {c for c in configured if c}
     if is_yes(get(main_config(), '推送配置', '直播状态推送渠道', '')) or '邮箱' in get(main_config(), '推送配置', '直播状态推送渠道', ''):
         out.add('邮箱')
-    return out or {'微信', '邮箱'}
+    return out or {'邮箱'}
 
 
 def send_notification(title: str, content: str, source_url: str = '', anchor_name: str = '') -> bool:
