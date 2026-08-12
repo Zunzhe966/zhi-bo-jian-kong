@@ -47,6 +47,7 @@ pub async fn run_daemon(
     }
     loop {
         // Rust 直播监控独立于 Python 兼容层运行：检测开播、自动录制、状态持久化。
+        // 每轮 tick 前刷新一次心跳，避免上一轮网络卡顿后健康判定陈旧。
         crate::service::touch_heartbeat(project_dir);
         let tick = run_tick_with_timeout(&pool, project_dir, &fupan_dir, config, &watch);
         tokio::pin!(tick);
@@ -62,6 +63,8 @@ pub async fn run_daemon(
                 exited = true;
             }
         }
+        // tick 结束后立即刷新心跳：即使本轮被 70 秒护栏截断，也证明调度器仍活跃。
+        crate::service::touch_heartbeat(project_dir);
         if once || exited || *stop.1.borrow() {
             let _ = monitor.stop_all_recordings().await;
             return Ok(());
