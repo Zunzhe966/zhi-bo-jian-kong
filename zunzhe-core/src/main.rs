@@ -1,3 +1,4 @@
+mod app_prefs;
 mod cli;
 mod config;
 mod config_api;

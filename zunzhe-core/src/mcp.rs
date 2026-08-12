@@ -7,6 +7,7 @@ use sqlx::sqlite::SqlitePool;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::error;
 
+use crate::app_prefs;
 use crate::config::Config;
 use crate::config_api::ConfigApi;
 use crate::db;
@@ -115,8 +116,11 @@ fn tools_list() -> Vec<Value> {
         json!({"name":"live_list","description":"列出直播监控项","inputSchema":{"type":"object","properties":{}}}),
         json!({"name":"live_add","description":"添加直播监控","inputSchema":{"type":"object","properties":{"url":{"type":"string"},"name":{"type":"string"},"quality":{"type":"string"}},"required":["url"]}}),
         json!({"name":"live_remove","description":"移除直播监控","inputSchema":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}),
+        json!({"name":"live_delete","description":"彻底删除直播监控","inputSchema":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}),
         json!({"name":"live_check","description":"检查直播监控项","inputSchema":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}),
+        json!({"name":"live_set_notify","description":"设置直播监控通知通道","inputSchema":{"type":"object","properties":{"url":{"type":"string"},"channel":{"type":"string"},"name":{"type":"string"}},"required":["url"]}}),
         json!({"name":"service_status","description":"查看 Python 服务、Rust daemon 与直播录制会话","inputSchema":{"type":"object","properties":{}}}),
+        json!({"name":"tail_logs","description":"读取后台服务日志末尾","inputSchema":{"type":"object","properties":{"name":{"type":"string"},"lines":{"type":"number"}}}}),
         json!({"name":"video_add","description":"添加博主发视频监控","inputSchema":{"type":"object","properties":{"url":{"type":"string"},"name":{"type":"string"},"download":{"type":"string"}},"required":["url"]}}),
         json!({"name":"video_remove","description":"移除发视频监控","inputSchema":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}),
         json!({"name":"video_list","description":"列出发视频监控","inputSchema":{"type":"object","properties":{}}}),
@@ -126,14 +130,16 @@ fn tools_list() -> Vec<Value> {
         json!({"name":"video_library","description":"查询视频库","inputSchema":{"type":"object","properties":{"source_url":{"type":"string"},"downloaded_only":{"type":"boolean"}}}}),
         json!({"name":"export_training_data","description":"导出训练数据 JSONL","inputSchema":{"type":"object","properties":{"anchor":{"type":"string"},"output":{"type":"string"}}}}),
         json!({"name":"email_status","description":"查看邮箱配置状态","inputSchema":{"type":"object","properties":{}}}),
+        json!({"name":"app_prefs_get","description":"读取桌面应用偏好","inputSchema":{"type":"object","properties":{}}}),
+        json!({"name":"app_prefs_set","description":"写入桌面应用偏好","inputSchema":{"type":"object","properties":{"updates":{"type":"object"}}}}),
         json!({"name":"config_get","description":"读取配置","inputSchema":{"type":"object","properties":{"file":{"type":"string"},"section":{"type":"string"},"key":{"type":"string"}}}}),
         json!({"name":"config_set","description":"写入配置","inputSchema":{"type":"object","properties":{"file":{"type":"string"},"section":{"type":"string"},"key":{"type":"string"},"value":{"type":"string"}},"required":["file","section","key","value"]}}),
         json!({"name":"config_set_bulk","description":"批量写入配置","inputSchema":{"type":"object","properties":{"updates_json":{"type":"string"}}}}),
         json!({"name":"config_schema_tool","description":"配置结构说明","inputSchema":{"type":"object","properties":{}}}),
         json!({"name":"notes_list","description":"列出复盘产物","inputSchema":{"type":"object","properties":{"name":{"type":"string"}}}}),
         json!({"name":"process_media","description":"对音视频跑复盘流水线","inputSchema":{"type":"object","properties":{"file_path":{"type":"string"},"anchor_name":{"type":"string"}},"required":["file_path"]}}),
-        json!({"name":"service_start","description":"启动 Python 后台服务","inputSchema":{"type":"object","properties":{}}}),
-        json!({"name":"service_stop","description":"停止 Python 后台服务","inputSchema":{"type":"object","properties":{}}}),
+        json!({"name":"service_start","description":"启动 Rust 核心 daemon（统一直播+视频监控）","inputSchema":{"type":"object","properties":{}}}),
+        json!({"name":"service_stop","description":"停止 Rust 核心 daemon","inputSchema":{"type":"object","properties":{}}}),
         json!({"name":"test_email","description":"发送测试邮件","inputSchema":{"type":"object","properties":{}}}),
     ]
 }
@@ -181,6 +187,53 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
             let removed = watch.remove_live(url)?;
             let _ = db::remove_anchor(pool, url).await;
             Ok(serde_json::to_string(&json!({"ok":removed,"url":url}))?)
+        }
+        "live_delete" => {
+            let url = args.get("url").and_then(|v| v.as_str()).unwrap_or_default();
+            let removed = db::remove_anchor(pool, url).await?;
+            let deleted = watch.delete_live(url)?;
+            Ok(serde_json::to_string(
+                &json!({"ok": removed || deleted, "url": url, "action": "delete-live"}),
+            )?)
+        }
+        "live_set_notify" => {
+            let url = args.get("url").and_then(|v| v.as_str()).unwrap_or_default();
+            let channel = args
+                .get("channel")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let name = args
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            match watch.set_notify(url, channel, name) {
+                Ok(_) => Ok(serde_json::to_string(
+                    &json!({"ok": true, "url": url, "channel": channel, "name": name}),
+                )?),
+                Err(e) => Ok(serde_json::to_string(
+                    &json!({"ok": false, "url": url, "error": e.to_string()}),
+                )?),
+            }
+        }
+        "tail_logs" => {
+            let name = args
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("live_monitor");
+            let lines = args.get("lines").and_then(|v| v.as_u64()).unwrap_or(200);
+            Ok(serde_json::to_string(&crate::service::tail_logs(
+                project_dir,
+                name,
+                lines,
+            ))?)
+        }
+        "app_prefs_get" => Ok(serde_json::to_string(
+            &json!({"ok": true, "prefs": app_prefs::read_app_prefs(project_dir)}),
+        )?),
+        "app_prefs_set" => {
+            let updates = args.get("updates").cloned().unwrap_or_else(|| json!({}));
+            let prefs = app_prefs::write_app_prefs(project_dir, &updates)?;
+            Ok(serde_json::to_string(&json!({"ok": true, "prefs": prefs}))?)
         }
         "live_check" => {
             let url = args.get("url").and_then(|v| v.as_str()).unwrap_or_default();
@@ -369,15 +422,23 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
             project_dir,
         )?)?),
         "service_status" => {
+            let rust_running = crate::service::rust_daemon_alive(project_dir);
             let mut result = crate::service::status(project_dir)?;
             let sessions = db::list_live_sessions(pool, "recording", 100).await?;
             result
                 .as_object_mut()
                 .unwrap()
                 .insert("live_sessions".to_string(), serde_json::to_value(sessions)?);
+            result
+                .as_object_mut()
+                .unwrap()
+                .insert("rust_daemon".to_string(), json!(rust_running));
             result.as_object_mut().unwrap().insert(
-                "rust_daemon".to_string(),
-                json!(crate::service::rust_daemon_alive(project_dir)),
+                "services".to_string(),
+                json!({
+                    "live_monitor": {"running": rust_running},
+                    "video_monitor": {"running": rust_running},
+                }),
             );
             Ok(serde_json::to_string(&result)?)
         }

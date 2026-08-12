@@ -280,7 +280,7 @@ export default function App() {
 
   const testEmail = async () => {
     try {
-      const r = await window.desktop.cli('test-notify')
+      const r = await window.desktop.cli('test-email')
       if (r.ok) {
         message.success('测试通知已发出，请查收邮箱')
       } else {
@@ -401,7 +401,7 @@ export default function App() {
   )
 
   const ensureStarted = async () => {
-    if (!status?.services?.live_monitor?.running) {
+    if (!status?.rust_daemon && !status?.services?.live_monitor?.running) {
       await window.desktop.cli('start')
       message.success('监控服务已启动')
       await fetchStatus()
@@ -677,6 +677,11 @@ export default function App() {
     }
   }
 
+  const serviceRunning = !!(
+    status?.rust_daemon ||
+    (status?.services?.live_monitor?.running && status?.services?.video_monitor?.running)
+  )
+
   const openNote = async (file) => {
     const text = await window.desktop.readText(file)
     setNoteContent(text)
@@ -696,7 +701,10 @@ export default function App() {
     },
   ]
 
-  const svc = status?.services || {}
+  const svc = {
+    live_monitor: { running: serviceRunning },
+    video_monitor: { running: serviceRunning },
+  }
   const tabTitles = { live: '直播监控', video: '发布视频监控', notes: '复盘笔记', logs: '运行日志' }
   const tabHints = {
     live: '每个主播一张卡片，点「主播设置」改画质、通知、删除',
@@ -753,10 +761,10 @@ export default function App() {
                   <Button icon={<CloudDownloadOutlined />} onClick={() => setBatchOpen(true)}>批量下载</Button>
                 </>
               )}
-              <Button icon={svc.live_monitor?.running && svc.video_monitor?.running ? <StopFilled /> : <PlayCircleFilled />}
-                type={svc.live_monitor?.running && svc.video_monitor?.running ? 'default' : 'primary'}
-                onClick={() => toggleService(!(svc.live_monitor?.running && svc.video_monitor?.running))}>
-                {svc.live_monitor?.running && svc.video_monitor?.running ? '停止服务' : '启动服务'}
+              <Button icon={serviceRunning ? <StopFilled /> : <PlayCircleFilled />}
+                type={serviceRunning ? 'default' : 'primary'}
+                onClick={() => toggleService(!serviceRunning)}>
+                {serviceRunning ? '停止服务' : '启动服务'}
               </Button>
               <Button icon={<ReloadOutlined />} loading={loading} onClick={() => refresh({ showLoading: true })}>刷新数据</Button>
             </div>

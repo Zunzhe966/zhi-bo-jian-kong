@@ -73,6 +73,12 @@ pub fn start_rust_daemon(project_dir: &Path, interval_secs: u64) -> Result<serde
         .join("target")
         .join("release")
         .join("zunzhe-core");
+    let debug_exe = project_dir
+        .join("zunzhe-core")
+        .join("target")
+        .join("debug")
+        .join("zunzhe-core");
+    let exe = if exe.exists() { exe } else { debug_exe };
     if !exe.exists() {
         bail!("找不到 Rust 核心二进制: {}", exe.display());
     }
@@ -148,6 +154,28 @@ pub fn status(project_dir: &Path) -> Result<serde_json::Value> {
         );
     }
     Ok(json!({"ok": true, "services": services}))
+}
+
+/// 读取后台服务日志末尾若干行（兼容 Python tail-logs）。
+pub fn tail_logs(project_dir: &Path, name: &str, lines: u64) -> serde_json::Value {
+    let log = project_dir.join("logs").join(format!("{name}.log"));
+    if !log.exists() {
+        return json!({"ok": true, "name": name, "path": log.display().to_string(),
+                      "content": "（暂无日志）"});
+    }
+    let text = std::fs::read_to_string(&log).unwrap_or_default();
+    let keep = (lines.clamp(1, 2000)) as usize;
+    let tail: String = text
+        .lines()
+        .rev()
+        .take(keep)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    json!({"ok": true, "name": name, "path": log.display().to_string(),
+           "content": tail, "lines": tail.lines().count()})
 }
 
 /// 检查 Rust 核心 daemon 是否在运行（通过 pid 文件，与 Python 服务同目录）。

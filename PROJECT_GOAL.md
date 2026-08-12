@@ -57,6 +57,12 @@ Python 工具层  faster-whisper / LLM 提炼 / ffmpeg 切片 / yt-dlp 兜底
 - M0-M12 全部完成并通过 `cargo test`（28 个测试）+ `cargo clippy` + `cargo fmt`
 - M13 组装收尾：macOS 守护脚本、launchd 模板、使用说明、图谱更新
 - CLI/MCP 命令与 Python 版对齐；SQLite 持久化、崩溃可恢复、任务失败只记日志不拖垮 daemon
+- CLI/MCP 已对齐 `delete-live / set-notify / ensure-services / tail-logs /
+  get-app-prefs / set-app-prefs / wizard-done`，直播列表同时兼容
+  `画质,URL,备注` 与 `URL,备注,画质` 两种旧格式
+- 桌面端 Electron 已改为调用 Rust 核心二进制（优先 release、缺省 debug），
+  `status` 同时返回 `rust_daemon` 与兼容的 `services` 字段，服务按钮/守护
+  只看 Rust daemon，不再启动 Python 双跑
 - 视频监控支持监控列表/偏好/服务管理，首次监控只记录基线，之后只对新视频通知/下载
 - 平台适配器：B站原生接口（Cookie 防 412）+ RSS 兜底；抖音/快手走 RSSHub 或 yt-dlp
 - 已知待补：邮箱授权码需用户提供；B站/抖音风控时需配置 Cookie
@@ -64,6 +70,8 @@ Python 工具层  faster-whisper / LLM 提炼 / ffmpeg 切片 / yt-dlp 兜底
   `config/fupan_config.ini` 的 `[视频监控] b站cookie` 填入浏览器 Cookie
 - Rust daemon 统一接管直播+视频监控；`start` 不再并行启动 Python 视频监控，
   `stop` 不自动拉起 Python 兜底（避免双跑与“停不掉”）
+- 验证环境遗留的 Python `video_monitor` 进程已清理；桌面端若再次出现“双跑”，
+  先查 `desktop/electron/main.cjs` 的 `ensure-services` 调用是否命中旧 Python CLI
 
 ## 五、关键约定
 

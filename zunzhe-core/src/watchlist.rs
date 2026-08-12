@@ -89,15 +89,42 @@ impl Watchlist {
     }
 
     pub fn remove_live(&self, url: &str) -> Result<bool> {
+        // Python 语义：remove-live = 暂停（注释掉），保留在列表。
         let before = read_lines(&self.url_config());
+        let mut changed = false;
         let after: Vec<String> = before
-            .iter()
+            .into_iter()
+            .map(|old| {
+                let stripped = old.trim();
+                let parsed = parse_live_line(stripped);
+                if !stripped.starts_with('#')
+                    && parsed.url.trim_end_matches('/') == url.trim_end_matches('/')
+                {
+                    changed = true;
+                    format!("#{stripped}")
+                } else {
+                    old
+                }
+            })
+            .collect();
+        if !changed {
+            return Ok(false);
+        }
+        write_lines(&self.url_config(), &after)?;
+        Ok(true)
+    }
+
+    pub fn delete_live(&self, url: &str) -> Result<bool> {
+        // Python 语义：delete-live = 彻底删除，并清理偏好。
+        let before = read_lines(&self.url_config());
+        let original_len = before.len();
+        let after: Vec<String> = before
+            .into_iter()
             .filter(|old| {
                 parse_live_line(old).url.trim_end_matches('/') != url.trim_end_matches('/')
             })
-            .cloned()
             .collect();
-        if after.len() == before.len() {
+        if after.len() == original_len {
             return Ok(false);
         }
         write_lines(&self.url_config(), &after)?;
@@ -279,14 +306,29 @@ fn parse_live_line(line: &str) -> LiveItem {
     let parts = split_comma(clean);
     let (quality, url, remark) = if parts.len() == 1 {
         (String::new(), parts[0].clone(), String::new())
-    } else if parts.len() == 2 {
-        if contains_url(&parts[0]) {
-            (String::new(), parts[0].clone(), parts[1].clone())
-        } else {
-            (parts[0].clone(), parts[1].clone(), String::new())
-        }
+    } else if contains_url(&parts[0]) {
+        // 兼容旧格式：URL,备注[,画质]
+        let remark = parts.get(1).cloned().unwrap_or_default();
+        let quality = parts
+            .get(2)
+            .cloned()
+            .filter(|v| is_quality(v))
+            .unwrap_or_default();
+        (quality, parts[0].clone(), remark)
+    } else if contains_url(&parts[1]) {
+        // 标准格式：画质,URL[,备注]
+        let remark = parts.get(2).cloned().unwrap_or_default();
+        (parts[0].clone(), parts[1].clone(), remark)
+    } else if parts.len() >= 3 {
+        // 兼容旧格式：URL,备注,画质（未加协议时按 URL 开头处理）
+        let quality = parts
+            .get(2)
+            .cloned()
+            .filter(|v| is_quality(v))
+            .unwrap_or_default();
+        (quality, parts[0].clone(), parts[1].clone())
     } else {
-        (parts[0].clone(), parts[1].clone(), parts[2..].join(","))
+        (String::new(), parts[0].clone(), parts[1].clone())
     };
     let url = if url.is_empty() || url.contains("://") {
         url
@@ -355,6 +397,13 @@ fn contains_url(text: &str) -> bool {
     t.contains("://") || t.starts_with("www.")
 }
 
+fn is_quality(text: &str) -> bool {
+    matches!(
+        text.trim(),
+        "原画" | "蓝光" | "超清" | "高清" | "标清" | "流畅"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,6 +421,10 @@ mod tests {
         assert_eq!(item.url, "https://live.bilibili.com/1");
         assert_eq!(item.remark, "主播甲");
         assert_eq!(item.quality, "原画");
+        let legacy = parse_live_line("https://live.bilibili.com/2,主播乙,高清");
+        assert_eq!(legacy.url, "https://live.bilibili.com/2");
+        assert_eq!(legacy.remark, "主播乙");
+        assert_eq!(legacy.quality, "高清");
         assert!(item.enabled);
         assert!(!parse_live_line("#https://live.bilibili.com/2").enabled);
     }

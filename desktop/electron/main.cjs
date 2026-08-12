@@ -3,11 +3,10 @@ const path = require('path')
 const { spawn } = require('child_process')
 const fs = require('fs')
 
-// electron/ 在 desktop/ 下，Python 虚拟环境在项目根目录（再上一级）
+// electron/ 在 desktop/ 下，Rust 核心在项目根目录（再上一级）
 const PROJECT_DIR = path.resolve(__dirname, '..', '..')
-const PYTHON = process.platform === 'win32'
-  ? path.join(PROJECT_DIR, '.venv', 'Scripts', 'python.exe')
-  : path.join(PROJECT_DIR, '.venv', 'bin', 'python')
+const RUST_EXE = path.join(PROJECT_DIR, 'zunzhe-core', 'target', 'release', 'zunzhe-core')
+const RUST_DEBUG_EXE = path.join(PROJECT_DIR, 'zunzhe-core', 'target', 'debug', 'zunzhe-core')
 const DIST_HTML = path.join(__dirname, '..', 'dist', 'index.html')
 const ASSETS = path.join(__dirname, '..', 'assets')
 const ICON_ICO = path.join(ASSETS, 'icon.ico')
@@ -73,10 +72,11 @@ function reloadUiWindow() {
 
 function runCli(args) {
   return new Promise((resolve, reject) => {
-    if (!fs.existsSync(PYTHON)) {
-      return reject(new Error(`找不到 Python 环境，请先在项目根目录创建 .venv：\n${PYTHON}`))
+    const exe = fs.existsSync(RUST_EXE) ? RUST_EXE : RUST_DEBUG_EXE
+    if (!fs.existsSync(exe)) {
+      return reject(new Error(`找不到 Rust 核心，请先构建：cd zunzhe-core && cargo build --release\n${RUST_EXE}`))
     }
-    const proc = spawn(PYTHON, ['-m', 'fupan.cli', ...args], {
+    const proc = spawn(exe, args, {
       cwd: PROJECT_DIR,
       windowsHide: true,
     })
@@ -142,9 +142,8 @@ async function serviceWatchdog() {
     const prefs = prefRes.prefs || {}
     if (prefs.watchdog === false) return
     const st = await runCli(['status'])
-    const live = st.services?.live_monitor?.running
-    const video = st.services?.video_monitor?.running
-    if (!live || !video) {
+    const rust = st.rust_daemon || st.rust_daemon_running
+    if (!rust) {
       const r = await runCli(['ensure-services'])
       if (r.restarted?.length) {
         console.log('[watchdog] 已重启服务:', r.restarted.join(', '))

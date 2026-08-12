@@ -40,6 +40,8 @@ enum Command {
     },
     /// 删除关注的主播/直播间（旧名 remove-anchor 继续保留）
     RemoveLive { url: String },
+    /// 彻底删除关注的主播/直播间（Python 版兼容）
+    DeleteLive { url: String },
     /// 删除关注的主播/直播间（Python 版兼容别名）
     RemoveAnchor { url: String },
     /// 列出关注的主播/直播间（旧名 list-anchors 继续保留）
@@ -48,6 +50,14 @@ enum Command {
     ListAnchors,
     /// 检查单个直播间监控状态
     CheckLive { url: String },
+    /// 设置某监控项通知通道（跟随全局/邮箱/微信/不通知）
+    SetNotify {
+        url: String,
+        #[arg(default_value = "跟随全局")]
+        channel: String,
+        #[arg(default_value = "")]
+        name: String,
+    },
     /// 手动录制一次直播（秒数，0=一直录到结束）
     RecordLive {
         url: String,
@@ -101,6 +111,11 @@ enum Command {
         #[arg(default_value = "")]
         to: String,
     },
+    /// 从旧配置导入邮箱（兼容 Python 命令，当前直接返回提示）
+    EmailImportLegacy {
+        #[arg(default_value = "")]
+        legacy_file: String,
+    },
     /// 导出训练数据 JSONL
     ExportTrainingData {
         #[arg(default_value = "")]
@@ -110,6 +125,8 @@ enum Command {
     },
     /// 发送测试邮件
     TestEmail,
+    /// 发送测试通知（Python 兼容别名）
+    TestNotify,
     /// 读取配置（all/config/fupan_config，密钥脱敏）
     GetConfig {
         #[arg(default_value = "all")]
@@ -148,10 +165,25 @@ enum Command {
     },
     /// 启动 MCP stdio server
     Mcp,
-    /// 启动 Python 直播监控 + 视频监控后台服务（兼容层）
+    /// 启动 Rust 核心 daemon（统一接管直播与视频监控）
     Start,
-    /// 停止全部 Python 后台服务（兼容层）
+    /// 确保服务运行（桌面端/兼容层入口）
+    EnsureServices,
+    /// 停止 Rust 核心 daemon（兼容层）
     Stop,
+    /// 读取后台服务日志末尾
+    TailLogs {
+        #[arg(default_value = "live_monitor")]
+        name: String,
+        #[arg(default_value_t = 200)]
+        lines: u64,
+    },
+    /// 读取桌面应用偏好
+    GetAppPrefs,
+    /// 写入桌面应用偏好（JSON）
+    SetAppPrefs { updates: String },
+    /// 标记向导完成
+    WizardDone,
     /// 查看后台服务与最近录制状态
     ServiceStatus,
     /// 对任意音视频文件跑 Python 复盘流水线（转写/提炼/切片）
@@ -194,6 +226,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 json!({"ok": removed, "url": url, "action": "remove-anchor"})
             );
         }
+        Command::DeleteLive { url } => {
+            let removed = db::remove_anchor(&pool, &url).await?;
+            let deleted = watch.delete_live(&url)?;
+            println!(
+                "{}",
+                json!({"ok": removed || deleted, "url": url, "action": "delete-live"})
+            );
+        }
         Command::ListLive | Command::ListAnchors => {
             let anchors = db::list_anchors(&pool).await?;
             let items = watch.list_live();
@@ -232,6 +272,19 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     "hint": "Rust daemon 运行中会自动检测并录制开播"
                 })
             );
+        }
+        Command::SetNotify { url, channel, name } => {
+            let result = watch.set_notify(&url, &channel, &name);
+            match result {
+                Ok(_) => println!(
+                    "{}",
+                    json!({"ok": true, "url": url, "channel": channel, "name": name})
+                ),
+                Err(e) => println!(
+                    "{}",
+                    json!({"ok": false, "url": url, "error": e.to_string()})
+                ),
+            }
         }
         Command::RecordLive { url, duration_secs } => {
             match live_monitor::record_live_once(&pool, &project_dir, &cfg, &url, duration_secs)
@@ -351,6 +404,15 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 json!({"ok": true, "email": email, "to": if to.is_empty() { email } else { to }})
             );
         }
+        Command::EmailImportLegacy { legacy_file } => {
+            // Python 旧版从 fupan_config/旧配置导入邮箱；Rust 已统一读 config.ini，
+            // 这里保留命令名与提示，避免桌面端/脚本因缺命令中断。
+            println!(
+                "{}",
+                json!({"ok": true, "legacy_file": legacy_file,
+                       "hint": "Rust 版邮箱配置统一使用 config.ini 的 [推送配置] 字段"})
+            );
+        }
         Command::ExportTrainingData { anchor, output } => {
             let summary = training_data::export(&fupan_dir, &anchor, &output)?;
             println!("{}", serde_json::to_string(&summary)?);
@@ -373,7 +435,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 json!({"ok": true, "videos": videos, "count": videos.len()})
             );
         }
-        Command::TestEmail => {
+        Command::TestEmail | Command::TestNotify => {
             let status = cfg.email_status();
             if !status.configured {
                 println!(
@@ -436,6 +498,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             let email = cfg.email_status();
             let live = watch.list_live();
             let video_sources = watch.list_video();
+            let rust_running = crate::service::rust_daemon_alive(&project_dir);
             println!(
                 "{}",
                 json!({
@@ -445,6 +508,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     "video_watchlist": video_sources,
                     "video_count": videos.len(),
                     "email": email,
+                    "rust_daemon": rust_running,
+                    "services": {
+                        "live_monitor": {"running": rust_running},
+                        "video_monitor": {"running": rust_running},
+                    },
                     "version": env!("CARGO_PKG_VERSION"),
                 })
             );
@@ -475,9 +543,36 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             let result = service::ensure_core(&project_dir)?;
             println!("{}", serde_json::to_string(&result)?);
         }
+        Command::EnsureServices => {
+            let result = service::ensure_core(&project_dir)?;
+            println!("{}", serde_json::to_string(&result)?);
+        }
         Command::Stop => {
             let result = service::stop_rust_daemon(&project_dir)?;
             println!("{}", serde_json::to_string(&result)?);
+        }
+        Command::TailLogs { name, lines } => {
+            println!(
+                "{}",
+                serde_json::to_string(&service::tail_logs(&project_dir, &name, lines))?
+            );
+        }
+        Command::GetAppPrefs => {
+            let prefs = crate::app_prefs::read_app_prefs(&project_dir);
+            println!("{}", json!({"ok": true, "prefs": prefs}));
+        }
+        Command::SetAppPrefs { updates } => {
+            let value: serde_json::Value = serde_json::from_str(&updates)
+                .map_err(|e| anyhow::anyhow!("JSON 解析失败: {e}"))?;
+            let prefs = crate::app_prefs::write_app_prefs(&project_dir, &value)?;
+            println!("{}", json!({"ok": true, "prefs": prefs}));
+        }
+        Command::WizardDone => {
+            let mut value = serde_json::Map::new();
+            value.insert("wizardDone".into(), serde_json::Value::Bool(true));
+            let prefs =
+                crate::app_prefs::write_app_prefs(&project_dir, &serde_json::Value::Object(value))?;
+            println!("{}", json!({"ok": true, "prefs": prefs}));
         }
         Command::ServiceStatus => {
             let mut result = service::status(&project_dir)?;
