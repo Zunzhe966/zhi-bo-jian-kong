@@ -60,7 +60,7 @@ Python 工具层  faster-whisper / LLM 提炼 / ffmpeg 切片 / yt-dlp 兜底
 
 ### Rust 重构（zunzhe-core）已交付能力
 
-- M0-M17 全部完成并通过 `cargo test`（50 个测试 + 4 集成契约测试）+ `cargo clippy` + `cargo fmt`
+- M0-M17 全部完成并通过 `cargo test`（61 个单测 + 5 集成契约测试）+ `cargo clippy` + `cargo fmt`
 - M13 组装收尾：macOS 守护脚本、launchd 模板、使用说明、图谱更新
 - CLI/MCP 命令与 Python 版对齐；SQLite 持久化、崩溃可恢复、任务失败只记日志不拖垮 daemon
 - CLI/MCP 已对齐 `delete-live / set-notify / ensure-services / tail-logs /
@@ -70,6 +70,8 @@ Python 工具层  faster-whisper / LLM 提炼 / ffmpeg 切片 / yt-dlp 兜底
   `status` 同时返回 `rust_daemon` 与兼容的 `services` 字段，服务按钮/守护
   只看 Rust daemon，不再启动 Python 双跑
 - 视频监控支持监控列表/偏好/服务管理，首次监控只记录基线，之后只对新视频通知/下载
+- 下载成功后自动入队复盘（独立后台 worker，转写/提炼/切片），录制结束同样自动复盘；
+  复盘队列按 kind 独立认领/恢复，失败 3 次落定 failed，不再无限循环
 - 平台适配器：B站原生接口（Cookie 防 412）+ RSS 兜底；抖音/快手走 RSSHub 或 yt-dlp
 - 已知待补：邮箱授权码需用户提供；B站/抖音风控时需配置 Cookie
 - 已知待补：B站视频监控当前环境匿名访问被 352/412 风控，需在
