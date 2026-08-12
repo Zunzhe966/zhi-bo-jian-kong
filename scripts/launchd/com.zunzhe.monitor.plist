@@ -17,9 +17,9 @@
   <key>WorkingDirectory</key>
   <string>/Users/zhangxuetao/Desktop/尊者监控直播短视频</string>
   <key>StandardOutPath</key>
-  <string>/Users/zhangxuetao/Desktop/尊者监控直播短视频/logs/zunzhe-core.log</string>
+  <string>/Users/zhangxuetao/Library/Logs/zunzhe/zunzhe-core.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/zhangxuetao/Desktop/尊者监控直播短视频/logs/zunzhe-core.err.log</string>
+  <string>/Users/zhangxuetao/Library/Logs/zunzhe/zunzhe-core.err.log</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
