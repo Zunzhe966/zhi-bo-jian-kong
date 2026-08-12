@@ -112,3 +112,57 @@ fn mcp_tools_cover_core_cli_commands() {
         assert!(names.contains(expected), "MCP 缺少工具: {expected}");
     }
 }
+
+/// 真实进程级崩溃恢复契约：SIGKILL 后单实例锁自动让出，新实例可重获。
+#[cfg(unix)]
+#[test]
+fn sigkill_frees_lock_and_allows_recovery() {
+    use std::process::{Command, Stdio};
+    use zunzhe_core::daemon_lock::DaemonLock;
+
+    let dir = std::env::temp_dir().join(format!("zunzhe-crash-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("config")).unwrap();
+    std::fs::create_dir_all(dir.join("logs")).unwrap();
+    std::fs::create_dir_all(dir.join("fupan_output").join("run")).unwrap();
+
+    // 用 python3 子进程以 flock 独占同一锁文件，模拟持有 daemon 锁的进程。
+    let lock_path = zunzhe_core::daemon_lock::lock_file(&dir);
+    let script = format!(
+        "import fcntl, time\nf=open({:?}, 'w')\nfcntl.flock(f, fcntl.LOCK_EX)\ntime.sleep(30)\n",
+        lock_path.to_string_lossy()
+    );
+    let mut child = Command::new("python3")
+        .arg("-c")
+        .arg(&script)
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    // 等子进程拿到锁。
+    let mut ready = false;
+    for _ in 0..50 {
+        if DaemonLock::try_acquire(&dir).unwrap().is_none() {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(ready, "子进程未在预期时间内持有锁");
+
+    // 模拟硬崩溃：SIGKILL 不会执行任何清理，锁由内核释放。
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGKILL);
+    }
+    let _ = child.wait();
+
+    // 锁应可重获；心跳文件无需存在，恢复由新实例自己刷新。
+    let lock = DaemonLock::try_acquire(&dir).unwrap();
+    assert!(lock.is_some(), "SIGKILL 后单实例锁必须释放");
+    drop(lock);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
