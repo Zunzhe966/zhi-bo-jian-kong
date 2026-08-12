@@ -7,6 +7,7 @@ use std::time::Duration;
 use tokio::process::Command;
 use tracing::{debug, warn};
 
+use crate::bilibili_auth::cookie_header_from_project;
 use crate::model::VideoMeta;
 
 /// B 站 WBI 固定置换表（公开算法，非密钥）。
@@ -123,29 +124,7 @@ impl BilibiliAdapter {
 
     /// 从桌面端「B站授权」导出的 Netscape cookie 文件读取 Cookie 字符串。
     fn browser_cookie_from_project(&self) -> String {
-        let path = self
-            .project_dir
-            .join("fupan_output")
-            .join("run")
-            .join("bilibili_browser_cookies.txt");
-        if !path.exists() {
-            return String::new();
-        }
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return String::new();
-        };
-        let mut pairs = Vec::new();
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let fields: Vec<&str> = line.split('\t').collect();
-            if fields.len() >= 7 && fields[5] != "0" {
-                pairs.push(format!("{}={}", fields[5], fields[6]));
-            }
-        }
-        pairs.join("; ")
+        cookie_header_from_project(&self.project_dir)
     }
 
     pub fn with_cookie_and_project_dir(cookie: impl Into<String>, project_dir: PathBuf) -> Self {

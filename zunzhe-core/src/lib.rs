@@ -1,4 +1,5 @@
 pub mod app_prefs;
+pub mod bilibili_auth;
 pub mod cli;
 pub mod config;
 pub mod config_api;

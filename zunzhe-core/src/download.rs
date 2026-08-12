@@ -7,6 +7,7 @@ use serde::Serialize;
 use sqlx::sqlite::SqlitePool;
 use tokio::process::Command;
 
+use crate::bilibili_auth::browser_cookie_path;
 use crate::db;
 
 /// 下载器：优先走平台原生路径（B站浏览器内核提取直链 + ffmpeg 合流），
@@ -82,11 +83,7 @@ impl Downloader {
         if url.contains("bilibili.com") || url.contains("b23.tv") {
             // 桌面端「B站授权」导出的浏览器会话 Cookie 最可靠；没有再回退
             // config 里粘贴的 cookie。
-            let browser_cookies = self
-                .project_dir
-                .join("fupan_output")
-                .join("run")
-                .join("bilibili_browser_cookies.txt");
+            let browser_cookies = browser_cookie_path(&self.project_dir);
             if browser_cookies.exists() {
                 cmd.args(["--cookies", browser_cookies.display().to_string().as_str()]);
             } else {

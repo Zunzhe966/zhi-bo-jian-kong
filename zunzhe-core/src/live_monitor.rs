@@ -11,6 +11,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 use tracing::{error, info, warn};
 
+use crate::bilibili_auth::cookie_header_from_project;
 use crate::config::Config;
 use crate::db;
 use crate::notify::{Channel, Notifier};
@@ -305,6 +306,11 @@ pub fn resolve_live_with_cookie(url: &str, cookie: &str) -> Box<dyn LiveAdapter>
     }
 }
 
+/// 桌面端「B站授权」导出的浏览器 Cookie 转成请求头字符串，供直播检测使用。
+fn bilibili_browser_cookie(project_dir: &Path) -> String {
+    cookie_header_from_project(project_dir)
+}
+
 /// 录制会话状态机：负责把主播标记为直播中、启动/停止 ffmpeg、持久化会话。
 pub struct LiveMonitor<'a> {
     pool: &'a SqlitePool,
@@ -337,6 +343,11 @@ impl<'a> LiveMonitor<'a> {
                 continue;
             }
             let cookie = self.config.get_main("Cookie", "b站cookie");
+            let cookie = if cookie.is_empty() {
+                bilibili_browser_cookie(self.project_dir)
+            } else {
+                cookie
+            };
             let adapter = resolve_live_with_cookie(&item.url, &cookie);
             // 单个直播检查总时限 25 秒：B站 room_init/主播名/标题/流地址可能串行
             // 多次网络请求，不设总超时会让整个 daemon tick 被拖到 70 秒上限。
@@ -789,6 +800,11 @@ pub async fn record_live_once(
     duration_secs: u64,
 ) -> Result<String> {
     let cookie = config.get_main("Cookie", "b站cookie");
+    let cookie = if cookie.is_empty() {
+        bilibili_browser_cookie(project_dir)
+    } else {
+        cookie
+    };
     let adapter = resolve_live_with_cookie(url, &cookie);
     let status = adapter.check(url).await.context("直播检测失败")?;
     if !status.is_live {
