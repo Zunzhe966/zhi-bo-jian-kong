@@ -6,6 +6,7 @@ use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, Transport};
 use serde::Serialize;
 use sqlx::sqlite::SqlitePool;
+use std::time::Duration;
 
 use crate::config::{Config, EmailSettings};
 use crate::db;
@@ -49,6 +50,10 @@ impl<'a> Notifier<'a> {
         content: &str,
         channel: Channel,
     ) -> Result<bool> {
+        if channel == Channel::Email && !self.config.email_configured() {
+            tracing::warn!("邮箱未配置，跳过发送并保持通知可审计性（不写入 pending 队列）");
+            return Ok(false);
+        }
         let channel_name = match channel {
             Channel::Email => "邮箱",
             Channel::Wechat => "微信",
@@ -59,7 +64,12 @@ impl<'a> Notifier<'a> {
             return Ok(false);
         }
         let sent = match channel {
-            Channel::Email => send_email(self.config.email_settings(), title, content)?,
+            Channel::Email => {
+                let settings = self.config.email_settings();
+                let subject = title.to_string();
+                let body = content.to_string();
+                Self::send_email_with_timeout(settings, subject, body).await
+            }
             Channel::Wechat => bail!("微信通道尚未接入，请先用邮箱或配置 Server酱"),
             Channel::None => false,
         };
@@ -67,6 +77,63 @@ impl<'a> Notifier<'a> {
             db::mark_notify_done(self.pool, id).await?;
         }
         Ok(sent)
+    }
+
+    /// 重试通知队列中的 pending 通知：一次最多处理 50 条，失败保留 pending，
+    /// 成功标记 sent。发送失败只记日志，不拖垮 daemon tick。
+    pub async fn flush_pending(&self, limit: i64) -> Result<usize> {
+        if !self.config.email_configured() {
+            return Ok(0);
+        }
+        let pending = db::list_notify(self.pool, "pending", limit).await?;
+        let mut sent_count = 0;
+        for item in pending {
+            let channel = Channel::parse(&item.channel);
+            match self
+                .send(
+                    &item.event,
+                    &item.anchor,
+                    &item.title,
+                    &item.content,
+                    channel,
+                )
+                .await
+            {
+                Ok(true) => sent_count += 1,
+                Ok(false) => {}
+                Err(e) => tracing::warn!("重试通知失败: {e:#}"),
+            }
+        }
+        Ok(sent_count)
+    }
+
+    /// 把阻塞 SMTP 调用放进 blocking 线程池并限时执行，避免卡住 daemon tick。
+    /// 超时后调用继续执行但调用方已返回，符合“通知失败不阻塞监控”的契约。
+    async fn send_email_with_timeout(
+        settings: EmailSettings,
+        subject: String,
+        body: String,
+    ) -> bool {
+        let join = tokio::task::spawn_blocking(move || send_email(settings, &subject, &body));
+        match tokio::time::timeout(Duration::from_secs(20), join).await {
+            Ok(Ok(Ok(true))) => true,
+            Ok(Ok(Ok(false))) => {
+                tracing::warn!("SMTP 未返回成功，通知保持 pending 待重试");
+                false
+            }
+            Ok(Ok(Err(e))) => {
+                tracing::warn!("SMTP 发送失败，通知保持 pending 待重试: {e:#}");
+                false
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("SMTP 发送任务失败，通知保持 pending 待重试: {e:#}");
+                false
+            }
+            Err(_) => {
+                tracing::warn!("SMTP 发送超时（20 秒），通知保持 pending 待重试");
+                false
+            }
+        }
     }
 
     /// 仅记录已发送事件（test-email 先发信再落库，避免失败也留下“已发送”记录）。
@@ -154,5 +221,66 @@ mod tests {
         assert_eq!(Channel::parse("微信"), Channel::Wechat);
         assert_eq!(Channel::parse("不通知"), Channel::None);
         assert_eq!(Channel::parse("跟随全局"), Channel::Email);
+    }
+
+    #[tokio::test]
+    async fn unconfigured_email_skips_pending_record() {
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-notify-dir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::write(dir.join("config").join("config.ini"), "[推送配置]\n").unwrap();
+        std::fs::write(dir.join("config").join("fupan_config.ini"), "").unwrap();
+        let file = std::env::temp_dir().join(format!(
+            "zunzhe-notify-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pool = db::open_pool(&file).await.unwrap();
+        let cfg = crate::config::Config::load(&dir).unwrap();
+        let notifier = Notifier::new(&pool, &cfg);
+        let sent = notifier
+            .send("live", "主播", "开播", "内容", Channel::Email)
+            .await
+            .unwrap();
+        assert!(!sent);
+        // 未配置邮箱时不写 pending，避免通知表无限膨胀。
+        assert_eq!(db::list_notify(&pool, "", 10).await.unwrap().len(), 0);
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_file(file.with_extension("db-shm"));
+        let _ = std::fs::remove_file(file.with_extension("db-wal"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn blocking_smtp_call_is_cancelled_by_timeout() {
+        // 模拟不可达 SMTP：把真实 send_email 放进 blocking 线程池，20 秒内必然返回。
+        let settings = EmailSettings {
+            host: "smtp.invalid.local".to_string(),
+            port: "465".to_string(),
+            ssl: true,
+            login: "test@qq.com".to_string(),
+            auth: "fake".to_string(),
+            sender: "test@qq.com".to_string(),
+            sender_name: "尊者".to_string(),
+            to: "test@qq.com".to_string(),
+        };
+        let started = std::time::Instant::now();
+        let result =
+            Notifier::send_email_with_timeout(settings, "开播".to_string(), "内容".to_string())
+                .await;
+        assert!(!result);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "阻塞 SMTP 调用不能超过 30 秒"
+        );
     }
 }

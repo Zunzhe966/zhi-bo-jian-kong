@@ -48,27 +48,38 @@ pub async fn run_daemon(
     loop {
         // Rust 直播监控独立于 Python 兼容层运行：检测开播、自动录制、状态持久化。
         crate::service::touch_heartbeat(project_dir);
-        run_tick_with_timeout(&pool, project_dir, &fupan_dir, config, &watch).await;
-        if once {
+        let tick = run_tick_with_timeout(&pool, project_dir, &fupan_dir, config, &watch);
+        tokio::pin!(tick);
+        let mut exited = false;
+        tokio::select! {
+            _ = &mut tick => {}
+            _ = stop.1.changed() => {
+                info!("daemon duration reached, stopping current tick");
+                exited = true;
+            }
+            _sig = shutdown_signal() => {
+                info!("收到中断信号，daemon 优雅退出");
+                exited = true;
+            }
+        }
+        if once || exited || *stop.1.borrow() {
             let _ = monitor.stop_all_recordings().await;
             return Ok(());
         }
+        // duration 未到点且 tick 提前结束后，等待下一轮；期间继续响应退出。
+        let mut wait_exit = false;
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(interval_secs)) => {}
-            sig = shutdown_signal() => {
-                if sig {
-                    info!("收到中断信号，daemon 优雅退出");
-                    let _ = monitor.stop_all_recordings().await;
-                    return Ok(());
-                }
+            _ = stop.1.changed() => {
+                wait_exit = true;
             }
-            stopped = stop.1.changed() => {
-                if stopped.is_ok() && *stop.1.borrow() {
-                    info!("daemon duration reached, exiting cleanly");
-                    let _ = monitor.stop_all_recordings().await;
-                    return Ok(());
-                }
+            _sig = shutdown_signal() => {
+                wait_exit = true;
             }
+        }
+        if wait_exit || *stop.1.borrow() {
+            let _ = monitor.stop_all_recordings().await;
+            return Ok(());
         }
     }
 }
@@ -154,11 +165,21 @@ async fn run_tick_with_timeout(
         }
     } else {
         warn!("daemon tick 超过 70 秒，终止本轮子任务并跳过");
-        // 超时后必须 abort 两个子任务，避免上一轮还在跑、下一轮又启动。
-        live_task.abort();
-        videos_task.abort();
-        let _ = live_task.await;
-        let _ = videos_task.await;
+        abort_timed_out_tasks(live_task, videos_task).await;
+    }
+}
+
+/// 超时收尾：只 abort 尚未完成的任务并等待收尾。
+/// 已完成的 JoinHandle 在上层 `join!` 中已被 poll 过，不能再 await，
+/// 否则 tokio 会 panic（真实线上曾因“JoinHandle polled after completion”崩溃）。
+async fn abort_timed_out_tasks<T, U>(a: tokio::task::JoinHandle<T>, b: tokio::task::JoinHandle<U>) {
+    if !a.is_finished() {
+        a.abort();
+        let _ = a.await;
+    }
+    if !b.is_finished() {
+        b.abort();
+        let _ = b.await;
     }
 }
 
@@ -187,6 +208,10 @@ async fn tick(
     fupan_dir: &Path,
     config: &Config,
 ) -> Result<TickStats> {
+    // 0. 重试上次发送失败/超时的邮件通知；失败保留 pending 下一轮再试。
+    let notifier = Notifier::new(pool, config);
+    let notified_retry = notifier.flush_pending(50).await.unwrap_or(0);
+
     // 1. 处理待下载任务
     let downloads = download::process_pending(pool, project_dir)
         .await
@@ -198,7 +223,6 @@ async fn tick(
     let watch = Watchlist::new(project_dir.to_path_buf());
     let sources = watch.list_video();
     let library = VideoLibrary::new(pool.clone(), fupan_dir.to_path_buf());
-    let notifier = Notifier::new(pool, config);
     let mut checked = 0usize;
     let mut notified = 0usize;
     let mut enqueued = 0usize;
@@ -297,6 +321,7 @@ async fn tick(
         downloads: downloads + enqueued,
         anchors_checked: checked,
         videos_notified: notified,
+        notify_retried: notified_retry,
     })
 }
 
@@ -315,6 +340,7 @@ pub struct TickStats {
     pub downloads: usize,
     pub anchors_checked: usize,
     pub videos_notified: usize,
+    pub notify_retried: usize,
 }
 
 #[cfg(test)]
@@ -388,5 +414,16 @@ mod tests {
         drop(lock);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn tick_timeout_abort_does_not_panic_on_finished_handles() {
+        // 复现真实 panic：两个任务都在 70 秒前完成，超时闭包已 await 过句柄；
+        // 超时分支不能再 await，否则 tokio 会 "JoinHandle polled after completion"。
+        let mut a = tokio::task::spawn(async { 1u32 });
+        let mut b = tokio::task::spawn(async { 2u32 });
+        let _ = tokio::join!(&mut a, &mut b);
+        // 两个句柄已完成，超时收尾不能 panic。
+        abort_timed_out_tasks(a, b).await;
     }
 }
