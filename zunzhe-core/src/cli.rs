@@ -375,12 +375,15 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             for v in &videos {
                 let _ = library.upsert(v, "", &url).await;
             }
+            // 返回已入库的视频，让前端拿到封面缓存、日期、时长与已下载标记，
+            // 而不是只有平台适配器返回的原始 VideoMeta。
+            let persisted = library.list(&url, "", false).await?;
             let result = json!({
                 "ok": true,
                 "platform": adapter.name(),
                 "url": url,
-                "count": videos.len(),
-                "videos": videos,
+                "count": persisted.len(),
+                "videos": persisted,
             });
             println!("{}", result);
         }

@@ -333,8 +333,9 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
             for v in &videos {
                 let _ = library.upsert(v, "", &url).await;
             }
+            let persisted = library.list(&url, "", false).await?;
             Ok(serde_json::to_string(
-                &json!({"ok":true,"platform":adapter.name(),"count":videos.len(),"videos":videos}),
+                &json!({"ok":true,"platform":adapter.name(),"count":persisted.len(),"videos":persisted}),
             )?)
         }
         "download_video" | "video_download" => {
