@@ -121,11 +121,46 @@ impl BilibiliAdapter {
         }
     }
 
+    /// 从桌面端「B站授权」导出的 Netscape cookie 文件读取 Cookie 字符串。
+    fn browser_cookie_from_project(&self) -> String {
+        let path = self
+            .project_dir
+            .join("fupan_output")
+            .join("run")
+            .join("bilibili_browser_cookies.txt");
+        if !path.exists() {
+            return String::new();
+        }
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return String::new();
+        };
+        let mut pairs = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let fields: Vec<&str> = line.split('\t').collect();
+            if fields.len() >= 7 && fields[5] != "0" {
+                pairs.push(format!("{}={}", fields[5], fields[6]));
+            }
+        }
+        pairs.join("; ")
+    }
+
     pub fn with_cookie_and_project_dir(cookie: impl Into<String>, project_dir: PathBuf) -> Self {
         Self {
             cookie: cookie.into(),
             project_dir,
             ..Self::default()
+        }
+    }
+
+    fn effective_cookie(&self) -> String {
+        if !self.cookie.is_empty() {
+            self.cookie.clone()
+        } else {
+            self.browser_cookie_from_project()
         }
     }
 
@@ -142,8 +177,9 @@ impl BilibiliAdapter {
             reqwest::header::REFERER,
             reqwest::header::HeaderValue::from_static("https://www.bilibili.com"),
         );
-        if !self.cookie.is_empty()
-            && let Ok(v) = reqwest::header::HeaderValue::from_str(&self.cookie)
+        let cookie = self.effective_cookie();
+        if !cookie.is_empty()
+            && let Ok(v) = reqwest::header::HeaderValue::from_str(&cookie)
         {
             headers.insert(reqwest::header::COOKIE, v);
         }
@@ -235,7 +271,8 @@ impl Platform for BilibiliAdapter {
 
 impl BilibiliAdapter {
     async fn upload_ids_official(&self, mid: &str, count: u32) -> Vec<String> {
-        if self.cookie.is_empty() {
+        let cookie = self.effective_cookie();
+        if cookie.is_empty() {
             return Vec::new();
         }
         let url = format!(
@@ -251,7 +288,7 @@ impl BilibiliAdapter {
                 reqwest::header::HeaderValue::from_static("https://www.bilibili.com")
             }),
         );
-        if let Ok(v) = reqwest::header::HeaderValue::from_str(&self.cookie) {
+        if let Ok(v) = reqwest::header::HeaderValue::from_str(&cookie) {
             headers.insert(reqwest::header::COOKIE, v);
         }
         // 部分风控环境下需要 WBI 签名；这里先做“取 wbi 图片 + 重试”的轻量兜底。
@@ -321,6 +358,7 @@ impl BilibiliAdapter {
     }
 
     async fn upload_ids_ytdlp(&self, mid: &str, count: u32) -> Vec<String> {
+        let cookie = self.effective_cookie();
         // 先找项目 .venv 里的 yt-dlp，再回退到系统 PATH，避免依赖当前工作目录。
         let candidate = self
             .project_venv_ytdlp()
@@ -328,7 +366,7 @@ impl BilibiliAdapter {
         debug!(
             "yt-dlp fallback: {} (cookie={})",
             candidate.display(),
-            !self.cookie.is_empty()
+            !cookie.is_empty()
         );
         let mut cmd = Command::new(&candidate);
         cmd.kill_on_drop(true);
@@ -337,8 +375,8 @@ impl BilibiliAdapter {
             .args(["--print", "%(id)s"])
             .arg(format!("https://space.bilibili.com/{mid}/video"));
         // 带用户 Cookie 可显著降低 B站风控；匿名请求容易被 352/412 拒绝。
-        if !self.cookie.is_empty() {
-            cmd.args(["--add-header", &format!("Cookie: {}", self.cookie)]);
+        if !cookie.is_empty() {
+            cmd.args(["--add-header", &format!("Cookie: {cookie}")]);
         }
         let child = cmd
             .stdin(Stdio::null())
