@@ -435,7 +435,6 @@ impl<'a> LiveMonitor<'a> {
         // 后台等待 ffmpeg 退出并回收状态，不阻塞检测循环。
         let pool = self.pool.clone();
         let anchor_name = anchor.clone();
-        let project_dir = self.project_dir.to_path_buf();
         let output_path = output.display().to_string();
         let split_enabled = self.config.is_yes("录制设置", "分段录制是否开启", false);
         tokio::spawn(async move {
@@ -453,18 +452,15 @@ impl<'a> LiveMonitor<'a> {
             if code == 0 {
                 info!("[{}] 录制正常结束", anchor_name);
                 let _ = db::end_live_session(&pool, session_id, "done", "").await;
-                // 录制结束后接复盘流水线；失败只记日志，不拖垮 daemon。
+                // 录制结束后入队复盘任务；失败只记日志，不拖垮 daemon。
                 let media = if split_enabled {
                     find_latest_segment(&output_path).unwrap_or_else(|| output_path.clone())
                 } else {
                     output_path.clone()
                 };
-                if let Err(e) = crate::pipeline_bridge::run_pipeline_by_project(
-                    &project_dir,
-                    &media,
-                    &anchor_name,
-                )
-                .await
+                if let Err(e) =
+                    crate::download::enqueue_pipeline_after_download(&pool, &media, &anchor_name)
+                        .await
                 {
                     warn!("[{}] 复盘流水线失败: {e:#}", anchor_name);
                 }
