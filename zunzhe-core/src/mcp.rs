@@ -128,6 +128,7 @@ pub fn tools_list() -> Vec<Value> {
         json!({"name":"video_check_now","description":"立即检查一轮新视频","inputSchema":{"type":"object","properties":{}}}),
         json!({"name":"blogger_videos","description":"列出博主历史视频","inputSchema":{"type":"object","properties":{"url":{"type":"string"},"count":{"type":"number"}},"required":["url"]}}),
         json!({"name":"download_video","description":"下载视频到 downloads/短视频/","inputSchema":{"type":"object","properties":{"url":{"type":"string"},"name":{"type":"string"}},"required":["url"]}}),
+        json!({"name":"video_download","description":"下载视频到 downloads/短视频/（Python 兼容别名）","inputSchema":{"type":"object","properties":{"url":{"type":"string"},"name":{"type":"string"}},"required":["url"]}}),
         json!({"name":"video_library","description":"查询视频库","inputSchema":{"type":"object","properties":{"source_url":{"type":"string"},"downloaded_only":{"type":"boolean"}}}}),
         json!({"name":"export_training_data","description":"导出训练数据 JSONL","inputSchema":{"type":"object","properties":{"anchor":{"type":"string"},"output":{"type":"string"}}}}),
         json!({"name":"email_status","description":"查看邮箱配置状态","inputSchema":{"type":"object","properties":{}}}),
@@ -336,7 +337,7 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
                 &json!({"ok":true,"platform":adapter.name(),"count":videos.len(),"videos":videos}),
             )?)
         }
-        "download_video" => {
+        "download_video" | "video_download" => {
             let url = args
                 .get("url")
                 .and_then(|v| v.as_str())
@@ -518,5 +519,62 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
             Ok(serde_json::to_string(&json!({"ok":true,"sent":true}))?)
         }
         _ => anyhow::bail!("工具未实现: {name}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tools_list_has_unique_names_and_required_args() {
+        let tools = tools_list();
+        let mut names = std::collections::HashSet::new();
+        for tool in &tools {
+            let name = tool["name"].as_str().unwrap_or_default();
+            assert!(!name.is_empty(), "工具缺 name: {tool}");
+            assert!(names.insert(name.to_string()), "工具名重复: {name}");
+            let schema = tool
+                .get("inputSchema")
+                .and_then(|s| s.as_object())
+                .unwrap_or_else(|| panic!("工具 {name} 缺 inputSchema"));
+            if let Some(props) = schema.get("properties") {
+                assert!(props.is_object(), "工具 {name} properties 必须是对象");
+            }
+        }
+        assert_eq!(names.len(), tools.len());
+    }
+
+    #[test]
+    fn tools_list_covers_python_mcp_surface() {
+        let tools = tools_list();
+        let names: std::collections::HashSet<String> = tools
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+            .collect();
+        for expected in [
+            "live_status",
+            "live_add",
+            "live_remove",
+            "live_list",
+            "live_check",
+            "video_add",
+            "video_download",
+            "blogger_videos",
+            "video_remove",
+            "video_list",
+            "video_check_now",
+            "service_start",
+            "service_stop",
+            "config_get",
+            "config_set",
+            "config_set_bulk",
+            "config_schema_tool",
+            "notes_list",
+            "process_media",
+            "test_email",
+        ] {
+            assert!(names.contains(expected), "MCP 缺工具: {expected}");
+        }
     }
 }
