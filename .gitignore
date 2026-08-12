@@ -180,3 +180,6 @@ config/config.ini
 config/URL_config.ini
 # 大型打包文件
 desktop/electron-win.zip
+
+# Rust core local database
+zunzhe-core.db

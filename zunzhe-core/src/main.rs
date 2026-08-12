@@ -1,6 +1,15 @@
 mod cli;
+mod config;
 mod db;
+mod download;
+mod mcp;
+mod model;
+mod notify;
+mod pipeline_bridge;
 mod platform;
+mod scheduler;
+mod training_data;
+mod video_library;
 
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
