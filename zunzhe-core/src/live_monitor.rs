@@ -338,18 +338,21 @@ impl<'a> LiveMonitor<'a> {
             }
             let cookie = self.config.get_main("Cookie", "b站cookie");
             let adapter = resolve_live_with_cookie(&item.url, &cookie);
-            match adapter.check(&item.url).await {
-                Ok(status) if status.is_live => {
+            // 单个直播检查总时限 25 秒：B站 room_init/主播名/标题/流地址可能串行
+            // 多次网络请求，不设总超时会让整个 daemon tick 被拖到 70 秒上限。
+            match tokio::time::timeout(Duration::from_secs(25), adapter.check(&item.url)).await {
+                Ok(Ok(status)) if status.is_live => {
                     stats.checked += 1;
                     if let Err(e) = self.ensure_recording(&item, &status).await {
                         warn!("[{}] 开始录制失败: {e:#}", item.remark);
                     }
                 }
-                Ok(_) => {
+                Ok(Ok(_)) => {
                     stats.checked += 1;
                     self.finish_if_stopped(&item.url).await;
                 }
-                Err(e) => error!("[{}] 直播检测失败: {e:#}", item.remark),
+                Ok(Err(e)) => error!("[{}] 直播检测失败: {e:#}", item.remark),
+                Err(_) => error!("[{}] 直播检测超时（25 秒），跳过本轮", item.remark),
             }
         }
         Ok(stats)

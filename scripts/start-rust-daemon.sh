@@ -5,7 +5,13 @@
 # 建议配合 launchd/任务计划使用；日志在 logs/zunzhe-core.log。
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# 支持从仓库 scripts/ 或 ~/Library/LaunchAgents/ 两种位置运行：
+# 优先用仓库绝对路径，避免 launchd 复制脚本后 dirname 解析到错误目录。
+if [ -d "$(dirname "$0")/../zunzhe-core" ]; then
+  ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+else
+  ROOT="$HOME/Desktop/尊者监控直播短视频"
+fi
 cd "$ROOT"
 
 export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
