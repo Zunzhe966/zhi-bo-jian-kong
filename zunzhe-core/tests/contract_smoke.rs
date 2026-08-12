@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use zunzhe_core::config::Config;
+use zunzhe_core::mcp;
 use zunzhe_core::service;
 
 /// 接口契约冒烟：daemon 心跳/pid 生命周期、doctor 输出、日志轮转文件。
@@ -60,4 +61,53 @@ fn goal_docs_exist() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     assert!(root.join("PROJECT_GOAL.md").exists());
     assert!(root.join("zunzhe-core").join("目标模式.md").exists());
+}
+
+/// CLI/MCP 对齐契约：MCP 工具清单必须覆盖 CLI 暴露的核心能力。
+#[test]
+fn mcp_tools_cover_core_cli_commands() {
+    let tools = mcp::tools_list();
+    let names: std::collections::HashSet<String> = tools
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+        .collect();
+    for expected in [
+        "live_status",
+        "live_list",
+        "live_add",
+        "live_remove",
+        "live_delete",
+        "live_check",
+        "live_set_notify",
+        "record_live",
+        "service_status",
+        "tail_logs",
+        "video_add",
+        "video_remove",
+        "video_list",
+        "video_check_now",
+        "blogger_videos",
+        "download_video",
+        "video_library",
+        "export_training_data",
+        "email_status",
+        "email_setup",
+        "app_prefs_get",
+        "app_prefs_set",
+        "config_get",
+        "config_set",
+        "config_set_bulk",
+        "config_schema_tool",
+        "notes_list",
+        "process_media",
+        "service_start",
+        "service_stop",
+        "ensure_services",
+        "doctor",
+        "wizard_done",
+        "test_email",
+        "test_notify",
+    ] {
+        assert!(names.contains(expected), "MCP 缺少工具: {expected}");
+    }
 }
