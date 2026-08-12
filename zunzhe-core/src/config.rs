@@ -121,6 +121,15 @@ impl Config {
         self.fupan.get(section, key).unwrap_or_default()
     }
 
+    pub fn is_yes(&self, section: &str, key: &str, default: bool) -> bool {
+        let v = self.get_fupan(section, key);
+        if v.is_empty() {
+            default
+        } else {
+            IniFile::is_yes(&v)
+        }
+    }
+
     #[allow(dead_code)] // 快速判断是否已配置，供界面使用
     pub fn email_configured(&self) -> bool {
         let host = self.get_main("推送配置", "SMTP邮件服务器");

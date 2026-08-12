@@ -1,16 +1,16 @@
 # Graph Report - 尊者监控直播短视频  (2026-08-12)
 
 ## Corpus Check
-- 87 files · ~121,200 words
+- 90 files · ~125,836 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 1015 nodes · 2239 edges · 57 communities (53 shown, 4 thin omitted)
+- 1109 nodes · 2511 edges · 57 communities (53 shown, 4 thin omitted)
 - Extraction: 99% EXTRACTED · 1% INFERRED · 0% AMBIGUOUS · INFERRED: 28 edges (avg confidence: 0.6)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `a6622e8b`
+- Built from commit: `c60ec0e6`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -29,7 +29,7 @@
 - ab_sign.py
 - ffmpeg_install.py
 - liveme.js
-- utils.py
+- Watchlist
 - x-bogus.js
 - make-icons.cjs
 - sync_req
@@ -52,21 +52,21 @@
 - 安全审查报告 —— DouyinLiveRecorder（直播复盘助手 基础项目）
 - main
 - Config
-- download.rs
-- settings.py
+- mcp.rs
+- get
 - pipeline_bridge.rs
 - notify.py
-- email_setup.py
-- config_api.py
-- push_message
-- app_prefs.py
-- _download_and_process
+- ConfigApi
+- service.rs
+- bili-cookie.cjs
+- bili_browser.py
+- extract-run.cjs
 - 尊者直播监控 Rust 重构 — 目标模式（北极星）
-- monitor_prefs.py
-- _load
-- write_email_config
+- _bili_test.cjs
+- settings.py
+- files
 - _resolve_media
-- import_legacy_account
+- pollLocalNotifyQueue
 - start-rust-daemon.sh
 
 ## God Nodes (most connected - your core abstractions)
@@ -74,23 +74,23 @@
 2. `start_record()` - 76 edges
 3. `trace_error_decorator()` - 75 edges
 4. `main()` - 35 edges
-5. `_json()` - 22 edges
-6. `Config` - 21 edges
+5. `Config` - 23 edges
+6. `_json()` - 22 edges
 7. `get()` - 20 edges
-8. `is_yes()` - 18 edges
-9. `fupan_config()` - 17 edges
-10. `run_pipeline()` - 16 edges
+8. `Watchlist` - 20 edges
+9. `is_yes()` - 18 edges
+10. `fupan_config()` - 17 edges
 
 ## Surprising Connections (you probably didn't know these)
 - `check_ffmpeg_existence()` --calls--> `check_ffmpeg()`  [EXTRACTED]
   main.py → ffmpeg_install.py
-- `send_email_smtp()` --calls--> `send_email()`  [EXTRACTED]
-  fupan/email_setup.py → msg_push.py
 - `push_message()` --calls--> `get_notify()`  [EXTRACTED]
   main.py → fupan/monitor_prefs.py
 - `_send_email()` --calls--> `send_email()`  [EXTRACTED]
   fupan/notify.py → msg_push.py
 - `_send_channels()` --calls--> `bark()`  [EXTRACTED]
+  fupan/notify.py → msg_push.py
+- `_send_channels()` --calls--> `ntfy()`  [EXTRACTED]
   fupan/notify.py → msg_push.py
 
 ## Import Cycles
@@ -99,35 +99,35 @@
 ## Communities (57 total, 4 thin omitted)
 
 ### Community 0 - "spider.py"
-Cohesion: 0.07
-Nodes (110): callable, Exception, start_record(), async_req(), get_response_status(), OptionalDict, OptionalStr, get_live_room_id() (+102 more)
+Cohesion: 0.06
+Nodes (123): callable, Exception, clean_name(), start_record(), async_req(), get_response_status(), OptionalDict, OptionalStr (+115 more)
 
 ### Community 1 - "video_monitor.py"
-Cohesion: 0.06
-Nodes (54): Connection, download(), _electron_binary(), extract_streams(), _ffmpeg(), is_bilibili(), Path, 返回 Electron 可执行文件（跨 Windows/macOS/Linux）。 (+46 more)
+Cohesion: 0.10
+Nodes (32): is_bilibili(), _bilibili_anon_cookies_file(), _bilibili_browser_cookies_file(), _bilibili_title(), _bilibili_upload_ids(), _bilibili_upload_ids_api(), _bilibili_upload_ids_rsshub(), _bilibili_user_cookies_file() (+24 more)
 
 ### Community 2 - "main.py"
-Cohesion: 0.10
-Nodes (20): translated_print(), backup_file(), backup_file_start(), check_subprocess(), clear_record_info(), converts_m4a(), converts_mp4(), direct_download_stream() (+12 more)
+Cohesion: 0.06
+Nodes (36): Enum, 真正走 SMTP 发信；测试用（不落盘），成功后返回 sent=True。, send_email_smtp(), translated_print(), backup_file(), backup_file_start(), check_subprocess(), clear_record_info() (+28 more)
 
 ### Community 3 - "cli.py"
-Cohesion: 0.13
-Nodes (37): add_live(), add_video(), check_live(), _contains_url(), delete_live(), email_status(), ensure_services(), export_training_data() (+29 more)
+Cohesion: 0.05
+Nodes (82): Connection, get_prefs(), _load(), mark_wizard_done(), _save(), set_prefs(), add_live(), add_video() (+74 more)
 
 ### Community 4 - "main.cjs"
-Cohesion: 0.05
-Nodes (45): DEFAULT_OUT, extractBilibiliStreams(), fs, harvestBilibiliCookies(), path, runStandalone(), { app, BrowserWindow, session }, fs (+37 more)
+Cohesion: 0.13
+Nodes (21): { app, BrowserWindow, Tray, Menu, globalShortcut, ipcMain, shell, nativeImage, Notification }, ASSETS, createTray(), createWindow(), DIST_HTML, fs, gotLock, ICON_ICO (+13 more)
 
 ### Community 5 - "mcp_server.py"
-Cohesion: 0.10
-Nodes (38): config_schema(), blogger_videos(), config_get(), config_schema_tool(), config_set(), config_set_bulk(), _json(), live_add() (+30 more)
+Cohesion: 0.07
+Nodes (56): config_schema(), _file_key(), get_config(), _is_secret(), _load(), _match_existing_key(), Path, RawConfigParser (+48 more)
 
 ### Community 6 - "devDependencies"
 Cohesion: 0.12
 Nodes (17): concurrently, devDependencies, concurrently, electron, electron-builder, sharp, to-ico, vite (+9 more)
 
 ### Community 7 - "initializer.py"
-Cohesion: 0.21
+Cohesion: 0.28
 Nodes (10): check_node(), check_nodejs_installed(), get_package_manager(), install_nodejs(), install_nodejs_centos(), install_nodejs_mac(), install_nodejs_ubuntu(), install_nodejs_windows() (+2 more)
 
 ### Community 8 - "App.jsx"
@@ -135,8 +135,8 @@ Cohesion: 0.12
 Nodes (17): App(), buildRows(), detectPlatform(), normalizeUrl(), notifyOptions, platformColors, platformLabels, platformOptions (+9 more)
 
 ### Community 10 - "build"
-Cohesion: 0.14
-Nodes (13): build, appId, directories, files, portable, productName, win, output (+5 more)
+Cohesion: 0.20
+Nodes (10): build, appId, directories, portable, productName, win, output, artifactName (+2 more)
 
 ### Community 11 - "ab_sign.py"
 Cohesion: 0.19
@@ -150,9 +150,9 @@ Nodes (17): _add_bundled_to_path(), check_ffmpeg(), check_ffmpeg_installed(), _d
 Cohesion: 0.20
 Nodes (10): Cm(), createRandom(), createSignature(), lC(), r(), requestSign(), Rm, s (+2 more)
 
-### Community 14 - "utils.py"
-Cohesion: 0.11
-Nodes (17): Enum, clean_name(), ProxyDetector, ProxyInfo, ProxyType, check_disk_capacity(), check_md5(), Color (+9 more)
+### Community 14 - "Watchlist"
+Cohesion: 0.15
+Nodes (25): contains_url(), format_live_line(), format_video_line(), live_and_video_roundtrip(), LiveItem, normalize_url(), notify_prefs_fallback_to_follow_global(), parse_live_line() (+17 more)
 
 ### Community 15 - "x-bogus.js"
 Cohesion: 0.25
@@ -171,16 +171,16 @@ Cohesion: 0.83
 Nodes (3): calculateSign(), generateUUID(), sign()
 
 ### Community 25 - "platform.rs"
-Cohesion: 0.12
-Nodes (26): Box, Client, Default, Future, Into, Output, Pin, Send (+18 more)
+Cohesion: 0.11
+Nodes (31): Box, Client, Default, Future, Into, Output, Pin, Range (+23 more)
 
 ### Community 26 - "三、功能需求清单"
 Cohesion: 0.09
 Nodes (21): 3.1 直播监控（核心）, 3.2 复盘流水线（开关可选）, 3.3 通知（简单版）, 3.4 博主已发布视频浏览 + 选择性下载（新增重点）, 3.5 训练数据沉淀（新增）, 3.6 智能体接入（保留）, 4.1 数据模型（SQLite 表 video_library）, 4.2 列表获取 (+13 more)
 
 ### Community 27 - "db.rs"
-Cohesion: 0.11
-Nodes (45): add_anchor(), add_notify(), enqueue_task(), get_videos(), init_db(), is_downloaded(), list_anchors(), list_notify() (+37 more)
+Cohesion: 0.10
+Nodes (50): add_anchor(), add_notify(), enqueue_task(), ensure_video_row(), ensure_video_row_keeps_existing_fields(), get_videos(), init_db(), is_downloaded() (+42 more)
 
 ### Community 28 - "直播复盘助手 / LiveReview"
 Cohesion: 0.11
@@ -228,67 +228,67 @@ Nodes (5): 一、审查范围与方法, 三、发现的风险点与 bug, 二、�
 
 ### Community 40 - "Config"
 Cohesion: 0.08
-Nodes (34): HashMap, Config, email_status_missing_hint(), EmailSettings, EmailStatus, find_project_root(), IniFile, mask() (+26 more)
+Nodes (34): Config, email_status_missing_hint(), EmailSettings, EmailStatus, find_project_root(), IniFile, mask(), parses_ini_and_yes() (+26 more)
 
-### Community 41 - "download.rs"
+### Community 41 - "mcp.rs"
 Cohesion: 0.08
-Nodes (35): Arc, Stdout, Value, Downloader, DownloadResult, extract_video_id(), find_latest_video(), find_ytdlp() (+27 more)
+Nodes (36): Arc, Stdout, Downloader, DownloadResult, extract_video_id(), find_latest_video(), find_ytdlp(), process_pending() (+28 more)
 
-### Community 42 - "settings.py"
-Cohesion: 0.30
+### Community 42 - "get"
+Cohesion: 0.29
 Nodes (16): cut_clips(), _safe_name(), _chat(), _client(), distill_transcript(), _parse_json(), 输入 transcribe 的结果，输出 知识点.json 和 复盘笔记.md。, main() (+8 more)
 
 ### Community 43 - "pipeline_bridge.rs"
-Cohesion: 0.15
-Nodes (16): Cli, Command, Option, PathBuf, Result, String, run(), PipelineSummary (+8 more)
+Cohesion: 0.13
+Nodes (19): Cli, Command, Option, PathBuf, Result, String, run(), list_notes() (+11 more)
 
 ### Community 44 - "notify.py"
 Cohesion: 0.19
-Nodes (17): get_notify(), _channels_for_pref(), _clean(), _push_channels(), 按指定通道集合发送，channels 元素：微信/邮箱/PushPlus/Bark/ntfy, 返回要使用的通道集合；None 表示不通知。, 按该监控项的「通知=」偏好发送（可在监控偏好.json 按 URL 配置）。, 过滤基础项目里遗留的占位符，但保留真实的 Server酱/PushPlus 密钥。 (+9 more)
+Nodes (16): _channels_for_pref(), _clean(), _push_channels(), 按指定通道集合发送，channels 元素：微信/邮箱/PushPlus/Bark/ntfy, 返回要使用的通道集合；None 表示不通知。, 按该监控项的「通知=」偏好发送（可在监控偏好.json 按 URL 配置）。, 过滤基础项目里遗留的占位符，但保留真实的 Server酱/PushPlus 密钥。, 从 [推送配置] 读取各 HTTPS 推送通道的凭据。 (+8 more)
 
-### Community 45 - "email_setup.py"
-Cohesion: 0.18
-Nodes (10): main(), _decrypt_legacy(), email_status(), _mask(), 尝试用老项目的 AES 密钥解密；无密钥或失败一律返回 None。, 真正走 SMTP 发信；测试用（不落盘），成功后返回 sent=True。, 返回邮箱配置状态与可诊断的错误原因（不回显授权码）。, send_email_smtp() (+2 more)
+### Community 45 - "ConfigApi"
+Cohesion: 0.25
+Nodes (9): ConfigApi, patch_ini_file(), patch_preserves_comments_and_order(), Path, PathBuf, Result, Self, Value (+1 more)
 
-### Community 46 - "config_api.py"
-Cohesion: 0.36
-Nodes (12): _file_key(), get_config(), _is_secret(), _load(), _match_existing_key(), Path, RawConfigParser, 大小写不敏感地找已有键，避免同名不同大小写的重复键弄崩 main.py 的解析。 (+4 more)
+### Community 46 - "service.rs"
+Cohesion: 0.33
+Nodes (15): ensure_started(), kill_process(), libc_kill(), libc_kill_process_group(), pid_file(), python_bin(), Option, Path (+7 more)
 
-### Community 47 - "push_message"
-Cohesion: 0.40
-Nodes (10): push_message(), bark(), dingtalk(), ntfy(), pushplus(), Any, PushPlus推送通知 API文档: https://www.pushplus.plus/doc/, send_email() (+2 more)
+### Community 47 - "bili-cookie.cjs"
+Cohesion: 0.31
+Nodes (7): DEFAULT_OUT, fs, harvestBilibiliCookies(), path, runStandalone(), path, { runStandalone, DEFAULT_OUT }
 
-### Community 48 - "app_prefs.py"
+### Community 48 - "bili_browser.py"
+Cohesion: 0.31
+Nodes (8): download(), _electron_binary(), extract_streams(), _ffmpeg(), Path, 返回 Electron 可执行文件（跨 Windows/macOS/Linux）。, 驱动 Electron 提取 B站视频的 DASH 直链。返回 {ok,title,video,audio}。, 下载 B站视频到 save_dir，返回最终 mp4 路径；失败返回 None。
+
+### Community 49 - "extract-run.cjs"
 Cohesion: 0.29
-Nodes (9): get_prefs(), _load(), mark_wizard_done(), _save(), set_prefs(), _queue_local(), 发送测试通知。未配置邮箱时给出明确修复提示，不再只报发送失败。, 写入待推送队列，由 Electron 桌面端弹出系统通知（代理/额度失败时的兜底）。 (+1 more)
-
-### Community 49 - "_download_and_process"
-Cohesion: 0.32
-Nodes (8): download_video(), 立即下载单个视频到 downloads/短视频/<名称>/，并跑复盘流水线。, _bilibili_anon_cookies_file(), _bilibili_user_cookies_file(), _download_and_process(), Path, 若用户在 [视频监控] b站cookie 里粘贴了浏览器 Cookie，转成 Netscape 格式给 yt-dlp 用。B站 412 风控时这是最可靠的解法。, B站对无 cookie 请求常返回 412 风控。领取匿名设备标识(buvid)写成 Netscape 格式 cookies 文件供 yt-dlp…
+Nodes (5): extractBilibiliStreams(), { app }, { extractBilibiliStreams }, fs, path
 
 ### Community 50 - "尊者直播监控 Rust 重构 — 目标模式（北极星）"
 Cohesion: 0.25
 Nodes (7): 一、最终目标（验收标准）, 三、接口契约（冻结）, 二、原子模块清单与接口契约, 五、稳定性验收（24×30）, 六、当前进度, 四、防回归规则（每次改动必须）, 尊者直播监控 Rust 重构 — 目标模式（北极星）
 
-### Community 51 - "monitor_prefs.py"
-Cohesion: 0.48
-Nodes (5): set_item_notify(), delete_prefs(), _load(), _save(), set_notify()
+### Community 51 - "_bili_test.cjs"
+Cohesion: 0.29
+Nodes (5): { app, BrowserWindow, session }, fs, hardStop, OUT, path
 
-### Community 52 - "_load"
-Cohesion: 0.33
-Nodes (6): ConfigParser, _load(), Path, RawConfigParser, 返回项目虚拟环境里的 Python 可执行文件（跨 Windows/macOS/Linux）。, venv_python()
+### Community 52 - "settings.py"
+Cohesion: 0.31
+Nodes (9): ConfigParser, email_settings(), _load(), main_config(), Path, RawConfigParser, 复用主程序 [推送配置] 里的 SMTP 账号。, 返回项目虚拟环境里的 Python 可执行文件（跨 Windows/macOS/Linux）。 (+1 more)
 
-### Community 53 - "write_email_config"
-Cohesion: 0.40
-Nodes (5): email_setup(), 写入 QQ 邮箱 SMTP 配置并启用邮件通知。, 写入 QQ 邮箱 SMTP 配置，并启用邮件通知渠道。, 内部写入（供迁移函数使用，忽略单键失败时抛错）。, write_email_config()
+### Community 53 - "files"
+Cohesion: 0.29
+Nodes (5): { contextBridge, ipcRenderer }, files, assets/**, dist/**, electron/**
 
 ### Community 54 - "_resolve_media"
 Cohesion: 0.50
 Nodes (5): _find_candidates(), Path, 按路径找实际录制文件。分段录制路径是 ffmpeg 模板（如 xxx_%03d.ts）， 实际文件是 xxx_000.ts；转码又会把 ts 换成…, 录制的 ts 可能正在被异步转成 mp4（转完删原文件），等文件落定后返回实际路径。, _resolve_media()
 
-### Community 55 - "import_legacy_account"
+### Community 55 - "pollLocalNotifyQueue"
 Cohesion: 0.50
-Nodes (4): email_import_legacy(), 尝试从老项目 zunzhe-dev 迁移 QQ 邮箱账号。, import_legacy_account(), 从老项目 accounts.json 读取 QQ 邮箱账号并写入当前配置。 注意：老项目密码是 AES-256-GCM 加密的，需要同目录…
+Nodes (5): applyStartupPrefs(), pollLocalNotifyQueue(), runCli(), serviceWatchdog(), startBackgroundTasks()
 
 ### Community 56 - "start-rust-daemon.sh"
 Cohesion: 0.50
@@ -302,17 +302,17 @@ Nodes (3): PATH, RUST_LOG, start-rust-daemon.sh script
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `get_notify()` connect `notify.py` to `monitor_prefs.py`, `main.py`, `cli.py`, `push_message`?**
-  _High betweenness centrality (0.048) - this node is a cross-community bridge._
-- **Why does `start_record()` connect `spider.py` to `main.py`, `utils.py`, `push_message`?**
-  _High betweenness centrality (0.031) - this node is a cross-community bridge._
-- **Why does `Config` connect `Config` to `download.rs`, `pipeline_bridge.rs`?**
-  _High betweenness centrality (0.019) - this node is a cross-community bridge._
+- **Why does `get_notify()` connect `cli.py` to `main.py`, `notify.py`?**
+  _High betweenness centrality (0.041) - this node is a cross-community bridge._
+- **Why does `Config` connect `Config` to `mcp.rs`, `pipeline_bridge.rs`?**
+  _High betweenness centrality (0.024) - this node is a cross-community bridge._
+- **Why does `start_record()` connect `spider.py` to `main.py`?**
+  _High betweenness centrality (0.021) - this node is a cross-community bridge._
 - **Are the 3 inferred relationships involving `start_record()` (e.g. with `converts_mp4()` and `generate_subtitles()`) actually correct?**
   _`start_record()` has 3 INFERRED edges - model-reasoned connections that need verification._
 - **What connects `{ app, BrowserWindow, session }`, `fs`, `path` to the rest of the system?**
   _150 weakly-connected nodes found - possible documentation gaps or missing edges._
 - **Should `spider.py` be split into smaller, more focused modules?**
-  _Cohesion score 0.07328054649899084 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.05887115429100162 - nodes in this community are weakly interconnected._
 - **Should `video_monitor.py` be split into smaller, more focused modules?**
-  _Cohesion score 0.060451977401129946 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.09915966386554621 - nodes in this community are weakly interconnected._

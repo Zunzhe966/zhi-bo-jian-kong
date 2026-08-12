@@ -7,6 +7,86 @@ use tokio::process::Command;
 
 use crate::config::Config;
 
+/// 列出 fupan_output/<主播>/<场次>/ 下的复盘产物（与 Python notes 对齐）。
+pub fn list_notes(fupan_dir: &Path, name_filter: &str) -> Result<Vec<serde_json::Value>> {
+    let mut results = Vec::new();
+    if !fupan_dir.exists() {
+        return Ok(results);
+    }
+    let mut anchors: Vec<PathBuf> = std::fs::read_dir(fupan_dir)
+        .map_err(anyhow::Error::from)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    anchors.sort();
+    for anchor_dir in anchors {
+        let anchor = anchor_dir
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if anchor == "run" || anchor == "logs" || anchor == "covers" {
+            continue;
+        }
+        if !name_filter.is_empty() && anchor != name_filter {
+            continue;
+        }
+        let mut sessions: Vec<PathBuf> = std::fs::read_dir(&anchor_dir)
+            .map_err(anyhow::Error::from)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        sessions.sort();
+        for session_dir in sessions {
+            if session_dir
+                .file_name()
+                .map(|s| s == "视频下载")
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let mut entry = serde_json::Map::new();
+            entry.insert("anchor".into(), anchor.clone().into());
+            entry.insert(
+                "session".into(),
+                session_dir
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default()
+                    .into(),
+            );
+            let mut clips = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&session_dir) {
+                for f in entries.flatten() {
+                    let name = f.file_name().to_string_lossy().to_string();
+                    let path = f.path();
+                    if name.ends_with(".复盘笔记.md") {
+                        entry.insert("notes_file".into(), path.display().to_string().into());
+                    } else if name.ends_with(".转写.txt") {
+                        entry.insert("transcript_file".into(), path.display().to_string().into());
+                    } else if name.ends_with(".知识点.json") {
+                        entry.insert("points_file".into(), path.display().to_string().into());
+                    } else if path.is_dir()
+                        && name == "精华切片"
+                        && let Ok(inner) = std::fs::read_dir(&path)
+                    {
+                        clips = inner
+                            .flatten()
+                            .map(|c| c.path().display().to_string().into())
+                            .collect();
+                    }
+                }
+            }
+            if !clips.is_empty() {
+                entry.insert("clips".into(), serde_json::Value::Array(clips));
+            }
+            results.push(serde_json::Value::Object(entry));
+        }
+    }
+    Ok(results)
+}
+
 /// Python AI 工具层路径（转写/提炼/切片）。
 #[derive(Debug, Clone)]
 pub struct PythonTool {

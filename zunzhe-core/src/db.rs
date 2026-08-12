@@ -57,6 +57,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
+
+CREATE TABLE IF NOT EXISTS monitor_baseline (
+    source_url TEXT PRIMARY KEY,
+    baseline_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
 "#;
 
 pub async fn init_db(pool: &SqlitePool) -> anyhow::Result<()> {
@@ -132,6 +138,28 @@ pub async fn list_anchors(pool: &SqlitePool) -> anyhow::Result<Vec<Anchor>> {
         });
     }
     Ok(out)
+}
+
+pub async fn is_source_baselined(pool: &SqlitePool, source_url: &str) -> anyhow::Result<bool> {
+    let row = sqlx::query("SELECT 1 FROM monitor_baseline WHERE source_url = ?")
+        .bind(source_url)
+        .fetch_optional(pool)
+        .await
+        .context("查询监控源基线")?;
+    Ok(row.is_some())
+}
+
+pub async fn mark_source_baselined(pool: &SqlitePool, source_url: &str) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"INSERT INTO monitor_baseline (source_url) VALUES (?)
+           ON CONFLICT(source_url) DO UPDATE SET
+             updated_at=datetime('now','localtime')"#,
+    )
+    .bind(source_url)
+    .execute(pool)
+    .await
+    .context("记录监控源基线")?;
+    Ok(())
 }
 
 #[allow(dead_code)] // 直播状态机写入接口
@@ -463,23 +491,28 @@ pub async fn mark_notify_done(pool: &SqlitePool, id: i64) -> anyhow::Result<()> 
 mod tests {
     use super::*;
     use crate::model::VideoMeta;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_DB_SEQ: AtomicU64 = AtomicU64::new(0);
 
     async fn test_pool() -> SqlitePool {
+        let seq = TEST_DB_SEQ.fetch_add(1, Ordering::Relaxed);
         let file = std::env::temp_dir().join(format!(
-            "zunzhe-test-{}-{}.db",
+            "zunzhe-test-{}-{}-{}.db",
             std::process::id(),
+            seq,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        let _ = std::fs::remove_file(&file);
         let options = sqlx::sqlite::SqliteConnectOptions::new()
             .filename(&file)
             .create_if_missing(true);
         let pool = SqlitePool::connect_with(options).await.unwrap();
         init_db(&pool).await.unwrap();
-        std::mem::forget(file); // 测试结束后交给 OS 清理，避免跨线程删除竞态
+        // 测试库文件交由 OS 临时目录回收，避免并发删除正在使用的 SQLite 文件。
+        std::mem::forget(file);
         pool
     }
 
@@ -565,6 +598,17 @@ mod tests {
             .unwrap();
         let rows = get_videos(&pool, "", "", false).await.unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[1].id, "BVnew");
+        let new_row = rows.iter().find(|r| r.id == "BVnew").unwrap();
+        assert_eq!(new_row.title, "新标题");
+        assert_eq!(new_row.anchor, "新主播");
+    }
+
+    #[tokio::test]
+    async fn monitor_baseline_persists() {
+        let pool = test_pool().await;
+        let url = "https://space.bilibili.com/946974";
+        assert!(!is_source_baselined(&pool, url).await.unwrap());
+        mark_source_baselined(&pool, url).await.unwrap();
+        assert!(is_source_baselined(&pool, url).await.unwrap());
     }
 }

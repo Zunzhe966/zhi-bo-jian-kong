@@ -55,8 +55,8 @@
     "semantic_hash": ""
   },
   "desktop/src/App.jsx": {
-    "mtime": 1786530654.1553605,
-    "ast_hash": "4eebee44874bfe917055f4652ef2f856",
+    "mtime": 1786533866.8079746,
+    "ast_hash": "6b3e41d5ad89faee287a81cb64797e2c",
     "semantic_hash": ""
   },
   "desktop/src/LogsPanel.jsx": {
@@ -105,8 +105,8 @@
     "semantic_hash": ""
   },
   "fupan/cli.py": {
-    "mtime": 1786530900.4221454,
-    "ast_hash": "f542235e6b36def07c6448998318057b",
+    "mtime": 1786533690.3834438,
+    "ast_hash": "fab67f4e36a9a795583cec72f160380a",
     "semantic_hash": ""
   },
   "fupan/clip.py": {
@@ -125,8 +125,8 @@
     "semantic_hash": ""
   },
   "fupan/doctor.py": {
-    "mtime": 1786492525.0580082,
-    "ast_hash": "2d999765d72b6918d6fcadfe082d86ce",
+    "mtime": 1786533774.2387688,
+    "ast_hash": "3a09b69daa448c51bf9a3b5a019ed282",
     "semantic_hash": ""
   },
   "fupan/mcp_server.py": {
@@ -140,8 +140,8 @@
     "semantic_hash": ""
   },
   "fupan/notify.py": {
-    "mtime": 1786530995.1987677,
-    "ast_hash": "1cba0ce3f9a07221bdcbebef34f3b480",
+    "mtime": 1786533731.3870347,
+    "ast_hash": "421d5927fa518c3e12ea45eefd37da2a",
     "semantic_hash": ""
   },
   "fupan/pipeline.py": {
@@ -315,23 +315,23 @@
     "semantic_hash": ""
   },
   "zunzhe-core/src/cli.rs": {
-    "mtime": 1786531676.362095,
-    "ast_hash": "3482d19870c9eaaca439cb4b6220e813",
+    "mtime": 1786540302.6235118,
+    "ast_hash": "8c6f0bdaa49f33ed87d848207a7ebec6",
     "semantic_hash": ""
   },
   "zunzhe-core/src/db.rs": {
-    "mtime": 1786531510.2406294,
-    "ast_hash": "4d2e487faf3042819591adc65ba98e33",
+    "mtime": 1786539705.968988,
+    "ast_hash": "d758576c0c74454ea2e8c56a4a54659d",
     "semantic_hash": ""
   },
   "zunzhe-core/src/main.rs": {
-    "mtime": 1786531556.319885,
-    "ast_hash": "51e71a8d09191b20e0ac7ebc855cbe17",
+    "mtime": 1786538819.7820919,
+    "ast_hash": "3404df68d654c36397f903dd55e98416",
     "semantic_hash": ""
   },
   "zunzhe-core/src/platform.rs": {
-    "mtime": 1786531647.2474747,
-    "ast_hash": "393b527a9e9723523f0347a0d72247b1",
+    "mtime": 1786539348.2307892,
+    "ast_hash": "8c8acaa29143513b98158d63beb3a159",
     "semantic_hash": ""
   },
   ".github/ISSUE_TEMPLATE/bug.yml": {
@@ -380,8 +380,8 @@
     "semantic_hash": ""
   },
   "PROJECT_GOAL.md": {
-    "mtime": 1786531712.8676286,
-    "ast_hash": "bd1d46b45122d56b8cf05f6b8340e70f",
+    "mtime": 1786540585.3865201,
+    "ast_hash": "9386628892cc15d61d98b8c7d10bddf1",
     "semantic_hash": ""
   },
   "README.md": {
@@ -415,8 +415,8 @@
     "semantic_hash": ""
   },
   "\u4f7f\u7528\u8bf4\u660e.md": {
-    "mtime": 1786531756.8758967,
-    "ast_hash": "8b129b99dcc6b9238d95d87c4ae462fc",
+    "mtime": 1786540570.7458644,
+    "ast_hash": "e86ea8cd26db168e67aedda7872b2c75",
     "semantic_hash": ""
   },
   "\u5b89\u5168\u5ba1\u67e5\u62a5\u544a.md": {
@@ -440,32 +440,32 @@
     "semantic_hash": ""
   },
   "desktop/assets/icon-128.png": {
-    "mtime": 1786530666.3980305,
+    "mtime": 1786534080.8145947,
     "ast_hash": "638aec0491518514cddf131ec0bba153",
     "semantic_hash": ""
   },
   "desktop/assets/icon-16.png": {
-    "mtime": 1786530666.3552437,
+    "mtime": 1786534080.7695076,
     "ast_hash": "73d6ad55da19d6adb06194a4dac799e1",
     "semantic_hash": ""
   },
   "desktop/assets/icon-256.png": {
-    "mtime": 1786530666.4121428,
+    "mtime": 1786534080.8293717,
     "ast_hash": "e28e9b9bafa68cb6ee612fc07a81dea6",
     "semantic_hash": ""
   },
   "desktop/assets/icon-32.png": {
-    "mtime": 1786530666.3656738,
+    "mtime": 1786534080.7806149,
     "ast_hash": "f94ff846797bf5887d32e622db39828f",
     "semantic_hash": ""
   },
   "desktop/assets/icon-48.png": {
-    "mtime": 1786530666.3763237,
+    "mtime": 1786534080.7915788,
     "ast_hash": "1829cbee971855fc795ba09cba36b47a",
     "semantic_hash": ""
   },
   "desktop/assets/icon-64.png": {
-    "mtime": 1786530666.386748,
+    "mtime": 1786534080.8024793,
     "ast_hash": "89d33ade9b6987b557524a79e1a6afd0",
     "semantic_hash": ""
   },
@@ -477,6 +477,71 @@
   "desktop/assets/kuaishou.png": {
     "mtime": 1786490422.8327606,
     "ast_hash": "b12318162773c5db430b60a06344e32c",
+    "semantic_hash": ""
+  },
+  "fupan/email_setup.py": {
+    "mtime": 1786533666.152667,
+    "ast_hash": "05057425ba739fb634ac5942ea7da56b",
+    "semantic_hash": ""
+  },
+  "scripts/start-rust-daemon.sh": {
+    "mtime": 1786540547.8636484,
+    "ast_hash": "e8640f36808040190d6033cbe0f230dc",
+    "semantic_hash": ""
+  },
+  "tests/test_email_setup.py": {
+    "mtime": 1786533948.0796204,
+    "ast_hash": "0d99c477b0e7349e414255aacba71b41",
+    "semantic_hash": ""
+  },
+  "zunzhe-core/src/config.rs": {
+    "mtime": 1786540475.6720514,
+    "ast_hash": "3b3c980f84b06be317f6a4528b46776b",
+    "semantic_hash": ""
+  },
+  "zunzhe-core/src/download.rs": {
+    "mtime": 1786539821.4379563,
+    "ast_hash": "b92a0633257ad81e4fda8693658cf5d0",
+    "semantic_hash": ""
+  },
+  "zunzhe-core/src/mcp.rs": {
+    "mtime": 1786540237.2700818,
+    "ast_hash": "52aeac9cb2510fb01e3ad71dcf9bdbaa",
+    "semantic_hash": ""
+  },
+  "zunzhe-core/src/model.rs": {
+    "mtime": 1786539540.5893335,
+    "ast_hash": "bcf61f0d76c610d33cf12ddf0486c559",
+    "semantic_hash": ""
+  },
+  "zunzhe-core/src/notify.rs": {
+    "mtime": 1786540231.0295658,
+    "ast_hash": "4c41ceaf8d99b075cf84dce70efb4116",
+    "semantic_hash": ""
+  },
+  "zunzhe-core/src/pipeline_bridge.rs": {
+    "mtime": 1786539073.4397388,
+    "ast_hash": "b27fb263acb00d99e6985da623dacc64",
+    "semantic_hash": ""
+  },
+  "zunzhe-core/src/scheduler.rs": {
+    "mtime": 1786540355.5964003,
+    "ast_hash": "443d54d486c55b88b8ed485f655f5506",
+    "semantic_hash": ""
+  },
+  "zunzhe-core/src/training_data.rs": {
+    "mtime": 1786539348.2366498,
+    "ast_hash": "ffa5b16d2a03fee3bda2525e98bc7ad3",
+    "semantic_hash": ""
+  },
+  "zunzhe-core/src/video_library.rs": {
+    "mtime": 1786540503.3601727,
+    "ast_hash": "3c347421881f8317a6d5243f69868395",
+    "semantic_hash": ""
+  },
+  "zunzhe-core/\u76ee\u6807\u6a21\u5f0f.md": {
+    "mtime": 1786540597.0606768,
+    "ast_hash": "7318b532b1324a0f06a5b169b9476fd9",
     "semantic_hash": ""
   }
 }

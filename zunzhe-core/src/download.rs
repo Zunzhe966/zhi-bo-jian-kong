@@ -40,6 +40,16 @@ impl Downloader {
             "--no-overwrites",
             url,
         ]);
+        // B站风控时带用户 cookie（config/fupan_config.ini [视频监控] b站cookie）
+        if url.contains("bilibili.com") || url.contains("b23.tv") {
+            let cookie = crate::config::Config::load(&self.project_dir)
+                .ok()
+                .map(|c| c.get_fupan("视频监控", "b站cookie"))
+                .unwrap_or_default();
+            if !cookie.is_empty() {
+                cmd.args(["--add-header", &format!("Cookie: {cookie}")]);
+            }
+        }
         let output = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -185,6 +195,8 @@ mod tests {
         let file = dir.join("x.log");
         let mut f = tokio::fs::File::create(&file).await.unwrap();
         f.write_all(b"hello").await.unwrap();
+        f.flush().await.unwrap();
+        drop(f);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello");
         let _ = std::fs::remove_dir_all(&dir);
     }

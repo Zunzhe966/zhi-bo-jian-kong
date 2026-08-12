@@ -9,10 +9,10 @@ use tracing::{error, info, warn};
 use crate::config::Config;
 use crate::db;
 use crate::download;
-use crate::model::VideoMeta;
 use crate::notify::{Channel, Notifier};
 use crate::platform;
 use crate::video_library::VideoLibrary;
+use crate::watchlist::Watchlist;
 
 /// 24×30 守护调度器：固定间隔跑“检查视频源 + 处理下载队列”。
 /// 任何单个任务失败只记日志，不拖垮主循环。
@@ -59,30 +59,51 @@ async fn tick(
 
     // 2. 对每个视频监控源拉一次最新视频并写入库；新出现的不重复通知。
     let anchors = db::list_anchors(pool).await?;
+    let watch = Watchlist::new(project_dir.to_path_buf());
+    let sources = watch.list_video();
     let library = VideoLibrary::new(pool.clone(), fupan_dir.to_path_buf());
     let notifier = Notifier::new(pool, config);
     let mut checked = 0usize;
     let mut notified = 0usize;
+    let mut enqueued = 0usize;
+    let mut items: Vec<(String, String, Option<bool>)> = sources
+        .into_iter()
+        .map(|s| (s.url, s.name, s.download))
+        .collect();
     for anchor in anchors {
-        let adapter = platform::resolve(&anchor.url);
-        match adapter.list_videos(&anchor.url, 10).await {
+        if !items.iter().any(|(u, _, _)| *u == anchor.url) {
+            items.push((anchor.url, anchor.name, None));
+        }
+    }
+    let auto_download = config.is_yes("视频监控", "自动下载新视频(是/否)", true);
+    let notify_enabled = config.is_yes("复盘邮件", "发现新视频时发送通知(是/否)", true);
+    for (source_url, name, item_download) in items {
+        let adapter = platform::resolve(&source_url);
+        match adapter.list_videos(&source_url, 10).await {
             Ok(videos) => {
-                for v in videos {
-                    if is_new_video(pool, &v).await {
-                        match library.upsert(&v, &anchor.name, &anchor.url).await {
-                            Ok(_) => {
+                let known_ids: Vec<String> = db::get_videos(pool, "", "", false)
+                    .await?
+                    .iter()
+                    .map(|v| v.id.clone())
+                    .collect();
+                let first_run = !db::is_source_baselined(pool, &source_url).await?;
+                for v in &videos {
+                    let is_new = !known_ids.contains(&v.id);
+                    match library.upsert(v, &name, &source_url).await {
+                        // 首次监控：只把现有视频写入库作为基线，不通知、不下载。
+                        Ok(_) if is_new && first_run => {}
+                        Ok(_) if is_new => {
+                            if notify_enabled {
                                 let title = "【尊者直播监控】博主发布新视频".to_string();
-                                let content = format!(
-                                    "博主：{}\n标题：{}\n链接：{}",
-                                    anchor.name, v.title, v.url
-                                );
+                                let content =
+                                    format!("博主：{}\n标题：{}\n链接：{}", name, v.title, v.url);
                                 match notifier
                                     .send(
                                         "video",
-                                        &anchor.name,
+                                        &name,
                                         &title,
                                         &content,
-                                        Channel::parse(&anchor.notify_channel),
+                                        Channel::parse(&watch.notify_for(&source_url, &name)),
                                     )
                                     .await
                                 {
@@ -90,30 +111,46 @@ async fn tick(
                                     Err(e) => warn!("通知新视频失败: {e:#}"),
                                 }
                             }
-                            Err(e) => warn!("写入视频库失败: {e:#}"),
+                            let should_download = item_download.unwrap_or(auto_download);
+                            if should_download {
+                                match db::enqueue_task(pool, "download", &v.url, &name).await {
+                                    Ok(_) => enqueued += 1,
+                                    Err(e) => warn!("下载任务入队失败: {e:#}"),
+                                }
+                            }
                         }
-                    } else {
-                        let _ = library.upsert(&v, &anchor.name, &anchor.url).await;
+                        Ok(_) => {}
+                        Err(e) => warn!("写入视频库失败: {e:#}"),
                     }
+                }
+                if first_run {
+                    db::mark_source_baselined(pool, &source_url).await?;
+                    info!(
+                        "source {source_url} first baseline recorded ({})",
+                        videos.len()
+                    );
                 }
                 checked += 1;
             }
-            Err(e) => error!("anchor {} check failed: {e:#}", anchor.url),
+            Err(e) => error!("source {source_url} check failed: {e:#}"),
         }
     }
 
     Ok(TickStats {
-        downloads,
+        downloads: downloads + enqueued,
         anchors_checked: checked,
         videos_notified: notified,
     })
 }
 
-async fn is_new_video(pool: &SqlitePool, meta: &VideoMeta) -> bool {
-    db::get_videos(pool, "", "", false)
-        .await
-        .map(|videos| !videos.iter().any(|v| v.id == meta.id))
-        .unwrap_or(false)
+/// 供 CLI check-videos 复用的一轮检查。
+pub async fn check_video_sources(
+    pool: &SqlitePool,
+    project_dir: &Path,
+    config: &Config,
+) -> Result<TickStats> {
+    let fupan_dir = project_dir.join("fupan_output");
+    tick(pool, project_dir, &fupan_dir, config).await
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

@@ -5,7 +5,7 @@
     "semantic_hash": ""
   },
   "config/\u76d1\u63a7\u504f\u597d.json": {
-    "mtime": 1786490422.8285584,
+    "mtime": 1786543775.1935308,
     "ast_hash": "ef5bc5e93138e8e3da0bb7660629fb4f",
     "semantic_hash": ""
   },
@@ -315,23 +315,23 @@
     "semantic_hash": ""
   },
   "zunzhe-core/src/cli.rs": {
-    "mtime": 1786540302.6235118,
-    "ast_hash": "8c6f0bdaa49f33ed87d848207a7ebec6",
+    "mtime": 1786543237.7938273,
+    "ast_hash": "8aae4e89a9338a343081f910c7adee06",
     "semantic_hash": ""
   },
   "zunzhe-core/src/db.rs": {
-    "mtime": 1786539705.968988,
-    "ast_hash": "d758576c0c74454ea2e8c56a4a54659d",
+    "mtime": 1786544710.045651,
+    "ast_hash": "7694629d9faca6179e81060ab3a148ab",
     "semantic_hash": ""
   },
   "zunzhe-core/src/main.rs": {
-    "mtime": 1786538819.7820919,
-    "ast_hash": "3404df68d654c36397f903dd55e98416",
+    "mtime": 1786543961.3372436,
+    "ast_hash": "f7d9ff33749d80135507bdb5ac143995",
     "semantic_hash": ""
   },
   "zunzhe-core/src/platform.rs": {
-    "mtime": 1786539348.2307892,
-    "ast_hash": "8c8acaa29143513b98158d63beb3a159",
+    "mtime": 1786543034.5970592,
+    "ast_hash": "6625eed8f050884b554d5812a243fe3f",
     "semantic_hash": ""
   },
   ".github/ISSUE_TEMPLATE/bug.yml": {
@@ -380,8 +380,8 @@
     "semantic_hash": ""
   },
   "PROJECT_GOAL.md": {
-    "mtime": 1786540585.3865201,
-    "ast_hash": "9386628892cc15d61d98b8c7d10bddf1",
+    "mtime": 1786544799.2681584,
+    "ast_hash": "f32a70443f08fec4b90dbb8ef5e48bc5",
     "semantic_hash": ""
   },
   "README.md": {
@@ -415,8 +415,8 @@
     "semantic_hash": ""
   },
   "\u4f7f\u7528\u8bf4\u660e.md": {
-    "mtime": 1786540570.7458644,
-    "ast_hash": "e86ea8cd26db168e67aedda7872b2c75",
+    "mtime": 1786544778.5557256,
+    "ast_hash": "c259fbdb3837add92d4e59d36ddda9cc",
     "semantic_hash": ""
   },
   "\u5b89\u5168\u5ba1\u67e5\u62a5\u544a.md": {
@@ -495,18 +495,18 @@
     "semantic_hash": ""
   },
   "zunzhe-core/src/config.rs": {
-    "mtime": 1786540475.6720514,
-    "ast_hash": "3b3c980f84b06be317f6a4528b46776b",
+    "mtime": 1786543706.9434946,
+    "ast_hash": "7b5dab7e94feb22494d1e7183308cf3a",
     "semantic_hash": ""
   },
   "zunzhe-core/src/download.rs": {
-    "mtime": 1786539821.4379563,
-    "ast_hash": "b92a0633257ad81e4fda8693658cf5d0",
+    "mtime": 1786543046.7377524,
+    "ast_hash": "533d4a113d2cb499452fc69c3b54fd67",
     "semantic_hash": ""
   },
   "zunzhe-core/src/mcp.rs": {
-    "mtime": 1786540237.2700818,
-    "ast_hash": "52aeac9cb2510fb01e3ad71dcf9bdbaa",
+    "mtime": 1786542149.2453074,
+    "ast_hash": "ba52bc126f90063eab9a38dc0fca0151",
     "semantic_hash": ""
   },
   "zunzhe-core/src/model.rs": {
@@ -520,13 +520,13 @@
     "semantic_hash": ""
   },
   "zunzhe-core/src/pipeline_bridge.rs": {
-    "mtime": 1786539073.4397388,
-    "ast_hash": "b27fb263acb00d99e6985da623dacc64",
+    "mtime": 1786541958.2416255,
+    "ast_hash": "d6b516a5d905c5819633d85d39099675",
     "semantic_hash": ""
   },
   "zunzhe-core/src/scheduler.rs": {
-    "mtime": 1786540355.5964003,
-    "ast_hash": "443d54d486c55b88b8ed485f655f5506",
+    "mtime": 1786544743.562499,
+    "ast_hash": "ec2254e541fcab82df6fffdd280c95e9",
     "semantic_hash": ""
   },
   "zunzhe-core/src/training_data.rs": {
@@ -540,8 +540,23 @@
     "semantic_hash": ""
   },
   "zunzhe-core/\u76ee\u6807\u6a21\u5f0f.md": {
-    "mtime": 1786540597.0606768,
-    "ast_hash": "7318b532b1324a0f06a5b169b9476fd9",
+    "mtime": 1786544810.3662295,
+    "ast_hash": "66f9597eecc2501f8643daddadae22f7",
+    "semantic_hash": ""
+  },
+  "zunzhe-core/src/config_api.rs": {
+    "mtime": 1786543840.040292,
+    "ast_hash": "c8923c8cabf5aea6682b31991bf7fc46",
+    "semantic_hash": ""
+  },
+  "zunzhe-core/src/service.rs": {
+    "mtime": 1786544134.0353436,
+    "ast_hash": "73e4ff3fde58e92c3f135de971ab5154",
+    "semantic_hash": ""
+  },
+  "zunzhe-core/src/watchlist.rs": {
+    "mtime": 1786543120.9343672,
+    "ast_hash": "a6b51b4d345e3dc5e76b38b2a7fe566a",
     "semantic_hash": ""
   }
 }

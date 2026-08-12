@@ -5,8 +5,8 @@ use serde_json::json;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
 
 use crate::{
-    config, db, download, notify, pipeline_bridge, platform, scheduler, training_data,
-    video_library,
+    config, config_api, db, download, notify, pipeline_bridge, platform, scheduler, service,
+    training_data, video_library, watchlist,
 };
 
 #[derive(Debug, Parser)]
@@ -27,12 +27,16 @@ enum Command {
         url: String,
         #[arg(default_value = "")]
         name: String,
+        #[arg(default_value = "")]
+        quality: String,
     },
     /// 添加关注的主播/直播间（Python 版兼容别名）
     AddAnchor {
         url: String,
         #[arg(default_value = "")]
         name: String,
+        #[arg(default_value = "")]
+        quality: String,
     },
     /// 删除关注的主播/直播间（旧名 remove-anchor 继续保留）
     RemoveLive { url: String },
@@ -42,6 +46,25 @@ enum Command {
     ListLive,
     /// 列出关注的主播/直播间（Python 版兼容别名）
     ListAnchors,
+    /// 检查单个直播间监控状态
+    CheckLive { url: String },
+    /// 添加博主发视频监控
+    AddVideo {
+        url: String,
+        #[arg(default_value = "")]
+        name: String,
+        /// ''=跟随全局 / 是 / 否
+        #[arg(default_value = "")]
+        download: String,
+        #[arg(default_value = "")]
+        notify: String,
+    },
+    /// 移除博主发视频监控
+    RemoveVideo { url: String },
+    /// 列出博主发视频监控
+    ListVideo,
+    /// 立即检查一轮所有视频监控源
+    CheckVideos,
     /// 查询视频库
     VideoLibrary {
         #[arg(default_value = "")]
@@ -81,6 +104,31 @@ enum Command {
     },
     /// 发送测试邮件
     TestEmail,
+    /// 读取配置（all/config/fupan_config，密钥脱敏）
+    GetConfig {
+        #[arg(default_value = "all")]
+        file: String,
+        #[arg(default_value = "")]
+        section: String,
+        #[arg(default_value = "")]
+        key: String,
+    },
+    /// 写入单个配置项
+    SetConfig {
+        file: String,
+        section: String,
+        key: String,
+        value: String,
+    },
+    /// 批量写入配置（JSON）
+    SetConfigBulk { updates: String },
+    /// 返回配置结构说明
+    Schema,
+    /// 列出复盘产物
+    Notes {
+        #[arg(default_value = "")]
+        name: String,
+    },
     /// 整体状态（Rust 版当前能力）
     Status,
     /// 运行守护调度：--once 只跑一轮；--duration 秒后退出
@@ -94,6 +142,12 @@ enum Command {
     },
     /// 启动 MCP stdio server
     Mcp,
+    /// 启动 Python 直播监控 + 视频监控后台服务（兼容层）
+    Start,
+    /// 停止全部 Python 后台服务（兼容层）
+    Stop,
+    /// 查看后台服务与最近录制状态
+    ServiceStatus,
     /// 对任意音视频文件跑 Python 复盘流水线（转写/提炼/切片）
     Process {
         file_path: String,
@@ -114,25 +168,112 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let pool = SqlitePool::connect_with(options).await?;
     db::init_db(&pool).await?;
     let fupan_dir = project_dir.join("fupan_output");
+    let watch = watchlist::Watchlist::new(project_dir.clone());
+    let api = config_api::ConfigApi::new(project_dir.clone());
 
     match cli.command {
-        Command::AddLive { url, name } | Command::AddAnchor { url, name } => {
+        Command::AddLive { url, name, quality } | Command::AddAnchor { url, name, quality } => {
             db::add_anchor(&pool, &url, &name).await?;
+            let _ = watch.add_live(&url, &name, &quality);
             println!(
                 "{}",
-                json!({"ok": true, "url": url, "name": name, "action": "add-anchor"})
+                json!({"ok": true, "url": url, "name": name, "quality": quality, "action": "add-anchor"})
             );
         }
         Command::RemoveLive { url } | Command::RemoveAnchor { url } => {
             let removed = db::remove_anchor(&pool, &url).await?;
+            let _ = watch.remove_live(&url);
             println!(
                 "{}",
                 json!({"ok": removed, "url": url, "action": "remove-anchor"})
             );
         }
         Command::ListLive | Command::ListAnchors => {
-            for anchor in db::list_anchors(&pool).await? {
-                println!("{}", serde_json::to_string(&anchor)?);
+            let anchors = db::list_anchors(&pool).await?;
+            let items = watch.list_live();
+            println!(
+                "{}",
+                json!({"ok": true, "rooms": items, "anchors": anchors})
+            );
+        }
+        Command::CheckLive { url } => {
+            let rooms = watch.list_live();
+            let found = rooms
+                .iter()
+                .any(|r| r.url == url || r.url.trim_end_matches('/') == url.trim_end_matches('/'));
+            let room = rooms
+                .into_iter()
+                .find(|r| r.url == url || r.url.trim_end_matches('/') == url.trim_end_matches('/'));
+            println!(
+                "{}",
+                json!({
+                    "url": url,
+                    "found": found,
+                    "room": room,
+                    "hint": "Rust daemon 运行中会自动检测开播"
+                })
+            );
+        }
+        Command::AddVideo {
+            url,
+            name,
+            download,
+            notify,
+        } => {
+            let url_for_opt = url.clone();
+            let name_for_opt = name.clone();
+            let download_opt = match download.as_str() {
+                "" => None,
+                "是" | "yes" | "true" | "1" => Some(true),
+                "否" | "no" | "false" | "0" => Some(false),
+                other => {
+                    println!(
+                        "{}",
+                        json!({"ok": false, "error": format!("下载参数不识别: {other}")})
+                    );
+                    return Ok(());
+                }
+            };
+            watch.add_video(
+                &url_for_opt,
+                &name_for_opt,
+                download_opt,
+                if notify.is_empty() {
+                    None
+                } else {
+                    Some(&notify)
+                },
+            )?;
+            db::add_anchor(&pool, &url_for_opt, &name_for_opt).await?;
+            println!(
+                "{}",
+                json!({"ok": true, "url": url, "name": if name.is_empty() { url.clone() } else { name.clone() },
+                       "download": match download_opt { Some(true) => "是", Some(false) => "否", None => "跟随全局" },
+                       "notify": if notify.is_empty() { watch.notify_for(&url, &name) } else { notify }})
+            );
+        }
+        Command::RemoveVideo { url } => {
+            let removed = watch.remove_video(&url)?;
+            let _ = db::remove_anchor(&pool, &url).await;
+            println!(
+                "{}",
+                json!({"ok": removed, "url": url, "action": "remove-video"})
+            );
+        }
+        Command::ListVideo => {
+            let items = watch.list_video();
+            println!("{}", json!({"ok": true, "sources": items}));
+        }
+        Command::CheckVideos => {
+            let result = scheduler::check_video_sources(&pool, &project_dir, &cfg).await;
+            match result {
+                Ok(stats) => println!(
+                    "{}",
+                    json!({"ok": true, "new_videos": stats.videos_notified + stats.downloads,
+                           "checked": stats.anchors_checked, "notified": stats.videos_notified,
+                           "downloads": stats.downloads})
+                ),
+                Err(e) => println!("{}", json!({"ok": false, "error": e.to_string()})),
             }
         }
         Command::BloggerVideos { url, count } => {
@@ -229,16 +370,43 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 }
             }
         }
+        Command::GetConfig { file, section, key } => {
+            println!("{}", api.get(&file, &section, &key)?);
+        }
+        Command::SetConfig {
+            file,
+            section,
+            key,
+            value,
+        } => {
+            println!("{}", api.set(&file, &section, &key, &value)?);
+        }
+        Command::SetConfigBulk { updates } => {
+            let value: serde_json::Value = serde_json::from_str(&updates)
+                .map_err(|e| anyhow::anyhow!("JSON 解析失败: {e}"))?;
+            println!("{}", api.set_bulk(&value)?);
+        }
+        Command::Schema => {
+            println!("{}", api.schema());
+        }
+        Command::Notes { name } => {
+            let notes = pipeline_bridge::list_notes(&fupan_dir, &name)?;
+            println!("{}", json!({"ok": true, "notes": notes}));
+        }
         Command::Status => {
             let anchors = db::list_anchors(&pool).await?;
             let library = video_library::VideoLibrary::new(pool.clone(), fupan_dir.clone());
             let videos = library.list("", "", false).await?;
             let email = cfg.email_status();
+            let live = watch.list_live();
+            let video_sources = watch.list_video();
             println!(
                 "{}",
                 json!({
                     "ok": true,
                     "anchors": anchors,
+                    "live_watchlist": live,
+                    "video_watchlist": video_sources,
                     "video_count": videos.len(),
                     "email": email,
                     "version": env!("CARGO_PKG_VERSION"),
@@ -264,6 +432,18 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         } => {
             let summary = pipeline_bridge::run_pipeline(&cfg, &file_path, &anchor_name).await?;
             println!("{}", serde_json::to_string(&summary)?);
+        }
+        Command::Start => {
+            let result = service::ensure_started(&project_dir)?;
+            println!("{}", serde_json::to_string(&result)?);
+        }
+        Command::Stop => {
+            let result = service::stop_all(&project_dir)?;
+            println!("{}", serde_json::to_string(&result)?);
+        }
+        Command::ServiceStatus => {
+            let result = service::status(&project_dir)?;
+            println!("{}", serde_json::to_string(&result)?);
         }
     }
     Ok(())
