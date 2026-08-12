@@ -339,35 +339,66 @@ pub async fn process_pending(pool: &SqlitePool, project_dir: &Path) -> Result<us
     let downloader = Downloader::new(project_dir.to_path_buf());
     let mut done = 0;
     while let Some(task) = db::claim_pending_task(pool, 1).await? {
-        if task.kind != "download" {
-            db::update_task_status(pool, task.id, "failed").await?;
-            continue;
-        }
-        match downloader.download(&task.url, &task.name, pool).await {
-            Ok(_) => {
-                // 认领后再更新：失败不会影响队列状态机，成功也只会更新已认领任务。
-                db::update_task_status(pool, task.id, "done").await?;
-                done += 1;
-            }
-            Err(_) => {
-                // 前 2 次失败留 pending 重试，第 3 次失败标记 failed，避免队列无限卡住。
-                db::update_task_status(
-                    pool,
-                    task.id,
-                    if task.attempts + 1 >= 3 {
-                        "failed"
-                    } else {
-                        "pending"
-                    },
-                )
-                .await?;
-            }
+        let outcome =
+            run_single_task_with_timeout(pool, &task, &downloader, Duration::from_secs(600)).await;
+        if outcome {
+            done += 1;
         }
         if done >= 50 {
             break;
         }
     }
     Ok(done)
+}
+
+/// 执行单个下载任务并更新状态。返回是否成功完成。
+/// 超时/失败都会显式更新状态，绝不把任务永久留在 processing。
+async fn run_single_task_with_timeout(
+    pool: &SqlitePool,
+    task: &crate::model::Task,
+    downloader: &Downloader,
+    timeout_duration: Duration,
+) -> bool {
+    if task.kind != "download" {
+        let _ = db::update_task_status(pool, task.id, "failed").await;
+        return false;
+    }
+    let outcome = tokio::time::timeout(
+        timeout_duration,
+        downloader.download(&task.url, &task.name, pool),
+    )
+    .await;
+    match outcome {
+        Ok(Ok(_)) => db::update_task_status(pool, task.id, "done").await.is_ok(),
+        Ok(Err(e)) => {
+            tracing::warn!(
+                "下载任务 id={} 失败（attempts={}）: {e:#}",
+                task.id,
+                task.attempts + 1
+            );
+            let next = if task.attempts + 1 >= 3 {
+                "failed"
+            } else {
+                "pending"
+            };
+            let _ = db::update_task_status(pool, task.id, next).await;
+            false
+        }
+        Err(_) => {
+            tracing::warn!(
+                "下载任务 id={} 超时（attempts={}），已显式结束本轮",
+                task.id,
+                task.attempts + 1
+            );
+            let next = if task.attempts + 1 >= 3 {
+                "failed"
+            } else {
+                "pending"
+            };
+            let _ = db::update_task_status(pool, task.id, next).await;
+            false
+        }
+    }
 }
 
 #[cfg(test)]
@@ -419,6 +450,39 @@ mod tests {
         drop(f);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn timed_out_task_is_not_left_processing() {
+        let file = std::env::temp_dir().join(format!(
+            "zunzhe-dl-queue-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pool = crate::db::open_pool(&file).await.unwrap();
+        let id = crate::db::enqueue_task(&pool, "download", "https://example.invalid/x", "测试")
+            .await
+            .unwrap();
+        let task = crate::db::claim_pending_task(&pool, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.id, id);
+        // 用不存在的项目目录构造 Downloader：下载必然快速失败，不应卡 processing。
+        let downloader = Downloader::new(std::env::temp_dir().join("zunzhe-nonexistent"));
+        let ok =
+            run_single_task_with_timeout(&pool, &task, &downloader, Duration::from_secs(1)).await;
+        assert!(!ok);
+        let rows: Vec<crate::model::Task> =
+            crate::db::list_tasks(&pool, "pending", 10).await.unwrap();
+        assert!(
+            rows.iter().any(|t| t.id == id),
+            "失败任务应回到 pending 等待重试，而不是卡 processing"
+        );
+        std::mem::forget(file);
     }
 
     #[tokio::test]
