@@ -507,18 +507,23 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
             Ok(serde_json::to_string(&json!({"ok":true,"sent":true}))?)
         }
         "test_notify" => {
-            let status = cfg.email_status();
-            if !status.configured {
-                return Ok(serde_json::to_string(
-                    &json!({"ok":false,"sent":false,"error":status.hint}),
-                )?);
+            let notifier = crate::notify::Notifier::new(pool, cfg);
+            match notifier
+                .send_test(
+                    "【尊者直播监控】通知测试",
+                    "收到这条消息说明通知通道配置成功。",
+                )
+                .await
+            {
+                Ok(test) => Ok(serde_json::to_string(&json!({
+                    "ok": true,
+                    "sent": test.sent,
+                    "channels": test.channels,
+                }))?),
+                Err(e) => Ok(serde_json::to_string(
+                    &json!({"ok": false, "sent": false, "error": e.to_string()}),
+                )?),
             }
-            crate::notify::send_email(
-                cfg.email_settings(),
-                "【尊者直播监控】通知测试",
-                "收到这条消息说明通知通道配置成功。",
-            )?;
-            Ok(serde_json::to_string(&json!({"ok":true,"sent":true}))?)
         }
         _ => anyhow::bail!("工具未实现: {name}"),
     }

@@ -437,7 +437,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 json!({"ok": true, "videos": videos, "count": videos.len()})
             );
         }
-        Command::TestEmail | Command::TestNotify => {
+        Command::TestEmail => {
             let status = cfg.email_status();
             if !status.configured {
                 println!(
@@ -468,6 +468,31 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                         json!({"ok": false, "sent": false, "error": e.to_string()})
                     ),
                 }
+            }
+        }
+        Command::TestNotify => {
+            let notifier = notify::Notifier::new(&pool, &cfg);
+            match notifier
+                .send_test(
+                    "【尊者直播监控】通知测试",
+                    "收到这条消息说明通知通道配置成功。",
+                )
+                .await
+            {
+                Ok(test) => {
+                    println!(
+                        "{}",
+                        json!({
+                            "ok": true,
+                            "sent": test.sent,
+                            "channels": test.channels,
+                        })
+                    );
+                }
+                Err(e) => println!(
+                    "{}",
+                    json!({"ok": false, "sent": false, "error": e.to_string()})
+                ),
             }
         }
         Command::GetConfig { file, section, key } => {

@@ -129,6 +129,81 @@ impl<'a> Notifier<'a> {
         Ok(sent_count)
     }
 
+    /// 测试所有已配置通知通道；任何一条成功都返回 true。
+    /// 与旧 Python `notify.send_test` 对齐：不因 SMTP 未配置而误报微信等
+    /// HTTPS 通道不可用，也不因某个通道失败而掩盖其它通道的成功。
+    pub async fn send_test(&self, title: &str, content: &str) -> Result<TestSend> {
+        let channels = self.config.push_channels();
+        let mut sent = false;
+        let mut channel_names = Vec::new();
+
+        if self.config.email_configured() {
+            let settings = self.config.email_settings();
+            if Self::send_email_with_timeout(settings, title.to_string(), content.to_string()).await
+            {
+                sent = true;
+            }
+            channel_names.push("邮箱".to_string());
+        }
+        if !channels.serverchan.is_empty() {
+            if send_serverchan(&channels.serverchan, title, content).await {
+                sent = true;
+            }
+            channel_names.push("微信".to_string());
+        }
+        if !channels.pushplus.is_empty() {
+            if send_pushplus(&channels.pushplus, title, content).await {
+                sent = true;
+            }
+            channel_names.push("PushPlus".to_string());
+        }
+        if !channels.bark.is_empty() {
+            if send_bark(&channels.bark, title, content).await {
+                sent = true;
+            }
+            channel_names.push("Bark".to_string());
+        }
+        if !channels.ntfy.is_empty() {
+            if send_ntfy(&channels.ntfy, title, content).await {
+                sent = true;
+            }
+            channel_names.push("ntfy".to_string());
+        }
+
+        if !self.config.email_configured() && !channels.configured() {
+            let missing: Vec<&str> = [
+                (!self.config.email_configured()).then_some("邮箱(SMTP)"),
+                channels.serverchan.is_empty().then_some("微信(Server酱)"),
+                channels.pushplus.is_empty().then_some("PushPlus"),
+                channels.bark.is_empty().then_some("Bark"),
+                channels.ntfy.is_empty().then_some("ntfy"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            bail!("未配置任何通知通道: {}", missing.join("、"));
+        }
+
+        Ok(TestSend {
+            sent,
+            channels: channel_names,
+        })
+    }
+
+    /// 仅记录一次测试事件。发送成功与否不在此处重复判断。
+    pub async fn record_sent(
+        &self,
+        event: &str,
+        anchor: &str,
+        title: &str,
+        content: &str,
+        channel: Channel,
+    ) -> Result<()> {
+        let id = db::add_notify(self.pool, event, anchor, title, content, channel.name()).await?;
+        db::mark_notify_done(self.pool, id).await?;
+        Ok(())
+    }
+
     /// HTTPS 通道的发送实现；请求自带 15 秒超时，网络失败只记日志不 panic。
     async fn send_wechat(&self, title: &str, content: &str) -> bool {
         let key = self.config.push_channels().serverchan;
@@ -194,20 +269,6 @@ impl<'a> Notifier<'a> {
             }
         }
     }
-
-    /// 仅记录已发送事件（test-email 先发信再落库，避免失败也留下“已发送”记录）。
-    pub async fn record_sent(
-        &self,
-        event: &str,
-        anchor: &str,
-        title: &str,
-        content: &str,
-        channel: Channel,
-    ) -> Result<()> {
-        let id = db::add_notify(self.pool, event, anchor, title, content, channel.name()).await?;
-        db::mark_notify_done(self.pool, id).await?;
-        Ok(())
-    }
 }
 
 pub fn send_email(cfg: EmailSettings, subject: &str, body: &str) -> Result<bool> {
@@ -256,6 +317,13 @@ pub fn send_email(cfg: EmailSettings, subject: &str, body: &str) -> Result<bool>
         .send(&message)
         .context("SMTP 发送失败，请检查账号/授权码/端口/网络")?;
     Ok(true)
+}
+
+/// 测试通知结果：是否至少一个通道成功，以及本次尝试过的通道列表。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TestSend {
+    pub sent: bool,
+    pub channels: Vec<String>,
 }
 
 /// 使用 443 HTTPS 的 Server酱³ 推送，避免代理/TUN 环境只依赖 SMTP 失败。
@@ -508,6 +576,40 @@ mod tests {
             .unwrap();
         let rows = db::list_notify(&pool, "sent", 10).await.unwrap();
         assert_eq!(rows[0].channel, "PushPlus");
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_file(file.with_extension("db-shm"));
+        let _ = std::fs::remove_file(file.with_extension("db-wal"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn send_test_without_any_channel_reports_missing_hint() {
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-notify-test-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::write(dir.join("config").join("config.ini"), "[推送配置]\n").unwrap();
+        std::fs::write(dir.join("config").join("fupan_config.ini"), "").unwrap();
+        let file = std::env::temp_dir().join(format!(
+            "zunzhe-notify-test-missing-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pool = db::open_pool(&file).await.unwrap();
+        let cfg = crate::config::Config::load(&dir).unwrap();
+        let notifier = Notifier::new(&pool, &cfg);
+        let err = notifier.send_test("标题", "内容").await.unwrap_err();
+        assert!(err.to_string().contains("未配置任何通知通道"));
+        assert!(err.to_string().contains("邮箱(SMTP)"));
+        assert!(err.to_string().contains("微信(Server酱)"));
         let _ = std::fs::remove_file(&file);
         let _ = std::fs::remove_file(file.with_extension("db-shm"));
         let _ = std::fs::remove_file(file.with_extension("db-wal"));
