@@ -60,6 +60,7 @@ impl Downloader {
             ok: true,
             file,
             name: name.to_string(),
+            pipeline_queued: true,
         })
     }
 
@@ -332,6 +333,8 @@ pub struct DownloadResult {
     pub ok: bool,
     pub file: String,
     pub name: String,
+    /// 下载完成后已自动入队复盘任务（转写/提炼/切片）。
+    pub pipeline_queued: bool,
 }
 
 /// 把 pending 下载任务逐个执行（失败重试，成功标记）。
