@@ -18,12 +18,16 @@ now="$(date '+%Y-%m-%d %H:%M:%S %z')"
 pid="$(cat "$ROOT/fupan_output/run/zunzhe-core.pid" 2>/dev/null || true)"
 
 status="$("$RUST_BIN" doctor 2>/dev/null || true)"
-daemon_ok="$(printf '%s' "$status" | python3 -c 'import json,sys
-try: print("true" if json.load(sys.stdin).get("rust_daemon") else "false")
-except Exception: print("false")' 2>/dev/null || echo false)"
-heartbeat_ok="$(printf '%s' "$status" | python3 -c 'import json,sys
-try: print("true" if json.load(sys.stdin).get("heartbeat_ok") else "false")
-except Exception: print("false")' 2>/dev/null || echo false)"
+if printf '%s' "$status" | grep -q '"rust_daemon":true'; then
+  daemon_ok=true
+else
+  daemon_ok=false
+fi
+if printf '%s' "$status" | grep -q '"heartbeat_ok":true'; then
+  heartbeat_ok=true
+else
+  heartbeat_ok=false
+fi
 
 printf '%s pid=%s rust_daemon=%s heartbeat_ok=%s\n' \
   "$now" "${pid:-none}" "$daemon_ok" "$heartbeat_ok" >> "$LOG"

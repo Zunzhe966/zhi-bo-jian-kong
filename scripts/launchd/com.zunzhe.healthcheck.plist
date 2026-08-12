@@ -16,6 +16,11 @@
   <true/>
   <key>WorkingDirectory</key>
   <string>/Users/zhangxuetao/Desktop/尊者监控直播短视频</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
   <key>StandardOutPath</key>
   <string>/Users/zhangxuetao/Library/Logs/zunzhe/zunzhe-healthcheck.log</string>
   <key>StandardErrorPath</key>
