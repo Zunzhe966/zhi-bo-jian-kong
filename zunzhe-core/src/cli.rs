@@ -525,7 +525,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             interval,
         } => {
             // --once 语义：先跑一轮完整 daemon tick，便于验证直播+视频+下载全链路。
-            service::write_rust_daemon_pid(&project_dir, std::process::id());
+            // pid 文件由 run_daemon 在拿到单实例锁后写入并随退出清理。
             scheduler::run_daemon(pool.clone(), &project_dir, &cfg, interval, once, duration)
                 .await?;
         }

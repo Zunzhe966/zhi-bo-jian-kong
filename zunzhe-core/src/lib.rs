@@ -2,6 +2,7 @@ pub mod app_prefs;
 pub mod cli;
 pub mod config;
 pub mod config_api;
+pub mod daemon_lock;
 pub mod db;
 pub mod download;
 pub mod live_monitor;

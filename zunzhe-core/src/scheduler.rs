@@ -1,11 +1,12 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result, anyhow};
 use sqlx::sqlite::SqlitePool;
 use tracing::{error, info, warn};
 
 use crate::config::Config;
+use crate::daemon_lock::DaemonLock;
 use crate::db;
 use crate::download;
 use crate::live_monitor::{LiveCheckStats, LiveMonitor};
@@ -24,6 +25,15 @@ pub async fn run_daemon(
     once: bool,
     duration_secs: Option<u64>,
 ) -> Result<()> {
+    // 单实例锁必须贯穿整个 daemon 生命周期：重复 run-daemon 直接退出，
+    // 防止两套调度同时检查/通知/下载同一批主播与视频源。
+    let lock = DaemonLock::try_acquire(project_dir)
+        .with_context(|| format!("获取 daemon 单实例锁失败: {}", project_dir.display()))?
+        .ok_or_else(|| anyhow!("已有 Rust daemon 在本项目运行，本实例退出"))?;
+    // pid 文件只有锁持有者写入/清理：第二实例拿不到锁时不会误删第一实例的 pid。
+    crate::service::write_rust_daemon_pid(project_dir, std::process::id());
+    let _pid_guard = DaemonPidGuard(project_dir);
+    let _lock = lock;
     let fupan_dir = project_dir.join("fupan_output");
     let watch = Watchlist::new(project_dir.to_path_buf());
     let monitor = LiveMonitor::new(&pool, project_dir, config, &watch);
@@ -41,7 +51,6 @@ pub async fn run_daemon(
         run_tick_with_timeout(&pool, project_dir, &fupan_dir, config, &watch).await;
         if once {
             let _ = monitor.stop_all_recordings().await;
-            crate::service::remove_rust_daemon_pid(project_dir);
             return Ok(());
         }
         tokio::select! {
@@ -50,7 +59,6 @@ pub async fn run_daemon(
                 if sig {
                     info!("收到中断信号，daemon 优雅退出");
                     let _ = monitor.stop_all_recordings().await;
-                    crate::service::remove_rust_daemon_pid(project_dir);
                     return Ok(());
                 }
             }
@@ -58,11 +66,19 @@ pub async fn run_daemon(
                 if stopped.is_ok() && *stop.1.borrow() {
                     info!("daemon duration reached, exiting cleanly");
                     let _ = monitor.stop_all_recordings().await;
-                    crate::service::remove_rust_daemon_pid(project_dir);
                     return Ok(());
                 }
             }
         }
+    }
+}
+
+/// 锁持有者的 pid 清理器：无论正常返回、错误返回还是 panic，都会移除本实例 pid。
+struct DaemonPidGuard<'a>(&'a Path);
+
+impl Drop for DaemonPidGuard<'_> {
+    fn drop(&mut self) {
+        crate::service::remove_rust_daemon_pid(self.0);
     }
 }
 
@@ -345,6 +361,42 @@ mod tests {
                 .join("zunzhe-core.pid")
                 .exists()
         );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn second_daemon_rejected_and_keeps_first_pid() {
+        let file = std::env::temp_dir().join(format!("zunzhe-daemon-dup-{}", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let options = SqliteConnectOptions::new()
+            .filename(&file)
+            .create_if_missing(true);
+        let pool = SqlitePool::connect_with(options).await.unwrap();
+        db::init_db(&pool).await.unwrap();
+        let cfg = crate::config::Config::load(Path::new(env!("CARGO_MANIFEST_DIR")))
+            .unwrap_or_else(|_| crate::config::Config::defaults_for_test());
+        let dir =
+            std::env::temp_dir().join(format!("zunzhe-daemon-dup-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 第一个实例持有锁并写入自己的 pid（真实进程才能通过存活检查）。
+        let lock = DaemonLock::try_acquire(&dir).unwrap().unwrap();
+        crate::service::write_rust_daemon_pid(&dir, std::process::id());
+
+        let second = run_daemon(pool.clone(), &dir, &cfg, 1, true, None).await;
+        assert!(second.is_err(), "同一项目根下第二个 daemon 必须被拒绝");
+        let pid_text =
+            std::fs::read_to_string(dir.join("fupan_output").join("run").join("zunzhe-core.pid"))
+                .unwrap();
+        assert_eq!(
+            pid_text.trim(),
+            std::process::id().to_string(),
+            "第二实例不能误删第一实例的 pid 文件"
+        );
+
+        drop(lock);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&file);
     }

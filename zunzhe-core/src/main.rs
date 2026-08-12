@@ -19,12 +19,5 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let cli = cli::Cli::parse();
-    let result = cli::run(cli).await;
-    // run-daemon 退出时清理 pid 文件，避免桌面端/守护误判“仍在运行”。
-    if is_daemon {
-        let start_dir = std::env::current_dir()?;
-        let cfg = zunzhe_core::config::Config::load(&start_dir)?;
-        zunzhe_core::service::remove_rust_daemon_pid(&cfg.project_dir);
-    }
-    result
+    cli::run(cli).await
 }

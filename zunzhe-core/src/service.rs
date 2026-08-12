@@ -68,6 +68,23 @@ pub fn start_rust_daemon(project_dir: &Path, interval_secs: u64) -> Result<serde
     if rust_daemon_alive(project_dir) {
         return Ok(json!({"ok": true, "rust_daemon": "已在运行"}));
     }
+    // 锁被占用但心跳不新鲜：进程仍在而调度疑似僵死，先停掉再拉起。
+    // 这样 watchdog 每分钟重试时能把“假健康/僵死 daemon”真正恢复，而不是永远误判。
+    if crate::daemon_lock::DaemonLock::try_acquire(project_dir)
+        .with_context(|| "探测 daemon 单实例锁失败")?
+        .is_none()
+    {
+        stop_rust_daemon(project_dir)?;
+        // 等旧进程退出、内核释放锁，避免下面 spawn 出的新实例立刻抢锁失败。
+        for _ in 0..50 {
+            // 这里只探测“锁是否已被让出”：拿到后立即 drop，不能把锁留在父进程手里。
+            if crate::daemon_lock::DaemonLock::try_acquire(project_dir)?.is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            } else {
+                break;
+            }
+        }
+    }
     let exe = project_dir
         .join("zunzhe-core")
         .join("target")
@@ -104,9 +121,22 @@ pub fn start_rust_daemon(project_dir: &Path, interval_secs: u64) -> Result<serde
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
-    let child = cmd.spawn().with_context(|| "启动 Rust daemon 失败")?;
-    write_rust_daemon_pid(project_dir, child.id());
-    Ok(json!({"ok": true, "rust_daemon": format!("已启动 pid={}", child.id())}))
+    let mut child = cmd.spawn().with_context(|| "启动 Rust daemon 失败")?;
+    // pid 文件由 daemon 拿到单实例锁后自己写入；这里只轮询等待“健康”确认，
+    // 避免并发启动时父进程把另一实例的 pid 覆盖掉。
+    let child_pid = child.id();
+    for _ in 0..50 {
+        if rust_daemon_alive(project_dir) {
+            return Ok(json!({"ok": true, "rust_daemon": format!("已启动 pid={child_pid}")}));
+        }
+        match child.try_wait()? {
+            Some(status) => {
+                bail!("Rust daemon 启动后立即退出（code={status}），请查看 logs/zunzhe-core.log")
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    }
+    bail!("Rust daemon 启动超时（5 秒），请查看 logs/zunzhe-core.log")
 }
 
 pub fn stop_rust_daemon(project_dir: &Path) -> Result<serde_json::Value> {
