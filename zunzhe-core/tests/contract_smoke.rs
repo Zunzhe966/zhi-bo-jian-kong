@@ -88,6 +88,7 @@ fn mcp_tools_cover_core_cli_commands() {
         "video_check_now",
         "blogger_videos",
         "download_video",
+        "video_download",
         "video_library",
         "export_training_data",
         "email_status",
