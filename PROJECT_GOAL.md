@@ -62,6 +62,8 @@ Python 工具层  faster-whisper / LLM 提炼 / ffmpeg 切片 / yt-dlp 兜底
 - 已知待补：邮箱授权码需用户提供；B站/抖音风控时需配置 Cookie
 - 已知待补：B站视频监控当前环境匿名访问被 352/412 风控，需在
   `config/fupan_config.ini` 的 `[视频监控] b站cookie` 填入浏览器 Cookie
+- Rust daemon 统一接管直播+视频监控；`start` 不再并行启动 Python 视频监控，
+  `stop` 不自动拉起 Python 兜底（避免双跑与“停不掉”）
 
 ## 五、关键约定
 

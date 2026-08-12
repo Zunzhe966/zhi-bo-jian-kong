@@ -97,7 +97,8 @@ async fn tick(
         .unwrap_or(0);
 
     // 2. 对每个视频监控源拉一次最新视频并写入库；新出现的不重复通知。
-    let anchors = db::list_anchors(pool).await?;
+    // 只检查“视频监控列表.ini”里的源；anchors 里的直播主播不能当成视频源，
+    // 否则会把直播间地址误当成 RSS/空间源去拉视频。
     let watch = Watchlist::new(project_dir.to_path_buf());
     let sources = watch.list_video();
     let library = VideoLibrary::new(pool.clone(), fupan_dir.to_path_buf());
@@ -105,15 +106,10 @@ async fn tick(
     let mut checked = 0usize;
     let mut notified = 0usize;
     let mut enqueued = 0usize;
-    let mut items: Vec<(String, String, Option<bool>)> = sources
+    let items: Vec<(String, String, Option<bool>)> = sources
         .into_iter()
         .map(|s| (s.url, s.name, s.download))
         .collect();
-    for anchor in anchors {
-        if !items.iter().any(|(u, _, _)| *u == anchor.url) {
-            items.push((anchor.url, anchor.name, None));
-        }
-    }
     let auto_download = config.is_yes("视频监控", "自动下载新视频(是/否)", true);
     let notify_enabled = config.is_yes("复盘邮件", "发现新视频时发送通知(是/否)", true);
     let item_count = items.len();

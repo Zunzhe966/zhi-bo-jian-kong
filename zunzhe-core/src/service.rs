@@ -3,8 +3,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 
-/// Python 后台服务兼容层：Rust 版本优先使用自身 daemon，
-/// 但仍提供 start/stop/status 来管理旧 Python 服务（录制引擎目前仍在 Python 层）。
+#[allow(dead_code)] // 保留显式 Python 兜底入口，CLI/MCP 默认不再自动调用
 pub fn ensure_started(project_dir: &Path) -> Result<serde_json::Value> {
     let python = python_bin(project_dir);
     if !python.exists() {
@@ -40,7 +39,7 @@ pub fn ensure_started(project_dir: &Path) -> Result<serde_json::Value> {
     Ok(json!({"ok": true, "services": services, "logs": project_dir.join("logs")}))
 }
 
-#[allow(dead_code)] // MCP/CLI 统一走 stop_rust_daemon，保留 Python 兼容能力
+#[allow(dead_code)] // 保留显式 Python 兜底入口，CLI/MCP 默认不再自动调用
 pub fn stop_all(project_dir: &Path) -> Result<serde_json::Value> {
     let mut services = serde_json::Map::new();
     for name in ["live_monitor", "video_monitor"] {
@@ -59,33 +58,9 @@ pub fn stop_all(project_dir: &Path) -> Result<serde_json::Value> {
 /// Python 服务仅在需要时作为兜底，避免重复录制同一路直播。
 pub fn ensure_core(project_dir: &Path) -> Result<serde_json::Value> {
     let rust = start_rust_daemon(project_dir, 900)?;
-    // Rust daemon 已接管直播检测/录制，Python 只保留视频监控，避免同一路直播被录两次。
-    let mut services = serde_json::Map::new();
-    for (name, args) in [("video_monitor", vec!["-u", "-m", "fupan.video_monitor"])] {
-        if service_pid(project_dir, name).is_some() {
-            services.insert(name.to_string(), json!("已在运行"));
-            continue;
-        }
-        let python = python_bin(project_dir);
-        let mut cmd = std::process::Command::new(&python);
-        cmd.args(&args)
-            .current_dir(project_dir)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-        }
-        let child = cmd.spawn().with_context(|| format!("启动 {name} 失败"))?;
-        write_pid(project_dir, name, child.id());
-        services.insert(
-            name.to_string(),
-            json!(format!("已启动 pid={}", child.id())),
-        );
-    }
-    Ok(json!({"ok": true, "rust_daemon": rust, "services": services}))
+    // Rust daemon 已统一接管直播检测/录制和视频监控；不再并行启动 Python
+    // video_monitor，避免同一批视频源被两套逻辑重复检查/通知/下载。
+    Ok(json!({"ok": true, "rust_daemon": rust, "services": {}}))
 }
 
 /// 启动 Rust 核心 daemon 并写入 pid 文件（供桌面端/兼容层调用）。
@@ -122,7 +97,8 @@ pub fn start_rust_daemon(project_dir: &Path, interval_secs: u64) -> Result<serde
 }
 
 pub fn stop_rust_daemon(project_dir: &Path) -> Result<serde_json::Value> {
-    // 先停 Rust daemon；Python 兜底属于尽力而为，失败不能阻塞停止操作。
+    // 只停 Rust daemon 与 Rust ffmpeg 录制进程；不再自动拉起 Python 服务，
+    // 否则用户点“停止”反而会启动另一套服务。
     let path = pid_file(project_dir, "zunzhe-core");
     let text = std::fs::read_to_string(&path).unwrap_or_default();
     let pid = text.trim().parse::<u32>();
@@ -134,12 +110,9 @@ pub fn stop_rust_daemon(project_dir: &Path) -> Result<serde_json::Value> {
     let _ = std::fs::remove_file(&path);
     // 清理可能残留的 Rust ffmpeg 录制进程（如果 daemon 未及优雅退出）。
     cleanup_rust_recordings(project_dir);
-    let fallback = ensure_started(project_dir);
-    let fallback_note = match fallback {
-        Ok(v) => format!("已由 Python 兜底接管: {v}"),
-        Err(e) => format!("Python 兜底启动失败（可稍后手动 start）: {e:#}"),
-    };
-    Ok(json!({"ok": true, "rust_daemon": "已停止", "live_monitor": fallback_note}))
+    Ok(
+        json!({"ok": true, "rust_daemon": "已停止", "python_fallback": "未自动启动，需要时手动 start"}),
+    )
 }
 
 /// 兜底清理：读取 fupan_output/run/rust_live/ 下录制 pid 文件，逐个结束。
@@ -189,6 +162,7 @@ pub fn rust_daemon_alive(project_dir: &Path) -> bool {
     service_pid_by_raw(pid)
 }
 
+#[allow(dead_code)] // 供 ensure_started/stop_all 兜底路径使用
 fn python_bin(project_dir: &Path) -> std::path::PathBuf {
     if cfg!(windows) {
         project_dir.join(".venv").join("Scripts").join("python.exe")
