@@ -18,7 +18,7 @@ vm.STATE_FILE = tmp_state
 # 伪造视频源：老视频 v1，之后发布新视频 v2
 fake_videos = [{'id': 'v1', 'title': '老视频', 'url': 'https://example.com/v1'}]
 vm._fetch_videos = lambda url, cookie: list(fake_videos)
-vm.send_new_video_alert = lambda name, title, url: calls['alert'].append((name, title))
+vm.send_new_video_alert = lambda name, title, url, **kwargs: calls['alert'].append((name, title))
 
 def fake_download(video, name):
     calls['download'].append((name, video['title']))

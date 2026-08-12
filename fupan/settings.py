@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """读取 fupan_config.ini 与主程序 config.ini 的配置。"""
 import configparser
+import os
 import sys
 from pathlib import Path
 
@@ -58,7 +59,13 @@ def ensure_project_on_path() -> None:
     if str(PROJECT_DIR) not in sys.path:
         sys.path.insert(0, str(PROJECT_DIR))
     # 让独立运行的流水线也能找到项目自带的 ffmpeg
-    import os
     ffmpeg_dir = str(PROJECT_DIR / 'ffmpeg')
     if ffmpeg_dir not in os.environ.get('PATH', ''):
         os.environ['PATH'] = ffmpeg_dir + os.pathsep + os.environ.get('PATH', '')
+
+
+def venv_python() -> Path:
+    """返回项目虚拟环境里的 Python 可执行文件（跨 Windows/macOS/Linux）。"""
+    if sys.platform == 'win32':
+        return PROJECT_DIR / '.venv' / 'Scripts' / 'python.exe'
+    return PROJECT_DIR / '.venv' / 'bin' / 'python'

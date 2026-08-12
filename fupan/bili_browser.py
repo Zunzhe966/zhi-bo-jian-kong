@@ -8,12 +8,31 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
 from .settings import PROJECT_DIR
 
-ELECTRON = PROJECT_DIR / 'desktop' / 'node_modules' / 'electron' / 'dist' / 'electron.exe'
+def _electron_binary() -> str:
+    """返回 Electron 可执行文件（跨 Windows/macOS/Linux）。"""
+    base = PROJECT_DIR / 'desktop' / 'node_modules' / 'electron' / 'dist'
+    if sys.platform == 'win32':
+        candidates = [base / 'electron.exe']
+    elif sys.platform == 'darwin':
+        candidates = [
+            base / 'Electron.app' / 'Contents' / 'MacOS' / 'Electron',
+            base / 'electron',
+        ]
+    else:
+        candidates = [base / 'electron']
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return shutil.which('electron') or str(candidates[0])
+
+
+ELECTRON = _electron_binary()
 EXTRACT_SCRIPT = PROJECT_DIR / 'desktop' / 'electron' / 'extract-run.cjs'
 RUN_DIR = PROJECT_DIR / 'fupan_output' / 'run'
 UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
@@ -25,7 +44,10 @@ def is_bilibili(url: str) -> bool:
 
 
 def _ffmpeg() -> str:
-    bundled = PROJECT_DIR / 'ffmpeg' / 'ffmpeg.exe'
+    if sys.platform == 'win32':
+        bundled = PROJECT_DIR / 'ffmpeg' / 'ffmpeg.exe'
+    else:
+        bundled = PROJECT_DIR / 'ffmpeg' / 'ffmpeg'
     if bundled.exists():
         return str(bundled)
     return shutil.which('ffmpeg') or 'ffmpeg'
@@ -33,7 +55,7 @@ def _ffmpeg() -> str:
 
 def extract_streams(video_url: str, timeout: int = 70) -> dict:
     """驱动 Electron 提取 B站视频的 DASH 直链。返回 {ok,title,video,audio}。"""
-    if not ELECTRON.exists():
+    if not Path(ELECTRON).exists():
         return {'ok': False, 'error': f'未找到 Electron，请先启动过桌面程序：{ELECTRON}'}
     RUN_DIR.mkdir(parents=True, exist_ok=True)
     out_file = RUN_DIR / f'bili_streams_{int(time.time()*1000)}.json'

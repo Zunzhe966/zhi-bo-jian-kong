@@ -2,7 +2,8 @@
 """尊者直播监控 — 智能体/自动化控制入口。每个子命令输出一行 JSON。
 
 用法（在项目根目录）：
-  .venv/Scripts/python.exe -m fupan.cli <子命令> [参数]
+  .venv/bin/python -m fupan.cli <子命令> [参数]        # macOS/Linux
+  .venv/Scripts/python.exe -m fupan.cli <子命令> [参数]  # Windows
 
 子命令：
   status | add-live | remove-live | list-live | check-live
@@ -14,10 +15,12 @@
   mcp-info                      打印 MCP 接入说明
 
 MCP（推荐智能体连接方式）：
-  .venv/Scripts/python.exe -m fupan.mcp_server
+  .venv/bin/python -m fupan.mcp_server                 # macOS/Linux
+  .venv/Scripts/python.exe -m fupan.mcp_server         # Windows
   配置见 mcp.json.example
 """
 import json
+import os
 import re
 import subprocess
 import sys
@@ -27,7 +30,8 @@ from pathlib import Path
 from .config_api import config_schema, get_config, set_config, set_config_bulk
 from .app_prefs import get_prefs, set_prefs, mark_wizard_done
 from .monitor_prefs import attach_to_items, delete_prefs, set_notify, get_notify, NOTIFY_OPTIONS
-from .settings import CONFIG_DIR, FUPAN_DIR, PROJECT_DIR, ensure_project_on_path
+from .settings import CONFIG_DIR, FUPAN_DIR, PROJECT_DIR, ensure_project_on_path, venv_python
+from .video_library import DB_PATH, init_db, get_videos, cache_cover, mark_downloaded
 
 ensure_project_on_path()
 
@@ -36,7 +40,7 @@ LOG_DIR = FUPAN_DIR / 'logs'
 URL_CONFIG = CONFIG_DIR / 'URL_config.ini'
 WATCHLIST = CONFIG_DIR / '视频监控列表.ini'
 ENCODING = 'utf-8-sig'
-PYTHON = str(PROJECT_DIR / '.venv' / 'Scripts' / 'python.exe')
+PYTHON = str(venv_python())
 QUALITIES = ('原画', '蓝光', '超清', '高清', '标清', '流畅')
 
 
@@ -107,7 +111,8 @@ def _format_live_line(url: str, remark: str = '', quality: str = '') -> str:
 def list_live() -> list[dict]:
     rooms = []
     for line in _read_lines(URL_CONFIG):
-        if not line.strip():
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#'):
             continue
         parsed = _parse_live_line(line)
         if parsed['url'].startswith('http'):
@@ -256,7 +261,29 @@ def blogger_videos(url: str, count: str = '30') -> dict:
     except (TypeError, ValueError):
         n = 30
     videos = list_blogger_videos(url, n)
-    return {'ok': True, 'url': url, 'count': len(videos), 'videos': videos}
+    # 封面本地缓存，界面秒开
+    for v in videos:
+        vid = v.get('id') or v.get('guid') or v.get('url')
+        try:
+            from .video_library import upsert_video
+            upsert_video(v, anchor=v.get('anchor') or v.get('name') or '', source_url=url)
+        except Exception:
+            pass
+        if v.get('cover'):
+            cached = cache_cover(v['cover'], str(vid))
+            if cached and cached != v['cover']:
+                v['cover_cache'] = cached
+    from .video_library import attach_downloaded
+    final = attach_downloaded(videos, source_url=url)
+    return {'ok': True, 'url': url, 'count': len(final), 'videos': final,
+            'library': {'db': str(DB_PATH)}}
+
+
+def video_library(source_url: str = '', anchor: str = '', downloaded_only: str = '') -> dict:
+    """查询视频库（已见过的视频 + 已下载标记）。"""
+    rows = get_videos(source_url=source_url, anchor=anchor,
+                      downloaded_only=downloaded_only in ('1', '是', 'true', 'yes'))
+    return {'ok': True, 'videos': rows, 'count': len(rows), 'db': str(DB_PATH)}
 
 
 def remove_video(url: str) -> dict:
@@ -308,11 +335,18 @@ def _start_one(service: str) -> str:
     RUN_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     cmd = _SERVICES[service]
-    flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
     log_file = open(LOG_DIR / f'{service}.log', 'a', encoding='utf-8')
+    popen_kwargs = {}
+    if os.name == 'nt':
+        popen_kwargs['creationflags'] = (
+            subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        )
+    else:
+        # POSIX 下让后台服务脱离当前终端会话，避免随终端一起退出
+        popen_kwargs['start_new_session'] = True
     proc = subprocess.Popen(
         cmd, cwd=str(PROJECT_DIR), stdout=log_file, stderr=subprocess.STDOUT,
-        stdin=subprocess.DEVNULL, creationflags=flags)
+        stdin=subprocess.DEVNULL, **popen_kwargs)
     _pid_file(service).write_text(str(proc.pid))
     time.sleep(2)
     if not _service_pid(service):
@@ -470,6 +504,10 @@ def main() -> None:
             _out(download_video(rest[0], rest[1] if len(rest) > 1 else '手动下载'))
         elif cmd == 'blogger-videos':
             _out(blogger_videos(rest[0], rest[1] if len(rest) > 1 else '30'))
+        elif cmd == 'video-library':
+            _out(video_library(rest[0] if len(rest) > 0 else '',
+                               rest[1] if len(rest) > 1 else '',
+                               rest[2] if len(rest) > 2 else ''))
         elif cmd == 'remove-video':
             _out(remove_video(rest[0]))
         elif cmd == 'list-video':

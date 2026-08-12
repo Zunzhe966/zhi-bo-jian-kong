@@ -2,7 +2,8 @@
 """尊者直播监控 MCP Server — 任何支持 MCP 的智能体（Cursor、OpenCode 等）均可连接。
 
 启动（stdio，供 Cursor 等配置）:
-  .venv/Scripts/python.exe -m fupan.mcp_server
+  .venv/bin/python -m fupan.mcp_server          # macOS/Linux
+  .venv/Scripts/python.exe -m fupan.mcp_server  # Windows
 
 Cursor 配置见项目根目录 mcp.json.example
 """

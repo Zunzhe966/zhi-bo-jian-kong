@@ -20,6 +20,8 @@ from .notify import send_new_video_alert
 from .pipeline import run_pipeline
 from . import bili_browser
 from .bili_browser import is_bilibili
+from .video_library import (upsert_video, mark_downloaded, attach_downloaded,
+                            cache_cover, get_videos)
 
 STATE_FILE = FUPAN_DIR / '视频监控状态.json'
 # 短视频与直播录像同在 downloads 下：downloads/短视频/主播名/日期_标题.mp4
@@ -73,7 +75,7 @@ def _bilibili_title(bvid: str) -> str:
 
 
 def _bilibili_view(bvid: str) -> dict:
-    """view 接口取标题/发布时间/时长，风控较松，代理下也可用。"""
+    """view 接口取标题/封面/发布时间/时长，风控较松，代理下也可用。"""
     try:
         d = httpx.get(f'https://api.bilibili.com/x/web-interface/view?bvid={bvid}',
                       headers={'User-Agent': UA, 'Referer': 'https://www.bilibili.com'},
@@ -82,21 +84,29 @@ def _bilibili_view(bvid: str) -> dict:
         return {
             'id': bvid,
             'title': data.get('title') or bvid,
+            'cover': (data.get('pic') or '').replace('http://', 'https://'),
             'url': f'https://www.bilibili.com/video/{bvid}',
             'date': time.strftime('%Y-%m-%d', time.localtime(data.get('pubdate', 0))) if data.get('pubdate') else '',
             'duration': data.get('duration', 0),
         }
     except Exception:
-        return {'id': bvid, 'title': bvid, 'url': f'https://www.bilibili.com/video/{bvid}',
-                'date': '', 'duration': 0}
+        return {'id': bvid, 'title': bvid, 'cover': '',
+                'url': f'https://www.bilibili.com/video/{bvid}', 'date': '', 'duration': 0}
 
 
 def _bilibili_upload_ids(mid: str, count: int) -> list[str]:
-    """用 yt-dlp flat-playlist 拉 UP主投稿的 BV 号列表（只列 ID，不触发 playurl 412）。"""
-    ytdlp = shutil.which('yt-dlp') or str(Path(sys.executable).parent / 'yt-dlp.exe')
+    """拉 UP主投稿 BV 号列表。优先官方 arc/search 接口，失败回退 yt-dlp。
+    两个途径都带用户 cookie，避免 412 限流。"""
+    bvids = _bilibili_upload_ids_api(mid, count)
+    if not bvids:
+        bvids = _bilibili_upload_ids_rsshub(mid, count)
+    if bvids:
+        return bvids
+    ytdlp = _ytdlp_bin()
     cmd = [ytdlp, '--flat-playlist', '--playlist-end', str(count), '--print', '%(id)s',
            f'https://space.bilibili.com/{mid}/video']
-    cookies = _bilibili_user_cookies_file() or _bilibili_browser_cookies_file() or _bilibili_anon_cookies_file()
+    # 注意：匿名 buvid cookie 反而会触发 412，这里只使用用户配置或浏览器导出的 cookie
+    cookies = _bilibili_user_cookies_file() or _bilibili_browser_cookies_file()
     if cookies:
         cmd[1:1] = ['--cookies', str(cookies)]
     result = subprocess.run(cmd, capture_output=True, text=True,
@@ -104,23 +114,72 @@ def _bilibili_upload_ids(mid: str, count: int) -> list[str]:
     return [ln.strip() for ln in result.stdout.splitlines() if ln.strip().startswith('BV')]
 
 
+def _bilibili_upload_ids_api(mid: str, count: int) -> list[str]:
+    """B站官方 arc/search 接口拉投稿 BV 号（需要 cookie，风控较稳）。"""
+    cookie = get(fupan_config(), '视频监控', 'b站cookie')
+    headers = {'User-Agent': UA, 'Referer': f'https://space.bilibili.com/{mid}/video'}
+    if cookie:
+        headers['Cookie'] = cookie
+    try:
+        data = httpx.get(
+            f'https://api.bilibili.com/x/space/wbi/arc/search?mid={mid}&ps={min(count, 50)}&pn=1&order=pubdate',
+            headers=headers, timeout=20).json()
+        if data.get('code') == 0:
+            vlist = (data.get('data') or {}).get('list', {}).get('vlist', [])
+            return [v['bvid'] for v in vlist if v.get('bvid')]
+    except Exception:
+        pass
+    return []
+
+
+def _bilibili_upload_ids_rsshub(mid: str, count: int) -> list[str]:
+    """RSSHub 公开实例拉 UP主投稿（不依赖 B站接口，绕开 412 限流）。
+    RSSHub 返回含视频页链接，从中提取 BV 号。"""
+    import urllib.parse
+    rss_url = 'https://rsshub.app/bilibili/user/video/' + urllib.parse.quote(str(mid))
+    try:
+        resp = httpx.get(rss_url, headers={'User-Agent': UA}, timeout=20, follow_redirects=True)
+        root = ET.fromstring(resp.content)
+        bvids = []
+        for item in root.iter('item'):
+            link = (item.findtext('link') or '').strip()
+            m = re.search(r'(BV[0-9A-Za-z]+)', link)
+            if m and m.group(1) not in bvids:
+                bvids.append(m.group(1))
+            if len(bvids) >= count:
+                break
+        return bvids
+    except Exception:
+        return []
+
+
 def list_blogger_videos(url: str, count: int = 30) -> list[dict]:
-    """列出某博主已发布的视频（供批量选择下载）。B站取投稿列表并补全标题；RSS 直接解析。"""
+    """列出某博主已发布的视频（供批量选择下载）。
+    返回每条含 id/title/cover/date/duration/url/downloaded/cover_cache。
+    B站取投稿列表并补全标题/封面；RSS 直接解析（含 media:content 封面）。"""
     match = re.search(r'space\.bilibili\.com/(\d+)', url)
     if match:
         bvids = _bilibili_upload_ids(match.group(1), count)
-        return [_bilibili_view(bv) for bv in bvids]
+        if not bvids:
+            raise RuntimeError(
+                'B站投稿列表拉取失败（可能被 412 风控）。请在「全局设置」里做一次 B站授权，'
+                '或稍后再试。')
+        items = [_bilibili_view(bv) for bv in bvids]
+        for it in items:
+            it['platform'] = 'bilibili'
+        return attach_downloaded(items, source_url=url)
     # 非 B站：按 RSS 处理，条目自带标题
     items = _fetch_rss(url)[:count]
     for it in items:
         it.setdefault('date', '')
         it.setdefault('duration', 0)
-    return items
+        it.setdefault('platform', 'rss')
+    return attach_downloaded(items, source_url=url)
 
 
 def _fetch_bilibili_ytdlp(mid: str) -> list[dict]:
     """无 cookie 兜底：用 yt-dlp 拉 UP主最新投稿 ID，再补标题。"""
-    ytdlp = shutil.which('yt-dlp') or str(Path(sys.executable).parent / 'yt-dlp.exe')
+    ytdlp = _ytdlp_bin()
     result = subprocess.run(
         [ytdlp, '--flat-playlist', '--playlist-end', '10', '--print', '%(id)s',
          f'https://space.bilibili.com/{mid}/video'],
@@ -149,27 +208,73 @@ def _fetch_bilibili(mid: str, cookie: str) -> list[dict]:
     return _fetch_bilibili_ytdlp(mid)
 
 
+def _ytdlp_bin() -> str:
+    """yt-dlp 可执行文件（跨平台：优先 PATH，其次 venv 内）。"""
+    found = shutil.which('yt-dlp')
+    if found:
+        return found
+    if sys.platform == 'win32':
+        return str(Path(sys.executable).parent / 'yt-dlp.exe')
+    return str(Path(sys.executable).parent / 'yt-dlp')
+
+
 def _fetch_rss(url: str) -> list[dict]:
     resp = httpx.get(url, headers={'User-Agent': UA}, timeout=20, follow_redirects=True)
     root = ET.fromstring(resp.content)
+    ns = {'media': 'http://search.yahoo.com/mrss/'}
     items = []
     for item in root.iter('item'):
         link = (item.findtext('link') or '').strip()
         title = (item.findtext('title') or '').strip()
         guid = (item.findtext('guid') or link).strip()
+        cover = ''
+        media_thumb = item.find('media:thumbnail', ns)
+        media_content = item.find('media:content', ns)
+        if media_thumb is not None and media_thumb.get('url'):
+            cover = media_thumb.get('url')
+        elif media_content is not None and media_content.get('url'):
+            cover = media_content.get('url')
+        elif item.findtext('enclosure'):
+            cover = (item.find('enclosure').get('url') or '').strip()
+        pub_date = (item.findtext('pubDate') or '').strip()
         if link:
-            items.append({'id': guid, 'title': title, 'url': link})
+            items.append({'id': guid, 'title': title, 'url': link,
+                          'cover': cover, 'date': _rss_date(pub_date)})
     # Atom 格式兼容
     if not items:
-        ns = {'a': 'http://www.w3.org/2005/Atom'}
+        ns_a = {'a': 'http://www.w3.org/2005/Atom',
+                'media': 'http://search.yahoo.com/mrss/'}
         for entry in root.findall('a:entry', ns):
-            link_el = entry.find('a:link', ns)
+            link_el = entry.find('a:link', ns_a)
             link = link_el.get('href') if link_el is not None else ''
-            title = (entry.findtext('a:title', default='', namespaces=ns) or '').strip()
-            guid = (entry.findtext('a:id', default=link, namespaces=ns) or '').strip()
+            title = (entry.findtext('a:title', default='', namespaces=ns_a) or '').strip()
+            guid = (entry.findtext('a:id', default=link, namespaces=ns_a) or '').strip()
+            cover = ''
+            media_thumb = entry.find('media:thumbnail', ns_a)
+            media_content = entry.find('media:content', ns_a)
+            if media_thumb is not None and media_thumb.get('url'):
+                cover = media_thumb.get('url')
+            elif media_content is not None and media_content.get('url'):
+                cover = media_content.get('url')
+            pub_date = (entry.findtext('a:published', default='', namespaces=ns_a) or '').strip()
             if link:
-                items.append({'id': guid, 'title': title, 'url': link})
+                items.append({'id': guid, 'title': title, 'url': link,
+                              'cover': cover, 'date': _rss_date(pub_date)})
     return items
+
+
+def _rss_date(raw: str) -> str:
+    """把 RFC822 / ISO8601 时间转成 YYYY-MM-DD；失败返回空串。"""
+    raw = (raw or '').strip()
+    if not raw:
+        return ''
+    for fmt in ('%a, %d %b %Y %H:%M:%S %z', '%a, %d %b %Y %H:%M:%S %Z',
+                '%Y-%m-%dT%H:%M:%S%z', '%Y-%m-%dT%H:%M:%S'):
+        try:
+            return time.strftime('%Y-%m-%d', time.strptime(raw[:31], fmt))
+        except ValueError:
+            continue
+    return raw[:10]
 
 
 def _fetch_videos(source_url: str, cookie: str) -> list[dict]:
@@ -226,16 +331,18 @@ def _download_and_process(video: dict, name: str) -> Path | None:
     save_dir = VIDEO_DOWNLOAD_ROOT / name
     save_dir.mkdir(parents=True, exist_ok=True)
     date_prefix = time.strftime('%Y-%m-%d')
+    video_id = str(video.get('id') or video.get('guid') or video.get('url'))
 
     # B站走 Electron 浏览器内核提取直链（绕过 412 风控），其余平台走 yt-dlp
     if is_bilibili(video['url']):
         media = bili_browser.download(video['url'], save_dir, filename_prefix=date_prefix)
         if media:
+            mark_downloaded(video_id)
             run_pipeline(str(media), name)
             return media
         print('B站浏览器下载失败，回退 yt-dlp 再试一次')
 
-    ytdlp = shutil.which('yt-dlp') or str(Path(sys.executable).parent / 'yt-dlp.exe')
+    ytdlp = _ytdlp_bin()
     if not Path(ytdlp).exists():
         print('未安装 yt-dlp，跳过自动下载（pip install yt-dlp）')
         return None
@@ -255,6 +362,7 @@ def _download_and_process(video: dict, name: str) -> Path | None:
     media = next((f for f in files if f.suffix.lower() in ('.mp4', '.mkv', '.webm', '.flv')), None)
     if media:
         print(f'已保存: {media}')
+        mark_downloaded(video_id)
         run_pipeline(str(media), name)
     return media
 
@@ -283,6 +391,12 @@ def check_once() -> int:
         known = set(state.get(item['url'], []))
         first_run = item['url'] not in state
         new_videos = [v for v in videos if v['id'] not in known]
+        # 把本轮拉到的视频元数据写入视频库（含封面/已下载状态）
+        for v in videos:
+            try:
+                upsert_video(v, anchor=item['name'], source_url=item['url'])
+            except Exception as e:
+                print(f'[视频库] 写入失败 {v.get("id")}: {e}')
         state[item['url']] = [v['id'] for v in videos][:50] + list(known)[:100]
 
         if first_run:

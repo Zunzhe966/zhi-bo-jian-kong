@@ -1,9 +1,9 @@
 {
   "mcpServers": {
     "live-monitor": {
-      "command": "C:\\Users\\75622\\.cursor\\plans\\直播录屏软件\\直播复盘助手\\.venv\\Scripts\\python.exe",
+      "command": "<项目绝对路径>/.venv/bin/python",
       "args": ["-m", "fupan.mcp_server"],
-      "cwd": "C:\\Users\\75622\\.cursor\\plans\\直播录屏软件\\直播复盘助手"
+      "cwd": "<项目绝对路径>"
     }
   }
 }

@@ -7,8 +7,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-PROJECT_DIR = Path(__file__).resolve().parent.parent
-VENV_PY = PROJECT_DIR / '.venv' / 'Scripts' / 'python.exe'
+from .settings import PROJECT_DIR, venv_python
+
+VENV_PY = venv_python()
 REQ = PROJECT_DIR / 'requirements-fupan.txt'
 
 

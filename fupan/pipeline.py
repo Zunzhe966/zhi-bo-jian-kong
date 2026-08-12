@@ -3,7 +3,8 @@
 
 两种触发方式：
 1. 主程序 config.ini 开启「录制完成后执行自定义脚本」，命令填：
-   .venv\\Scripts\\python.exe -m fupan.pipeline
+   .venv/bin/python -m fupan.pipeline           # macOS/Linux
+   .venv\\Scripts\\python.exe -m fupan.pipeline  # Windows
    （主程序会自动附加 --record_name / --save_file_path 等参数）
 2. 手动/智能体调用：python -m fupan.pipeline --save_file_path "视频路径" --record_name "主播名"
 """

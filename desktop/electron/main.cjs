@@ -5,7 +5,9 @@ const fs = require('fs')
 
 // electron/ 在 desktop/ 下，Python 虚拟环境在项目根目录（再上一级）
 const PROJECT_DIR = path.resolve(__dirname, '..', '..')
-const PYTHON = path.join(PROJECT_DIR, '.venv', 'Scripts', 'python.exe')
+const PYTHON = process.platform === 'win32'
+  ? path.join(PROJECT_DIR, '.venv', 'Scripts', 'python.exe')
+  : path.join(PROJECT_DIR, '.venv', 'bin', 'python')
 const DIST_HTML = path.join(__dirname, '..', 'dist', 'index.html')
 const ASSETS = path.join(__dirname, '..', 'assets')
 const ICON_ICO = path.join(ASSETS, 'icon.ico')
@@ -310,4 +312,6 @@ app.on('will-quit', () => {
   if (watchdogTimer) clearInterval(watchdogTimer)
   if (notifyTimer) clearInterval(notifyTimer)
 })
-app.on('window-all-closed', (e) => e.preventDefault())
+app.on('window-all-closed', () => {
+  // 主窗口只是隐藏而不是关闭；这里保持托盘进程常驻，不退出应用
+})

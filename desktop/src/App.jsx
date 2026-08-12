@@ -584,7 +584,11 @@ export default function App() {
     setHistoryLoading(true)
     try {
       const r = await window.desktop.cli('blogger-videos', row.url, '40')
-      const list = (r.videos || []).map((v) => ({ ...v, key: v.url }))
+      const list = (r.videos || []).map((v) => ({
+        ...v,
+        key: v.url,
+        date: v.date || v.published_at || '',
+      }))
       setHistoryVideos(list)
       if (!list.length) message.warning('没拉到视频，可能该地址不是博主主页，或需要在设置里先做 B站授权')
     } catch (e) {
@@ -616,6 +620,26 @@ export default function App() {
     setHistoryDownloading(false)
     message[fail ? 'warning' : 'success'](`批量下载完成：成功 ${ok}，失败 ${fail}。文件在 downloads/短视频/${name}/`)
     await fetchStatus()
+    await openHistory(historyBlogger)
+  }
+
+  const downloadAll = async () => {
+    const todo = historyVideos.filter((v) => !v.downloaded).map((v) => v.url)
+    if (!todo.length) return message.warning('没有未下载的视频')
+    setHistoryDownloading(true)
+    const name = historyBlogger?.name || '批量下载'
+    let ok = 0
+    let fail = 0
+    for (const url of todo) {
+      try {
+        const r = await window.desktop.cli('download-video', url, name)
+        r.ok ? ok++ : fail++
+      } catch { fail++ }
+    }
+    setHistoryDownloading(false)
+    message[fail ? 'warning' : 'success'](`全部下载完成：成功 ${ok}，失败 ${fail}。文件在 downloads/短视频/${name}/`)
+    await fetchStatus()
+    await openHistory(historyBlogger)
   }
 
   const toggleService = async (start) => {
@@ -973,6 +997,9 @@ export default function App() {
             已选 {historySelected.length} / {historyVideos.length}
           </span>,
           <Button key="close" onClick={() => setHistoryOpen(false)}>关闭</Button>,
+          <Button key="all" loading={historyDownloading} disabled={!historyVideos.some((v) => !v.downloaded)} onClick={downloadAll}>
+            下载全部（未下载）
+          </Button>,
           <Button key="dl" type="primary" loading={historyDownloading} disabled={!historySelected.length} onClick={downloadSelected}>
             下载选中（{historySelected.length}）
           </Button>,
@@ -991,11 +1018,21 @@ export default function App() {
           rowSelection={{
             selectedRowKeys: historySelected,
             onChange: (keys) => setHistorySelected(keys),
+            getCheckboxProps: (r) => ({ disabled: !!r.downloaded }),
           }}
           columns={[
+            { title: '封面', dataIndex: 'cover_cache', width: 100, align: 'center',
+              render: (c, r) => (c
+                ? <img src={`file://${c}`} alt="" style={{ width: 96, height: 54, objectFit: 'cover', borderRadius: 4 }} />
+                : <a onClick={() => r.cover && window.desktop.openExternal(r.cover)} style={{ color: '#999' }}>无缓存</a>) },
             { title: '标题', dataIndex: 'title', ellipsis: true,
-              render: (t, r) => <a onClick={() => window.desktop.openExternal(r.url)}>{t}</a> },
-            { title: '发布日期', dataIndex: 'date', width: 110, align: 'center' },
+              render: (t, r) => (
+                <span>
+                  <a onClick={() => window.desktop.openExternal(r.url)}>{t}</a>
+                  {r.downloaded ? <span style={{ marginLeft: 8, color: '#52c41a', fontSize: 12 }}>✓ 已下载</span> : null}
+                </span>
+              ) },
+            { title: '发布日期', dataIndex: 'date', width: 150, align: 'center' },
             { title: '时长', dataIndex: 'duration', width: 80, align: 'center',
               render: (d) => (d ? `${Math.floor(d / 60)}:${String(d % 60).padStart(2, '0')}` : '-') },
           ]}
