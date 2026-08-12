@@ -144,15 +144,18 @@ pub struct DownloadResult {
 
 /// 把 pending 下载任务逐个执行（失败重试，成功标记）。
 pub async fn process_pending(pool: &SqlitePool, project_dir: &Path) -> Result<usize> {
-    let tasks = db::list_tasks(pool, "pending", 50).await?;
+    // 上次崩溃遗留的 processing 任务先归还队列，避免永久卡死。
+    db::recover_processing(pool).await?;
     let downloader = Downloader::new(project_dir.to_path_buf());
     let mut done = 0;
-    for task in tasks {
+    while let Some(task) = db::claim_pending_task(pool, 1).await? {
         if task.kind != "download" {
+            db::update_task_status(pool, task.id, "failed").await?;
             continue;
         }
         match downloader.download(&task.url, &task.name, pool).await {
             Ok(_) => {
+                // 认领后再更新：失败不会影响队列状态机，成功也只会更新已认领任务。
                 db::update_task_status(pool, task.id, "done").await?;
                 done += 1;
             }
@@ -169,6 +172,9 @@ pub async fn process_pending(pool: &SqlitePool, project_dir: &Path) -> Result<us
                 )
                 .await?;
             }
+        }
+        if done >= 50 {
+            break;
         }
     }
     Ok(done)

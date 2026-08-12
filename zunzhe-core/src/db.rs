@@ -1,6 +1,9 @@
+use std::path::Path;
+
 use anyhow::Context;
 use sqlx::Row;
 use sqlx::sqlite::SqlitePool;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
 
 use crate::model::{Anchor, LiveSession, NotifyEvent, Task, Video};
 
@@ -88,6 +91,27 @@ pub async fn init_db(pool: &SqlitePool) -> anyhow::Result<()> {
         .await
         .context("初始化 SQLite schema")?;
     Ok(())
+}
+
+/// 打开生产 SQLite 连接：WAL 允许 daemon 内多个并发任务边写边读，
+/// busy_timeout 让短锁冲突等待而不是立刻报错，保证 24×30 长时间运行稳定。
+pub fn open_options(path: &Path) -> SqliteConnectOptions {
+    SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .busy_timeout(std::time::Duration::from_secs(15))
+        .foreign_keys(true)
+}
+
+/// 供测试/调用方直接建立 SQLite 池。
+pub async fn open_pool(path: &Path) -> anyhow::Result<SqlitePool> {
+    let pool = SqlitePool::connect_with(open_options(path))
+        .await
+        .context("连接 SQLite 数据库")?;
+    init_db(&pool).await?;
+    Ok(pool)
 }
 
 pub async fn add_anchor(pool: &SqlitePool, url: &str, name: &str) -> anyhow::Result<()> {
@@ -216,7 +240,8 @@ pub async fn end_live_session(
 ) -> anyhow::Result<()> {
     sqlx::query(
         r#"UPDATE live_sessions SET status=?, error=?, pid=0,
-           ended_at=datetime('now','localtime'), updated_at=datetime('now','localtime') WHERE id=?"#,
+           ended_at=datetime('now','localtime'), updated_at=datetime('now','localtime')
+           WHERE id=? AND status='recording'"#,
     )
     .bind(status)
     .bind(error)
@@ -225,6 +250,17 @@ pub async fn end_live_session(
     .await
     .context("结束直播录制会话")?;
     Ok(())
+}
+
+/// 查询某次录制会话是否仍处于 recording（后台收尾前确认，避免覆盖已停止状态）。
+pub async fn live_session_recording(pool: &SqlitePool, id: i64) -> anyhow::Result<bool> {
+    let row: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM live_sessions WHERE id=? AND status='recording'")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .context("查询录制会话状态")?;
+    Ok(row.is_some())
 }
 
 pub async fn list_live_sessions(
@@ -534,6 +570,56 @@ pub async fn enqueue_task(
     Ok(result.last_insert_rowid())
 }
 
+/// 原子认领一条待处理任务：把 `pending/failed` 置为 `processing` 并返回任务。
+/// 认领后崩溃会把任务留在 processing，下次启动用 `recover_processing` 归还队列；
+/// 单实例 daemon 下也防止同批任务被并发重复执行。
+pub async fn claim_pending_task(pool: &SqlitePool, limit: i64) -> anyhow::Result<Option<Task>> {
+    let row = sqlx::query(
+        "SELECT id, kind, url, name, status, attempts, payload, created_at, updated_at
+         FROM tasks
+         WHERE status IN ('pending','failed')
+         ORDER BY id LIMIT ?",
+    )
+    .bind(limit)
+    .fetch_optional(pool)
+    .await
+    .context("查询待处理任务")?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let id: i64 = row.try_get("id")?;
+    let updated = sqlx::query(
+        "UPDATE tasks SET status='processing', updated_at=datetime('now','localtime') WHERE id=? AND status IN ('pending','failed')",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .context("认领下载任务")?;
+    if updated.rows_affected() == 0 {
+        return Ok(None);
+    }
+    Ok(Some(Task {
+        id,
+        kind: row.try_get("kind")?,
+        url: row.try_get("url")?,
+        name: row.try_get("name")?,
+        status: "processing".to_string(),
+        attempts: row.try_get("attempts")?,
+        payload: row.try_get("payload")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    }))
+}
+
+/// 启动/每轮 tick 前把上次崩溃遗留的 processing 任务归还 pending 重试。
+pub async fn recover_processing(pool: &SqlitePool) -> anyhow::Result<u64> {
+    let result = sqlx::query("UPDATE tasks SET status='pending', updated_at=datetime('now','localtime') WHERE status='processing'")
+        .execute(pool)
+        .await
+        .context("恢复处理中任务")?;
+    Ok(result.rows_affected())
+}
+
 pub async fn list_tasks(pool: &SqlitePool, status: &str, limit: i64) -> anyhow::Result<Vec<Task>> {
     let mut sql = String::from(
         "SELECT id, kind, url, name, status, attempts, payload, created_at, updated_at FROM tasks WHERE 1=1",
@@ -660,11 +746,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let options = sqlx::sqlite::SqliteConnectOptions::new()
-            .filename(&file)
-            .create_if_missing(true);
-        let pool = SqlitePool::connect_with(options).await.unwrap();
-        init_db(&pool).await.unwrap();
+        let pool = open_pool(&file).await.unwrap();
         // 测试库文件交由 OS 临时目录回收，避免并发删除正在使用的 SQLite 文件。
         std::mem::forget(file);
         pool
@@ -726,6 +808,26 @@ mod tests {
         assert_eq!(list_notify(&pool, "pending", 10).await.unwrap().len(), 1);
         mark_notify_done(&pool, nid).await.unwrap();
         assert_eq!(list_notify(&pool, "pending", 10).await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn claim_and_recover_processing_task() {
+        let pool = test_pool().await;
+        let id = enqueue_task(&pool, "download", "https://x.test/claim", "博主")
+            .await
+            .unwrap();
+
+        let claimed = claim_pending_task(&pool, 1).await.unwrap().unwrap();
+        assert_eq!(claimed.id, id);
+        assert_eq!(claimed.status, "processing");
+        // 认领后同一轮不能再拿到同一条任务。
+        assert!(claim_pending_task(&pool, 1).await.unwrap().is_none());
+
+        // 模拟 daemon 在 processing 时崩溃：重启后 recover 把它归还 pending。
+        let recovered = recover_processing(&pool).await.unwrap();
+        assert_eq!(recovered, 1);
+        let again = claim_pending_task(&pool, 1).await.unwrap().unwrap();
+        assert_eq!(again.id, id);
     }
 
     #[tokio::test]
@@ -801,5 +903,38 @@ mod tests {
         let sessions = list_live_sessions(&pool, "done", 10).await.unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].error, "");
+    }
+
+    #[tokio::test]
+    async fn ended_session_cannot_be_overwritten_by_stale_waiter() {
+        let pool = test_pool().await;
+        let id = start_live_session(
+            &pool,
+            "https://live.bilibili.com/999",
+            "主播",
+            "测试直播",
+            "bilibili",
+            "https://stream.example/live.m3u8",
+            123,
+            "/tmp/x.ts",
+        )
+        .await
+        .unwrap();
+
+        // daemon 停止时先把会话标记为 stopped；随后后台 ffmpeg 等待任务醒来。
+        assert!(live_session_recording(&pool, id).await.unwrap());
+        end_live_session(&pool, id, "stopped", "服务停止")
+            .await
+            .unwrap();
+        assert!(!live_session_recording(&pool, id).await.unwrap());
+
+        // 迟到的收尾调用不能再把它覆盖成 failed。
+        end_live_session(&pool, id, "failed", "录制退出 code=1")
+            .await
+            .unwrap();
+        let sessions = list_live_sessions(&pool, "stopped", 10).await.unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].status, "stopped");
+        assert_eq!(sessions[0].error, "服务停止");
     }
 }

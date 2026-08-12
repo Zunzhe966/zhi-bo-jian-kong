@@ -1,13 +1,11 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
-use serde_json::json;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
-
 use crate::{
     config, config_api, db, download, live_monitor, notify, pipeline_bridge, platform, scheduler,
     service, training_data, video_library, watchlist,
 };
+use clap::{Parser, Subcommand};
+use serde_json::json;
 
 #[derive(Debug, Parser)]
 #[command(name = "zunzhe-core", version, about = "尊者直播监控 Rust 核心 daemon")]
@@ -202,11 +200,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // 所有路径以项目根为基准，避免从 zunzhe-core/ 运行时把 DB/下载写错位置。
     let project_dir = cfg.project_dir.clone();
     let db_path = cli.db.unwrap_or_else(|| project_dir.join("zunzhe-core.db"));
-    let options = SqliteConnectOptions::new()
-        .filename(&db_path)
-        .create_if_missing(true);
-    let pool = SqlitePool::connect_with(options).await?;
-    db::init_db(&pool).await?;
+    let pool = db::open_pool(&db_path).await?;
     let fupan_dir = project_dir.join("fupan_output");
     let watch = watchlist::Watchlist::new(project_dir.clone());
     let api = config_api::ConfigApi::new(project_dir.clone());

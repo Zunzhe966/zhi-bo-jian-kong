@@ -183,3 +183,5 @@ desktop/electron-win.zip
 
 # Rust core local database
 zunzhe-core.db
+zunzhe-core.db-shm
+zunzhe-core.db-wal

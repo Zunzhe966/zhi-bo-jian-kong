@@ -436,9 +436,17 @@ impl<'a> LiveMonitor<'a> {
         let output_path = output.display().to_string();
         let split_enabled = self.config.is_yes("录制设置", "分段录制是否开启", false);
         tokio::spawn(async move {
-            // 在等待期间周期性检查进程是否已被外部停止；无法取消的 select 会在
-            // wait_child 返回后自然收尾，不留下孤儿。
+            // 等待 ffmpeg 退出后回收状态。若会话已被 stop_all_recordings 结束
+            // （status 不再是 recording），只清理文件进程记录，不覆盖停止状态，
+            // 也不在主动停止后跑复盘流水线。
             let (code, log) = wait_child(&mut child).await;
+            let still_recording = db::live_session_recording(&pool, session_id)
+                .await
+                .unwrap_or(false);
+            if !still_recording {
+                info!("[{}] 会话已被外部停止，跳过状态回收", anchor_name);
+                return;
+            }
             if code == 0 {
                 info!("[{}] 录制正常结束", anchor_name);
                 let _ = db::end_live_session(&pool, session_id, "done", "").await;

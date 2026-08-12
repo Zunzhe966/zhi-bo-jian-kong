@@ -320,16 +320,11 @@ pub struct TickStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
-
     #[tokio::test]
     async fn daemon_once_without_anchors() {
         let file = std::env::temp_dir().join(format!("zunzhe-daemon-{}", std::process::id()));
         let _ = std::fs::remove_file(&file);
-        let options = SqliteConnectOptions::new()
-            .filename(&file)
-            .create_if_missing(true);
-        let pool = SqlitePool::connect_with(options).await.unwrap();
+        let pool = crate::db::open_pool(&file).await.unwrap();
         db::init_db(&pool).await.unwrap();
         let cfg = crate::config::Config::load(Path::new(env!("CARGO_MANIFEST_DIR")))
             .unwrap_or_else(|_| crate::config::Config::defaults_for_test());
@@ -342,10 +337,7 @@ mod tests {
     async fn daemon_duration_exits_and_cleans_pid() {
         let file = std::env::temp_dir().join(format!("zunzhe-daemon-dur-{}", std::process::id()));
         let _ = std::fs::remove_file(&file);
-        let options = SqliteConnectOptions::new()
-            .filename(&file)
-            .create_if_missing(true);
-        let pool = SqlitePool::connect_with(options).await.unwrap();
+        let pool = crate::db::open_pool(&file).await.unwrap();
         db::init_db(&pool).await.unwrap();
         let cfg = crate::config::Config::load(Path::new(env!("CARGO_MANIFEST_DIR")))
             .unwrap_or_else(|_| crate::config::Config::defaults_for_test());
@@ -369,10 +361,7 @@ mod tests {
     async fn second_daemon_rejected_and_keeps_first_pid() {
         let file = std::env::temp_dir().join(format!("zunzhe-daemon-dup-{}", std::process::id()));
         let _ = std::fs::remove_file(&file);
-        let options = SqliteConnectOptions::new()
-            .filename(&file)
-            .create_if_missing(true);
-        let pool = SqlitePool::connect_with(options).await.unwrap();
+        let pool = crate::db::open_pool(&file).await.unwrap();
         db::init_db(&pool).await.unwrap();
         let cfg = crate::config::Config::load(Path::new(env!("CARGO_MANIFEST_DIR")))
             .unwrap_or_else(|_| crate::config::Config::defaults_for_test());
