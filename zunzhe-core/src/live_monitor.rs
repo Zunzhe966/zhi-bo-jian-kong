@@ -714,7 +714,16 @@ fn process_alive(pid: u32) -> bool {
         std::process::Command::new("tasklist")
             .args(["/FI", &format!("PID eq {pid}")])
             .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout).lines().any(|line| {
+                    let mut parts = line.split_whitespace();
+                    parts
+                        .next()
+                        .and_then(|p| p.parse::<u32>().ok())
+                        .map(|p| p == pid)
+                        .unwrap_or(false)
+                })
+            })
             .unwrap_or(false)
     }
 }

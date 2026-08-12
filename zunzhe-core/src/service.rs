@@ -389,7 +389,15 @@ fn service_pid_by_raw(pid: u32) -> bool {
             .output()
             .map(|o| {
                 let text = String::from_utf8_lossy(&o.stdout);
-                text.contains(&pid.to_string()) && !text.contains("INFO: No tasks")
+                // 逐行解析 tasklist，避免 pid 子串误匹配其它进程。
+                text.lines().any(|line| {
+                    let mut parts = line.split_whitespace();
+                    parts
+                        .next()
+                        .and_then(|p| p.parse::<u32>().ok())
+                        .map(|p| p == pid)
+                        .unwrap_or(false)
+                })
             })
             .unwrap_or(false)
     }

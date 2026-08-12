@@ -76,16 +76,24 @@ function runCli(args) {
     if (!fs.existsSync(exe)) {
       return reject(new Error(`找不到 Rust 核心，请先构建：cd zunzhe-core && cargo build --release\n${RUST_EXE}`))
     }
+    const timeoutMs = 30000
     const proc = spawn(exe, args, {
       cwd: PROJECT_DIR,
       windowsHide: true,
     })
+    const timer = setTimeout(() => {
+      proc.kill('SIGTERM')
+      // 30 秒后再强制结束，避免进程组残留。
+      setTimeout(() => { try { proc.kill('SIGKILL') } catch (e) {} }, 3000)
+      reject(new Error(`Rust 核心命令超时（${timeoutMs}ms）: ${args[0]}`))
+    }, timeoutMs)
     let stdout = ''
     let stderr = ''
     proc.on('error', (err) => reject(new Error(`无法启动后端: ${err.message}`)))
     proc.stdout.on('data', (d) => { stdout += d.toString('utf8') })
     proc.stderr.on('data', (d) => { stderr += d.toString('utf8') })
     proc.on('close', (code) => {
+      clearTimeout(timer)
       const text = stdout.trim()
       if (!text) {
         return reject(new Error(stderr || `命令失败 exit=${code}`))
