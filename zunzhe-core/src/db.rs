@@ -727,6 +727,16 @@ pub async fn mark_notify_done(pool: &SqlitePool, id: i64) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// 通知明确失败（通道未接入/配置缺失）时标记，避免无限 pending。
+pub async fn fail_notify(pool: &SqlitePool, id: i64) -> anyhow::Result<()> {
+    sqlx::query("UPDATE notify SET status='failed' WHERE id=?")
+        .bind(id)
+        .execute(pool)
+        .await
+        .context("更新通知状态")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

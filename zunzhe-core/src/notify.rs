@@ -61,6 +61,8 @@ impl<'a> Notifier<'a> {
         };
         let id = db::add_notify(self.pool, event, anchor, title, content, channel_name).await?;
         if channel == Channel::None {
+            // “不通知”本身是有效投递策略：保留审计记录但立即完成。
+            db::mark_notify_done(self.pool, id).await?;
             return Ok(false);
         }
         let sent = match channel {
@@ -70,7 +72,14 @@ impl<'a> Notifier<'a> {
                 let body = content.to_string();
                 Self::send_email_with_timeout(settings, subject, body).await
             }
-            Channel::Wechat => bail!("微信通道尚未接入，请先用邮箱或配置 Server酱"),
+            Channel::Wechat => {
+                tracing::warn!(
+                    "微信通道尚未接入，通知 id={} 标记 failed，避免无限 pending",
+                    id
+                );
+                db::fail_notify(self.pool, id).await?;
+                return Ok(false);
+            }
             Channel::None => false,
         };
         if sent {
@@ -254,6 +263,47 @@ mod tests {
         assert!(!sent);
         // 未配置邮箱时不写 pending，避免通知表无限膨胀。
         assert_eq!(db::list_notify(&pool, "", 10).await.unwrap().len(), 0);
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_file(file.with_extension("db-shm"));
+        let _ = std::fs::remove_file(file.with_extension("db-wal"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn wechat_unimplemented_marks_failed_not_pending() {
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-notify-wx-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::write(dir.join("config").join("config.ini"), "[推送配置]\n").unwrap();
+        std::fs::write(dir.join("config").join("fupan_config.ini"), "").unwrap();
+        let file = std::env::temp_dir().join(format!(
+            "zunzhe-notify-wx-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pool = db::open_pool(&file).await.unwrap();
+        let cfg = crate::config::Config::load(&dir).unwrap();
+        let notifier = Notifier::new(&pool, &cfg);
+        let sent = notifier
+            .send("video", "博主", "新视频", "内容", Channel::Wechat)
+            .await
+            .unwrap();
+        assert!(!sent);
+        let rows = db::list_notify(&pool, "failed", 10).await.unwrap();
+        assert_eq!(rows.len(), 1, "微信未接入应标记 failed");
+        assert_eq!(
+            db::list_notify(&pool, "pending", 10).await.unwrap().len(),
+            0
+        );
         let _ = std::fs::remove_file(&file);
         let _ = std::fs::remove_file(file.with_extension("db-shm"));
         let _ = std::fs::remove_file(file.with_extension("db-wal"));
