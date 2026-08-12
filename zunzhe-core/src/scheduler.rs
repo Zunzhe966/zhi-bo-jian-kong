@@ -34,6 +34,22 @@ pub async fn run_daemon(
     crate::service::write_rust_daemon_pid(project_dir, std::process::id());
     let _pid_guard = DaemonPidGuard(project_dir);
     let _lock = lock;
+    // 启动即写一条 uptime 日志记录：外部 doctor/桌面端据此计算连续运行时长。
+    let uptime_log = project_dir.join("logs").join("zunzhe-core.uptime.log");
+    if let Some(parent) = uptime_log.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let now = chrono::Local::now()
+        .format("%Y-%m-%d %H:%M:%S %z")
+        .to_string();
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&uptime_log)
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "{now} started pid={}", std::process::id());
+    }
     let fupan_dir = project_dir.join("fupan_output");
     let watch = Watchlist::new(project_dir.to_path_buf());
     let monitor = LiveMonitor::new(&pool, project_dir, config, &watch);
@@ -41,7 +57,6 @@ pub async fn run_daemon(
     // 独立心跳记录器：每 60 秒把“daemon 进程仍在运行”写入 uptime 日志，
     // 不依赖 launchd/桌面端 watchdog；launchd 被 macOS TCC 挡在 ~/Desktop 外时
     // 也能持续留下 24×30 验收记录。
-    let uptime_log = project_dir.join("logs").join("zunzhe-core.uptime.log");
     let uptime_tx = stop.0.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));

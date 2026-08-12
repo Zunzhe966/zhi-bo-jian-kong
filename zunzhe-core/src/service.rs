@@ -288,16 +288,67 @@ pub fn diagnostics(project_dir: &Path) -> Result<serde_json::Value> {
     let heartbeat_ok = heartbeat_fresh(project_dir, 30 * 60);
     let daemon_ok = rust_daemon_alive(project_dir);
     let disk = disk_free_bytes(project_dir);
+    let (uptime_secs, uptime_human) = daemon_uptime(project_dir);
     Ok(json!({
         "ok": true,
         "rust_daemon": daemon_ok,
         "heartbeat_ok": heartbeat_ok,
+        "uptime_secs": uptime_secs,
+        "uptime_human": uptime_human,
         "logs_writable": log_dir.is_dir() || std::fs::create_dir_all(&log_dir).is_ok(),
         "run_dir_writable": run_dir.is_dir() || std::fs::create_dir_all(&run_dir).is_ok(),
         "ffmpeg": if ffmpeg.exists() { "ok" } else { "missing（将使用 PATH 中的 ffmpeg）" },
         "disk_free_mb": disk,
         "hints": [],
     }))
+}
+
+/// 当前 daemon pid 的连续运行时长。日志由 daemon 自己每 60 秒追加，
+/// 其中 `started pid=...` 行是本实例启动时间，取它的最早记录作为起点。
+fn daemon_uptime(project_dir: &Path) -> (u64, String) {
+    let Ok(pid_text) = std::fs::read_to_string(pid_file(project_dir, "zunzhe-core")) else {
+        return (0, String::new());
+    };
+    let Ok(pid) = pid_text.trim().parse::<u32>() else {
+        return (0, String::new());
+    };
+    let log = project_dir.join("logs").join("zunzhe-core.uptime.log");
+    let Ok(text) = std::fs::read_to_string(&log) else {
+        return (0, String::new());
+    };
+    let re = regex::Regex::new(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{4}")
+        .expect("uptime 时间戳正则应合法");
+    let mut started_at: Option<chrono::DateTime<chrono::FixedOffset>> = None;
+    for line in text.lines() {
+        // 启动行有两种格式，统一按“包含 started 且匹配 pid”处理。
+        if !line.contains(" started") || !line.contains(&format!("pid={pid}")) {
+            continue;
+        }
+        let Some(ts) = re.find(line).and_then(|m| {
+            chrono::DateTime::parse_from_str(m.as_str(), "%Y-%m-%d %H:%M:%S %z").ok()
+        }) else {
+            continue;
+        };
+        if started_at.is_none() || ts < started_at.unwrap() {
+            started_at = Some(ts);
+        }
+    }
+    let Some(started_at) = started_at else {
+        return (0, String::new());
+    };
+    let now = chrono::Local::now().with_timezone(&started_at.timezone());
+    let secs = (now - started_at).num_seconds().max(0) as u64;
+    let days = secs / 86400;
+    let hours = (secs % 86400) / 3600;
+    let mins = (secs % 3600) / 60;
+    let human = if days > 0 {
+        format!("{days} 天 {hours} 小时 {mins} 分")
+    } else if hours > 0 {
+        format!("{hours} 小时 {mins} 分")
+    } else {
+        format!("{mins} 分钟")
+    };
+    (secs, human)
 }
 
 fn disk_free_bytes(_project_dir: &Path) -> u64 {
@@ -473,6 +524,31 @@ mod tests {
         let diag = diagnostics(&dir).unwrap();
         assert!(diag["heartbeat_ok"].as_bool().unwrap());
         assert!(diag["run_dir_writable"].as_bool().unwrap());
+        assert_eq!(diag["uptime_secs"].as_u64(), Some(0));
+        assert_eq!(diag["uptime_human"].as_str(), Some(""));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn daemon_uptime_parses_started_line() {
+        let dir = std::env::temp_dir().join(format!("zunzhe-uptime-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        std::fs::create_dir_all(dir.join("fupan_output").join("run")).unwrap();
+        write_rust_daemon_pid(&dir, 424242);
+        let started = chrono::Local::now() - chrono::Duration::seconds(125);
+        std::fs::write(
+            dir.join("logs").join("zunzhe-core.uptime.log"),
+            format!(
+                "{} started pid=424242\n{} pid=424242 rust_daemon=true heartbeat_ok=true\n",
+                started.format("%Y-%m-%d %H:%M:%S %z"),
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S %z")
+            ),
+        )
+        .unwrap();
+        let (secs, human) = daemon_uptime(&dir);
+        assert!(secs >= 120, "uptime_secs 应接近 125 秒，实际 {secs}");
+        assert!(!human.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
