@@ -39,6 +39,7 @@ pub async fn run_daemon(
         // Rust 直播监控独立于 Python 兼容层运行：检测开播、自动录制、状态持久化。
         run_tick_with_timeout(&monitor, &pool, project_dir, &fupan_dir, config).await;
         if once {
+            let _ = monitor.stop_all_recordings().await;
             return Ok(());
         }
         tokio::select! {
@@ -46,6 +47,7 @@ pub async fn run_daemon(
             stopped = stop.1.changed() => {
                 if stopped.is_ok() && *stop.1.borrow() {
                     info!("daemon duration reached, exiting cleanly");
+                    let _ = monitor.stop_all_recordings().await;
                     return Ok(());
                 }
             }

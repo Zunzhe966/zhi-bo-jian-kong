@@ -14,6 +14,7 @@ use tracing::{error, info, warn};
 use crate::config::Config;
 use crate::db;
 use crate::notify::{Channel, Notifier};
+use crate::service::write_rust_live_pid;
 use crate::watchlist::{LiveItem, Watchlist};
 
 /// 平台无关的直播状态。适配器只输出这一种结构。
@@ -385,10 +386,21 @@ impl<'a> LiveMonitor<'a> {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            // ffmpeg 放进独立进程组，停止时按组结束，避免孤儿子进程。
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::setpgid(0, 0);
+                    Ok(())
+                });
+            }
+        }
         let mut child = cmd
             .spawn()
             .with_context(|| format!("启动 ffmpeg 失败，请检查 ffmpeg: {}", ffmpeg.display()))?;
         let pid = child.id().unwrap_or(0);
+        write_rust_live_pid(self.project_dir, &item.url, pid);
         let session_id = db::start_live_session(
             self.pool,
             &item.url,
@@ -424,6 +436,8 @@ impl<'a> LiveMonitor<'a> {
         let output_path = output.display().to_string();
         let split_enabled = self.config.is_yes("录制设置", "分段录制是否开启", false);
         tokio::spawn(async move {
+            // 在等待期间周期性检查进程是否已被外部停止；无法取消的 select 会在
+            // wait_child 返回后自然收尾，不留下孤儿。
             let (code, log) = wait_child(&mut child).await;
             if code == 0 {
                 info!("[{}] 录制正常结束", anchor_name);
@@ -461,6 +475,21 @@ impl<'a> LiveMonitor<'a> {
             let _ = db::end_live_session(self.pool, session.id, "interrupted", "直播已结束").await;
             info!("[{}] 直播结束，会话已回收", session.anchor);
         }
+    }
+
+    /// 停止所有录制中的会话（daemon 退出/服务停止时调用），避免 ffmpeg 孤儿进程。
+    pub async fn stop_all_recordings(&self) -> Result<usize> {
+        let sessions = db::list_live_sessions(self.pool, "recording", 1000).await?;
+        let mut stopped = 0;
+        for session in sessions {
+            if session.pid > 0 && process_alive(session.pid as u32) {
+                terminate_process(session.pid as u32);
+                stopped += 1;
+                info!("[{}] 已停止录制进程 pid={}", session.anchor, session.pid);
+            }
+            let _ = db::end_live_session(self.pool, session.id, "stopped", "服务停止").await;
+        }
+        Ok(stopped)
     }
 
     fn ffmpeg_bin(&self) -> PathBuf {
@@ -679,6 +708,19 @@ fn process_alive(pid: u32) -> bool {
     }
 }
 
+fn terminate_process(pid: u32) {
+    #[cfg(unix)]
+    unsafe {
+        let _ = libc::kill(-(pid as i32), libc::SIGTERM);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .status();
+    }
+}
+
 fn clean_name(input: &str) -> String {
     let mut out = String::new();
     for ch in input.trim().chars() {
@@ -739,5 +781,11 @@ mod tests {
     fn last_lines_keeps_tail() {
         let log = "a\nb\nc\nd";
         assert!(last_log_lines(log, 3).contains('d'));
+    }
+
+    #[test]
+    fn terminate_process_does_not_panic() {
+        // 不存在的 pid 调用不应 panic；真实清理按 DB 会话驱动。
+        terminate_process(u32::MAX);
     }
 }

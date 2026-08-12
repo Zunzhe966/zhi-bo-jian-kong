@@ -133,7 +133,29 @@ pub fn stop_rust_daemon(project_dir: &Path) -> Result<serde_json::Value> {
         kill_process(pid);
     }
     let _ = std::fs::remove_file(&path);
+    // 清理可能残留的 Rust ffmpeg 录制进程（如果 daemon 未及优雅退出）。
+    cleanup_rust_recordings(project_dir);
     Ok(json!({"ok": true, "rust_daemon": "已停止", "live_monitor": "已由 Python 兜底接管"}))
+}
+
+/// 兜底清理：读取 fupan_output/run/rust_live/ 下录制 pid 文件，逐个结束。
+fn cleanup_rust_recordings(project_dir: &Path) {
+    let dir = project_dir
+        .join("fupan_output")
+        .join("run")
+        .join("rust_live");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if let Ok(text) = std::fs::read_to_string(entry.path())
+            && let Ok(pid) = text.trim().parse::<u32>()
+            && service_pid_by_raw(pid)
+        {
+            kill_process(pid);
+        }
+        let _ = std::fs::remove_file(entry.path());
+    }
 }
 
 pub fn status(project_dir: &Path) -> Result<serde_json::Value> {
@@ -191,6 +213,25 @@ pub fn write_rust_daemon_pid(project_dir: &Path, pid: u32) {
     write_pid(project_dir, "zunzhe-core", pid);
 }
 
+/// 录制进程 pid 落盘（fupan_output/run/rust_live/<url-hash>.pid），供停止兜底清理。
+pub fn write_rust_live_pid(project_dir: &Path, url: &str, pid: u32) {
+    let dir = project_dir
+        .join("fupan_output")
+        .join("run")
+        .join("rust_live");
+    let _ = std::fs::create_dir_all(&dir);
+    let name = simple_hash(url);
+    let _ = std::fs::write(dir.join(format!("{name}.pid")), pid.to_string());
+}
+
+fn simple_hash(text: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
 fn service_pid(project_dir: &Path, name: &str) -> Option<u32> {
     let path = pid_file(project_dir, name);
     let text = std::fs::read_to_string(&path).ok()?;
@@ -238,5 +279,25 @@ fn kill_process(pid: u32) {
 fn kill_process(pid: u32) {
     unsafe {
         libc_kill_process_group(pid);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rust_live_pid_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("zunzhe-rust-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_rust_live_pid(&dir, "https://live.bilibili.com/320", 12345);
+        let file = std::fs::read_dir(dir.join("fupan_output").join("run").join("rust_live"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(file.path()).unwrap(), "12345");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
