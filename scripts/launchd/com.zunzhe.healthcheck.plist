@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.zunzhe.healthcheck</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/zhangxuetao/Desktop/尊者监控直播短视频/scripts/check-rust-daemon.sh</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>60</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>WorkingDirectory</key>
+  <string>/Users/zhangxuetao/Desktop/尊者监控直播短视频</string>
+  <key>StandardOutPath</key>
+  <string>/Users/zhangxuetao/Library/Logs/zunzhe/zunzhe-healthcheck.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/zhangxuetao/Library/Logs/zunzhe/zunzhe-healthcheck.err.log</string>
+</dict>
+</plist>
