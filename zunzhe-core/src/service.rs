@@ -423,8 +423,19 @@ pub fn rust_live_pid_name(text: &str) -> String {
 fn service_pid(project_dir: &Path, name: &str) -> Option<u32> {
     let path = pid_file(project_dir, name);
     let text = std::fs::read_to_string(&path).ok()?;
-    let pid: u32 = text.trim().parse().ok()?;
-    service_pid_by_raw(pid).then_some(pid)
+    let Ok(pid) = text.trim().parse::<u32>() else {
+        // 残留/损坏的 pid 文件没有价值，避免后续查询一直返回异常状态。
+        let _ = std::fs::remove_file(&path);
+        return None;
+    };
+    if service_pid_by_raw(pid) {
+        Some(pid)
+    } else {
+        // 进程已退出后，pid 文件会成为“死 pid”残留；顺手清掉，
+        // 避免 service-status / 兼容层误判服务还在运行。
+        let _ = std::fs::remove_file(&path);
+        None
+    }
 }
 
 fn service_pid_by_raw(pid: u32) -> bool {
@@ -511,6 +522,21 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(std::fs::read_to_string(file.path()).unwrap(), "12345");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_service_pid_is_removed() {
+        let dir = std::env::temp_dir().join(format!("zunzhe-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("fupan_output").join("run")).unwrap();
+        // 使用一个几乎不可能存在的 pid，确保进程已退出。
+        write_pid(&dir, "video_monitor", 4_000_000_000);
+        assert!(service_pid(&dir, "video_monitor").is_none());
+        assert!(
+            !pid_file(&dir, "video_monitor").exists(),
+            "死 pid 文件应被自动清理"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
