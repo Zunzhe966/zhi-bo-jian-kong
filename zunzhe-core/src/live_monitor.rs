@@ -386,6 +386,7 @@ impl<'a> LiveMonitor<'a> {
                     if !was_live && begin_push {
                         self.send_live_alert(&item, &anchor, &status).await;
                     }
+                    stats.started += usize::from(!was_live);
                     if let Err(e) = db::set_live_state(self.pool, &item.url, true).await {
                         warn!("[{}] 记录开播状态失败: {e:#}", anchor);
                     }

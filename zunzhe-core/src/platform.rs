@@ -501,24 +501,36 @@ impl Platform for RssAdapter {
     }
 }
 
-/// 极简 RSS 2.0 解析（够用且可测；完整能力交给后续 quick-xml 升级）。
+const ATOM_NS: &str = "http://www.w3.org/2005/Atom";
+const MRSS_NS: &str = "http://search.yahoo.com/mrss/";
+
+/// RSS 2.0 / Atom 解析。
+///
+/// 使用只读 XML DOM 而不是字符串切分，才能正确识别 XML 命名空间（如
+/// `<atom:link>`、`<media:thumbnail>`）和 CDATA 文本；这两类在真实订阅源里很常见，
+/// 旧 Python 依赖 `xml.etree.ElementTree`，Rust 侧也必须对齐同样的解析语义。
 pub fn parse_rss(text: &str) -> Vec<VideoMeta> {
-    let mut out = Vec::new();
-    // RSS 2.0 items
-    let items: Vec<String> = split_original(text, "item");
-    for item in items {
-        let title = tag_text_case(&item, "title").unwrap_or_default();
-        let link = tag_text_case(&item, "link").unwrap_or_default();
+    let Ok(doc) = roxmltree::Document::parse(text) else {
+        return Vec::new();
+    };
+
+    let mut rss = Vec::new();
+    for item in doc
+        .descendants()
+        .filter(|n| matches_local_name(*n, "item", None))
+    {
+        let title = child_text(item, "title");
+        let link = child_text(item, "link");
         if link.is_empty() {
             continue;
         }
-        let guid = tag_text_case(&item, "guid").unwrap_or_else(|| link.clone());
-        let cover = tag_attr_case(&item, "url")
-            .or_else(|| tag_text_case(&item, "enclosure"))
+        let guid = child_text(item, "guid");
+        let cover = media_cover(item)
+            .or_else(|| element_attr(item, "enclosure", "url"))
             .unwrap_or_default();
-        let published_at = normalize_rss_date(tag_text_case(&item, "pubdate"));
-        out.push(VideoMeta {
-            id: guid,
+        let published_at = normalize_rss_date(Some(child_text(item, "pubdate")));
+        rss.push(VideoMeta {
+            id: if guid.is_empty() { link.clone() } else { guid },
             platform: "rss".to_string(),
             url: link,
             title,
@@ -527,36 +539,117 @@ pub fn parse_rss(text: &str) -> Vec<VideoMeta> {
             duration: 0,
         });
     }
-    // Atom entries（media:thumbnail/content 兼容）
-    if out.is_empty() {
-        let entries: Vec<String> = split_original(text, "entry");
-        for entry in entries {
-            let title = tag_text_case(&entry, "title").unwrap_or_default();
-            let link = tag_attr_case(&entry, "href")
-                .or_else(|| tag_text_case(&entry, "link"))
-                .unwrap_or_default();
-            if link.is_empty() {
-                continue;
-            }
-            let guid = tag_text_case(&entry, "id").unwrap_or_else(|| link.clone());
-            let cover = tag_attr_case(&entry, "url")
-                .or_else(|| tag_text_case(&entry, "enclosure"))
-                .unwrap_or_default();
-            let published_at = normalize_rss_date(
-                tag_text_case(&entry, "published").or_else(|| tag_text_case(&entry, "updated")),
-            );
-            out.push(VideoMeta {
-                id: guid,
-                platform: "rss".to_string(),
-                url: link,
-                title,
-                cover,
-                published_at,
-                duration: 0,
-            });
-        }
+    if !rss.is_empty() {
+        return rss;
     }
-    out
+
+    let mut atom = Vec::new();
+    for entry in doc
+        .descendants()
+        .filter(|n| matches_local_name(*n, "entry", Some(ATOM_NS)))
+    {
+        let title = namespaced_child_text(entry, ATOM_NS, "title");
+        let link = atom_link(entry);
+        if link.is_empty() {
+            continue;
+        }
+        let guid = namespaced_child_text(entry, ATOM_NS, "id");
+        let cover = media_cover(entry).unwrap_or_default();
+        let published_at = {
+            let published = namespaced_child_text(entry, ATOM_NS, "published");
+            if published.is_empty() {
+                namespaced_child_text(entry, ATOM_NS, "updated")
+            } else {
+                published
+            }
+        };
+        atom.push(VideoMeta {
+            id: if guid.is_empty() { link.clone() } else { guid },
+            platform: "rss".to_string(),
+            url: link,
+            title,
+            cover,
+            published_at: normalize_rss_date(Some(published_at)),
+            duration: 0,
+        });
+    }
+    atom
+}
+
+fn child_text<'a, 'input>(node: roxmltree::Node<'a, 'input>, name: &str) -> String {
+    node.children()
+        .find(|n| n.is_element() && matches_local_name(*n, name, None))
+        .map(|n| n.text().unwrap_or("").trim())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn matches_local_name<'a, 'input>(
+    node: roxmltree::Node<'a, 'input>,
+    name: &str,
+    allowed_namespace: Option<&str>,
+) -> bool {
+    if !node.is_element() || node.tag_name().name() != name {
+        return false;
+    }
+    match allowed_namespace {
+        Some(ns) => {
+            node.tag_name().namespace() == Some(ns) || node.tag_name().namespace().is_none()
+        }
+        None => true,
+    }
+}
+
+fn namespaced_child_text<'a, 'input>(
+    node: roxmltree::Node<'a, 'input>,
+    namespace: &str,
+    name: &str,
+) -> String {
+    node.children()
+        .find(|n| {
+            n.is_element()
+                && (n.tag_name().namespace() == Some(namespace)
+                    || n.tag_name().namespace().is_none())
+                && n.has_tag_name(name)
+        })
+        .map(|n| n.text().unwrap_or("").trim())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn element_attr<'a, 'input>(
+    node: roxmltree::Node<'a, 'input>,
+    name: &str,
+    attr: &str,
+) -> Option<String> {
+    node.children()
+        .find(|n| n.is_element() && n.has_tag_name(name))
+        .and_then(|n| n.attribute(attr))
+        .map(|s| s.trim().to_string())
+}
+
+fn media_cover<'a, 'input>(node: roxmltree::Node<'a, 'input>) -> Option<String> {
+    ["thumbnail", "content"].into_iter().find_map(|name| {
+        node.children()
+            .find(|n| {
+                n.is_element() && n.tag_name().namespace() == Some(MRSS_NS) && n.has_tag_name(name)
+            })
+            .and_then(|n| n.attribute("url"))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn atom_link<'a, 'input>(node: roxmltree::Node<'a, 'input>) -> String {
+    node.children()
+        .find(|n| {
+            n.is_element() && n.tag_name().namespace() == Some(ATOM_NS) && n.has_tag_name("link")
+        })
+        .and_then(|n| n.attribute("href"))
+        .unwrap_or("")
+        .trim()
+        .to_string()
 }
 
 /// 把 RSS 2.0 / Atom 常见日期规范成 `YYYY-MM-DD`，失败时回退 `YYYY-MM-DD` 前缀。
@@ -592,59 +685,6 @@ fn normalize_rss_date(raw: Option<String>) -> String {
     }
 }
 
-fn split_original(text: &str, tag: &str) -> Vec<String> {
-    split_tags(&text.to_lowercase(), tag)
-        .into_iter()
-        .map(|range| text[range].to_string())
-        .collect()
-}
-
-fn split_tags(text: &str, tag: &str) -> Vec<std::ops::Range<usize>> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let mut out: Vec<std::ops::Range<usize>> = Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.find(&open) {
-        let body_start = start + open.len();
-        let after = &rest[body_start..];
-        if let Some(end) = after.find(&close) {
-            let base = text.len() - rest.len();
-            out.push((base + body_start)..(base + body_start + end));
-            rest = &after[end + close.len()..];
-        } else {
-            break;
-        }
-    }
-    out
-}
-
-fn tag_text_case(item: &str, tag: &str) -> Option<String> {
-    let lower = item.to_lowercase();
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let start = lower.find(&open)? + open.len();
-    let end = lower[start..].find(&close)? + start;
-    let value = item[start..end].trim();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
-    }
-}
-
-fn tag_attr_case(item: &str, attr: &str) -> Option<String> {
-    let lower = item.to_lowercase();
-    let pat = format!("{attr}=\"");
-    let start = lower.find(&pat)? + pat.len();
-    let end = lower[start..].find('"')? + start;
-    let value = item[start..end].trim();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
-    }
-}
-
 /// 带项目根的平台注册表：yt-dlp 兜底按项目 .venv 查找，跨目录运行也可用。
 pub fn resolve_with_project_dir(url: &str, project_dir: &Path) -> Box<dyn Platform> {
     if url.contains("bilibili.com") || url.contains("b23.tv") {
@@ -666,7 +706,7 @@ mod tests {
 
     #[test]
     fn parses_rss_items() {
-        let xml = r#"<rss><channel>
+        let xml = r#"<rss xmlns:media="http://search.yahoo.com/mrss/"><channel>
           <item><title>测试一</title><link>https://x.test/1</link><guid>g1</guid>
           <media:thumbnail url="https://x.test/1.jpg"/></item>
           <item><title>测试二</title><link>https://x.test/2</link><guid>g2</guid></item>
@@ -680,7 +720,8 @@ mod tests {
 
     #[test]
     fn parses_atom_entries() {
-        let xml = r#"<feed xmlns="http://www.w3.org/2005/Atom">
+        let xml = r#"<feed xmlns="http://www.w3.org/2005/Atom"
+          xmlns:media="http://search.yahoo.com/mrss/">
           <entry><title>Atom 视频</title><id>urn:1</id>
           <link href="https://x.test/1"/>
           <media:thumbnail url="https://x.test/1.jpg"/>
@@ -692,6 +733,22 @@ mod tests {
         assert_eq!(items[0].url, "https://x.test/1");
         assert_eq!(items[0].cover, "https://x.test/1.jpg");
         assert_eq!(items[0].published_at, "2026-08-12");
+    }
+
+    #[test]
+    fn parses_cdata_titles_and_rss_default_namespace() {
+        let xml = r#"<rss version="2.0" xmlns="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+          <channel>
+            <item>
+              <title><![CDATA[一个 <带标签> 的标题]]></title>
+              <link>https://x.test/cdata</link>
+            </item>
+          </channel>
+        </rss>"#;
+        let items = parse_rss(xml);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "一个 <带标签> 的标题");
+        assert_eq!(items[0].url, "https://x.test/cdata");
     }
 
     #[test]
