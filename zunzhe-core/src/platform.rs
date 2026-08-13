@@ -338,8 +338,13 @@ impl Platform for BilibiliAdapter {
         Box::pin(async move {
             let mid =
                 Self::mid_from_url(url).with_context(|| format!("不是 B站空间地址: {url}"))?;
-            // 官方 wbi/arc 接口优先（带 cookie），再 RSSHub，最后 yt-dlp。
+            // 官方 wbi/arc 接口优先（带 cookie），再 Electron 页面提取，
+            // 再 RSSHub，最后 yt-dlp；Electron 只依赖真实浏览器页面，不依赖
+            // 容易受公共出口限制的 RSSHub/匿名 HTTP 请求。
             let mut bvids = self.upload_ids_official(&mid, count).await;
+            if bvids.is_empty() {
+                bvids = self.upload_ids_electron(&mid, count).await;
+            }
             if bvids.is_empty() {
                 bvids = self.upload_ids_rsshub(&mid, count).await;
             }
@@ -508,6 +513,69 @@ impl BilibiliAdapter {
         }
         warn!("yt-dlp 启动失败: {candidate:?}");
         Vec::new()
+    }
+
+    /// 用 Electron 浏览器内核从 B站空间页提取投稿 BV 号。
+    ///
+    /// B站 `arc/search` 接口、RSSHub 和 yt-dlp 都可能因为匿名出口/公共实例
+    /// 限制而失败；真实 Chromium 页面会跑完前端风控逻辑，是最接近桌面浏览器
+    /// 的取数方式。这里只用于“取列表”，不触发下载，因此不会占用带宽写文件。
+    async fn upload_ids_electron(&self, mid: &str, count: u32) -> Vec<String> {
+        let Ok(cookie) =
+            std::fs::read_to_string(crate::bilibili_auth::browser_cookie_path(&self.project_dir))
+        else {
+            return Vec::new();
+        };
+        if cookie.trim().is_empty() {
+            return Vec::new();
+        }
+        let url = format!("https://space.bilibili.com/{mid}/video");
+        let script = r#"(function(){{
+  var out={{ok:false,bvids:[]}};
+  try{{
+    var text=document.body ? document.body.innerText : '';
+    var html=document.documentElement ? document.documentElement.innerHTML : '';
+    var seen={{}};
+    var re=/BV[0-9A-Za-z]{{10}}/g;
+    (text+'\n'+html).replace(re, function(v){{ if(!seen[v]){{seen[v]=1; out.bvids.push(v);}} return v; }});
+    out.ok=out.bvids.length>0;
+    if(!out.ok && window.__INITIAL_STATE__){{
+      var st=window.__INITIAL_STATE__;
+      var list=(st.videoList||st.space||{{}}).list;
+      if(Array.isArray(list)){{
+        for(var i=0;i<list.length;i++){{ if(list[i].bvid && !seen[list[i].bvid]){{ seen[list[i].bvid]=1; out.bvids.push(list[i].bvid); }} }}
+      }}
+    }}
+    out.ok=out.bvids.length>0;
+  }}catch(e){{ out.error=String(e && e.message ? e.message : e); }}
+  return JSON.stringify(out);
+}})()"#
+            .to_string();
+        let result = match crate::bilibili_electron::run_bilibili_script(
+            &self.project_dir,
+            &script,
+            &[("FUPAN_TARGET_URL", url)],
+            std::time::Duration::from_secs(45),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::warn!("B站 Electron 投稿列表提取失败: {e:#}");
+                return Vec::new();
+            }
+        };
+        let value = result.value;
+        let Some(bvids) = value.get("bvids").and_then(|v| v.as_array()) else {
+            return Vec::new();
+        };
+        bvids
+            .iter()
+            .filter_map(|v| v.as_str())
+            .filter(|s| is_plausible_bvid(s))
+            .take(count as usize)
+            .map(ToOwned::to_owned)
+            .collect()
     }
 
     fn project_venv_ytdlp(&self) -> Option<PathBuf> {
