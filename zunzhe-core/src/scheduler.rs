@@ -58,6 +58,13 @@ pub async fn run_daemon(
     }
     let watch = Watchlist::new(project_dir.to_path_buf());
     let monitor = LiveMonitor::new(&pool, project_dir, config, &watch);
+    // 硬崩溃/断电后，SQLite 仍会留着上一实例的 recording 会话。新实例没有旧
+    // Child 句柄，必须在首轮 tick 前统一回收，否则僵尸录制状态会长期残留。
+    match monitor.recover_stale_recordings().await {
+        Ok(0) => {}
+        Ok(n) => info!("已回收 {n} 个重启前残留录制会话"),
+        Err(e) => warn!("回收重启前残留录制会话失败，继续调度: {e:#}"),
+    }
     let mut stop = tokio::sync::watch::channel(false);
     // 独立下载队列 worker：不参与 70 秒 tick 护栏，每个任务自身有 600 秒超时。
     // 下载耗时不会阻塞直播/视频检查，也不会被 tick abort 后永远卡 processing。

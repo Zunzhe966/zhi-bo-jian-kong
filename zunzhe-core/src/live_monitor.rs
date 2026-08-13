@@ -439,6 +439,39 @@ impl<'a> LiveMonitor<'a> {
         Ok(stats)
     }
 
+    /// daemon 启动时回收上次硬崩溃遗留的 recording 会话。
+    ///
+    /// 单实例锁只保护调度器，无法保护已经被 `SIGKILL` 留下的 ffmpeg 子进程。
+    /// 这些会话在 DB 里仍为 recording、pid 文件也仍存在，但新 daemon 没有旧
+    /// `Child` 句柄，无法再等待它们退出。这里统一终止仍存活的录制进程、结束
+    /// 会话并清理 pid 文件，避免 24×30 长期运行中状态和磁盘文件持续漂移。
+    pub async fn recover_stale_recordings(&self) -> Result<usize> {
+        let sessions = db::list_live_sessions(self.pool, "recording", 1000).await?;
+        let mut recovered = 0usize;
+        for session in sessions {
+            if session.pid > 0
+                && session.pid as u32 != std::process::id()
+                && process_alive(session.pid as u32)
+            {
+                terminate_process(session.pid as u32);
+                recovered += 1;
+                info!(
+                    "[{}] 回收重启前残留录制进程 pid={}",
+                    session.anchor, session.pid
+                );
+            }
+            let _ = db::end_live_session(
+                self.pool,
+                session.id,
+                "interrupted",
+                "daemon 重启，回收残留录制会话",
+            )
+            .await;
+            remove_rust_live_pid(self.project_dir, &session.url);
+        }
+        Ok(recovered)
+    }
+
     async fn send_live_alert(&self, item: &LiveItem, anchor: &str, status: &LiveStatus) {
         let title = "【尊者直播监控】主播开播".to_string();
         let content = format!(
@@ -832,8 +865,11 @@ fn last_log_lines(log: &str, max_bytes: usize) -> String {
 
 fn process_alive(pid: u32) -> bool {
     #[cfg(unix)]
-    unsafe {
-        libc::kill(pid as i32, 0) == 0
+    {
+        if pid == 0 || pid > i32::MAX as u32 {
+            return false;
+        }
+        unsafe { libc::kill(pid as i32, 0) == 0 }
     }
     #[cfg(not(unix))]
     {
@@ -858,8 +894,13 @@ fn process_alive(pid: u32) -> bool {
 
 fn terminate_process(pid: u32) {
     #[cfg(unix)]
-    unsafe {
-        let _ = libc::kill(-(pid as i32), libc::SIGTERM);
+    {
+        if pid == 0 || pid > i32::MAX as u32 {
+            return;
+        }
+        unsafe {
+            let _ = libc::kill(-(pid as i32), libc::SIGTERM);
+        }
     }
     #[cfg(not(unix))]
     {
@@ -1139,5 +1180,54 @@ mod tests {
         .await;
         assert!(result.is_ok());
         assert!(result.unwrap().unwrap().is_live);
+    }
+
+    #[tokio::test]
+    async fn recover_stale_recordings_reclaims_session_and_pid_file() {
+        let dir = std::env::temp_dir().join(format!("zunzhe-live-recover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::write(dir.join("config").join("config.ini"), "").unwrap();
+        std::fs::write(dir.join("config").join("fupan_config.ini"), "").unwrap();
+
+        let db_file = dir.join("live.db");
+        let pool = crate::db::open_pool(&db_file).await.unwrap();
+        let cfg = crate::config::Config::load(&dir).unwrap();
+        let watch = Watchlist::new(dir.clone());
+        let url = "https://live.example.test/42";
+        let session_id = crate::db::start_live_session(
+            &pool,
+            url,
+            "测试主播",
+            "测试标题",
+            "test",
+            "https://example.test/live.m3u8",
+            u32::MAX,
+            "/tmp/unused.mp4",
+        )
+        .await
+        .unwrap();
+        crate::service::write_rust_live_pid(&dir, url, u32::MAX);
+
+        let monitor = LiveMonitor::new(&pool, &dir, &cfg, &watch);
+        let recovered = monitor.recover_stale_recordings().await.unwrap();
+        assert_eq!(recovered, 0, "不存在 pid 时不应计数为已杀进程");
+        let sessions = crate::db::list_live_sessions(&pool, "recording", 10)
+            .await
+            .unwrap();
+        assert!(
+            sessions.iter().all(|s| s.id != session_id),
+            "硬崩溃残留会话应被回收"
+        );
+        assert!(
+            !dir.join("fupan_output")
+                .join("run")
+                .join("rust_live")
+                .join(format!("{}.pid", crate::service::rust_live_pid_name(url)))
+                .exists(),
+            "硬崩溃残留 pid 文件应被清理"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
