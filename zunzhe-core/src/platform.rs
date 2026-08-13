@@ -34,6 +34,28 @@ fn md5_hex(text: &str) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// 用 B 站 WBI 公钥和投稿列表参数生成签名查询串。
+///
+/// 纯函数便于单测；排序、拼参、`w_rid` 均按官方 WBI 规则执行。
+fn build_wbi_query(img_key: &str, sub_key: &str, mid: &str, count: u32, wts: u64) -> String {
+    let mut params = [
+        ("mid".to_string(), mid.to_string()),
+        ("ps".to_string(), count.to_string()),
+        ("pn".to_string(), "1".to_string()),
+        ("order".to_string(), "pubdate".to_string()),
+        ("wts".to_string(), wts.to_string()),
+    ];
+    params.sort();
+    let query = params
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    let mixin = mixin_key(img_key, sub_key);
+    let digest = md5_hex(&format!("{query}{mixin}"));
+    format!("{query}&w_rid={digest}")
+}
+
 pub trait Platform: Send + Sync {
     fn name(&self) -> &'static str;
 
@@ -46,7 +68,7 @@ pub trait Platform: Send + Sync {
 }
 
 /// B站适配器：先解析 space.bilibili.com/<mid>，用 view 接口补全
-/// 标题/封面/日期/时长；投稿 ID 走 RSSHub 或 yt-dlp 兜底（WBI 签名后续可插拔）。
+/// 标题/封面/日期/时长；投稿 ID 走官方 WBI 接口，RSSHub/yt-dlp 兜底。
 #[derive(Debug)]
 pub struct BilibiliAdapter {
     client: reqwest::Client,
@@ -96,23 +118,7 @@ impl BilibiliAdapter {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        // 标准 WBI：参数按 key 排序后拼接，再附 mixin key，整体 md5。
-        let mut params = [
-            ("mid".to_string(), mid.to_string()),
-            ("ps".to_string(), count.to_string()),
-            ("pn".to_string(), "1".to_string()),
-            ("order".to_string(), "pubdate".to_string()),
-            ("wts".to_string(), wts.to_string()),
-        ];
-        params.sort();
-        let query = params
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join("&");
-        let mixin = mixin_key(&img_key, &sub_key);
-        let digest = md5_hex(&format!("{query}{mixin}"));
-        Ok(format!("{query}&w_rid={digest}"))
+        Ok(build_wbi_query(&img_key, &sub_key, mid, count, wts))
     }
 
     pub fn with_project_dir(project_dir: PathBuf) -> Self {
@@ -251,12 +257,6 @@ impl Platform for BilibiliAdapter {
 impl BilibiliAdapter {
     async fn upload_ids_official(&self, mid: &str, count: u32) -> Vec<String> {
         let cookie = self.effective_cookie();
-        if cookie.is_empty() {
-            return Vec::new();
-        }
-        let url = format!(
-            "https://api.bilibili.com/x/space/wbi/arc/search?mid={mid}&ps={count}&pn=1&order=pubdate"
-        );
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             reqwest::header::REFERER,
@@ -270,7 +270,8 @@ impl BilibiliAdapter {
         if let Ok(v) = reqwest::header::HeaderValue::from_str(&cookie) {
             headers.insert(reqwest::header::COOKIE, v);
         }
-        // 部分风控环境下需要 WBI 签名；这里先做“取 wbi 图片 + 重试”的轻量兜底。
+
+        // 官方接口优先使用 WBI 签名。无 Cookie 也可尝试，失败再走匿名/下方兜底。
         if let Ok(signed_query) = self.wbi_query(mid, count).await {
             let signed = format!("https://api.bilibili.com/x/space/wbi/arc/search?{signed_query}");
             if let Ok(resp) = self
@@ -297,28 +298,7 @@ impl BilibiliAdapter {
                 }
             }
         }
-        let Ok(resp) = self.client.get(&url).headers(headers).send().await else {
-            return Vec::new();
-        };
-        let Ok(data) = resp.json::<serde_json::Value>().await else {
-            return Vec::new();
-        };
-        if data.get("code").and_then(|c| c.as_i64()) != Some(0) {
-            return Vec::new();
-        }
-        data["data"]["list"]["vlist"]
-            .as_array()
-            .map(|rows| {
-                rows.iter()
-                    .filter_map(|r| {
-                        r.get("bvid")
-                            .and_then(|b| b.as_str())
-                            .map(|s| s.to_string())
-                    })
-                    .take(count as usize)
-                    .collect()
-            })
-            .unwrap_or_default()
+        Vec::new()
     }
 
     async fn upload_ids_rsshub(&self, mid: &str, count: u32) -> Vec<String> {
@@ -651,5 +631,22 @@ mod tests {
     #[test]
     fn unix_ts_converts_date() {
         assert_eq!(unix_to_date(1786550400), "2026-08-12");
+    }
+
+    #[test]
+    fn wbi_query_sorts_params_and_appends_w_rid() {
+        // 固定时间戳和图片 key，验证签名串与官方 WBI 拼接规则一致。
+        let query = build_wbi_query(
+            "1234567890abcdefghijklmnopqrstuvwxyz",
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ01",
+            "946974",
+            10,
+            1786550400,
+        );
+        assert_eq!(
+            query,
+            "mid=946974&order=pubdate&pn=1&ps=10&wts=1786550400&w_rid=6ee69f49fe6f88e479e6a504b0521981"
+        );
+        assert!(query.contains("&w_rid="));
     }
 }
