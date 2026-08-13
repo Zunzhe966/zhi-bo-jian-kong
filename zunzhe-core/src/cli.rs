@@ -561,8 +561,21 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             file_path,
             anchor_name,
         } => {
-            let summary = pipeline_bridge::run_pipeline(&cfg, &file_path, &anchor_name).await?;
-            println!("{}", serde_json::to_string(&summary)?);
+            // 与 daemon 的 process 队列走同一条路径：只入队，不在这里直接跑 Python。
+            // 这样手动 process、下载后自动复盘、录制结束自动复盘都不会重复执行，
+            // 且失败/重试/超时状态由复盘 worker 统一维护。
+            let task_id = download::enqueue_process(&pool, &file_path, &anchor_name).await?;
+            println!(
+                "{}",
+                serde_json::to_string(&json!({
+                    "ok": true,
+                    "queued": true,
+                    "task_id": task_id,
+                    "file": file_path,
+                    "anchor": anchor_name,
+                    "hint": "daemon 的复盘 worker 会处理该任务；请确保 Rust daemon 正在运行"
+                }))?
+            );
         }
         Command::Start => {
             let result = service::ensure_core(&project_dir)?;

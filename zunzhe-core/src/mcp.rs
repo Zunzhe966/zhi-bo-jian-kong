@@ -450,9 +450,15 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
                 .get("anchor_name")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            Ok(serde_json::to_string(
-                &crate::pipeline_bridge::run_pipeline(cfg, file_path, anchor_name).await?,
-            )?)
+            let task_id = crate::download::enqueue_process(pool, file_path, anchor_name).await?;
+            Ok(serde_json::to_string(&json!({
+                "ok": true,
+                "queued": true,
+                "task_id": task_id,
+                "file": file_path,
+                "anchor": anchor_name,
+                "hint": "daemon 的复盘 worker 会处理该任务；请确保 Rust daemon 正在运行"
+            }))?)
         }
         "service_start" => Ok(serde_json::to_string(&crate::service::ensure_core(
             project_dir,

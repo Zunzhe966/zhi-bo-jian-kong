@@ -367,16 +367,16 @@ pub async fn process_pending(pool: &SqlitePool, project_dir: &Path) -> Result<us
     Ok(done)
 }
 
-/// 下载完成后立即入队复盘任务：kind="process"、url 是媒体文件绝对路径、
-/// name 是主播/博主名，避免阻塞下载 worker，也避免并发 spawn 无限堆积。
-pub async fn enqueue_pipeline_after_download(
-    pool: &SqlitePool,
-    file: &str,
-    name: &str,
-) -> anyhow::Result<i64> {
+/// 入队一个复盘任务：kind="process"、url 是媒体文件绝对路径、name 是主播/博主名。
+///
+/// 手动 CLI/MCP 和下载/录制完成都走这一个入口。已存在未完成任务（pending/
+/// processing/failed）时不再重复插入，避免同一媒体文件被重复转写/切片；
+/// 已完成的任务保留历史记录，需要重新处理时应让调用方显式创建新任务或未来提供
+/// “重新处理”入口，而不是悄悄覆盖 done。
+pub async fn enqueue_process(pool: &SqlitePool, file: &str, name: &str) -> anyhow::Result<i64> {
     // 同一媒体文件已经排队或正在处理时不再重复入队。
     let existing: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM tasks WHERE kind='process' AND url=? AND status IN ('pending','processing','failed') LIMIT 1",
+        "SELECT id FROM tasks WHERE kind='process' AND url=? AND status IN ('pending','processing','failed','done') LIMIT 1",
     )
     .bind(file)
     .fetch_optional(pool)
@@ -386,6 +386,15 @@ pub async fn enqueue_pipeline_after_download(
         return Ok(id);
     }
     db::enqueue_task(pool, "process", file, name).await
+}
+
+/// 下载完成后立即入队复盘任务，保持旧调用名兼容。
+pub async fn enqueue_pipeline_after_download(
+    pool: &SqlitePool,
+    file: &str,
+    name: &str,
+) -> anyhow::Result<i64> {
+    enqueue_process(pool, file, name).await
 }
 
 /// 独立下载队列 worker：不参与 70 秒 tick 护栏，每个任务自身有 600 秒超时，
@@ -559,6 +568,46 @@ mod tests {
         drop(f);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn enqueue_process_deduplicates_active_and_completed_tasks() {
+        let file = std::env::temp_dir().join(format!(
+            "zunzhe-process-dedup-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pool = crate::db::open_pool(&file).await.unwrap();
+        let media = "/tmp/same-media.mp4";
+
+        let pending_id = enqueue_process(&pool, media, "主播甲").await.unwrap();
+        let duplicate_pending = enqueue_process(&pool, media, "主播乙").await.unwrap();
+        assert_eq!(
+            pending_id, duplicate_pending,
+            "同一媒体文件在 pending 时不应重复入队"
+        );
+
+        crate::db::update_task_status(&pool, pending_id, "done")
+            .await
+            .unwrap();
+        let after_done = enqueue_process(&pool, media, "主播丙").await.unwrap();
+        assert_eq!(
+            after_done, pending_id,
+            "同一媒体文件已完成时不应再创建重复 process 任务"
+        );
+
+        crate::db::set_task_status(&pool, pending_id, "failed")
+            .await
+            .unwrap();
+        let after_failed = enqueue_process(&pool, media, "主播丁").await.unwrap();
+        assert_eq!(
+            after_failed, pending_id,
+            "同一媒体文件失败后应复用任务，而不是重复生成"
+        );
+        std::mem::forget(file);
     }
 
     #[tokio::test]
