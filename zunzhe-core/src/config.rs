@@ -114,19 +114,36 @@ impl Config {
     }
 
     pub fn get_main(&self, section: &str, key: &str) -> String {
-        self.main.get(section, key).unwrap_or_default()
+        IniFile::get_case_insensitive(&self.main, section, key)
     }
 
     pub fn get_fupan(&self, section: &str, key: &str) -> String {
-        self.fupan.get(section, key).unwrap_or_default()
+        IniFile::get_case_insensitive(&self.fupan, section, key)
     }
 
-    pub fn is_yes(&self, section: &str, key: &str, default: bool) -> bool {
+    pub fn is_yes_fupan(&self, section: &str, key: &str, default: bool) -> bool {
         let v = self.get_fupan(section, key);
         if v.is_empty() {
             default
         } else {
             IniFile::is_yes(&v)
+        }
+    }
+
+    pub fn is_yes_main(&self, section: &str, key: &str, default: bool) -> bool {
+        let v = self.get_main(section, key);
+        if v.is_empty() {
+            default
+        } else {
+            IniFile::is_yes(&v)
+        }
+    }
+
+    pub fn is_yes(&self, section: &str, key: &str, default: bool) -> bool {
+        if section == "录制设置" {
+            self.is_yes_main(section, key, default)
+        } else {
+            self.is_yes_fupan(section, key, default)
         }
     }
 
@@ -164,6 +181,28 @@ impl Config {
             bark: clean_push_value(&self.get_main("推送配置", "bark推送接口链接")),
             ntfy: clean_push_value(&self.get_main("推送配置", "ntfy推送地址")),
         }
+    }
+}
+
+impl IniFile {
+    /// 按 section 和 key 大小写不敏感地读取值。
+    ///
+    /// 主配置 `config.ini` 与旧 Python 使用 `RawConfigParser(optionxform=str)`，
+    /// 因此同一个键可能以 `SMTP` 或 `smtp` 混用；Rust 若严格匹配会漏读邮箱、
+    /// SSL、推送通道等关键项。这里按现存键做一次大小写折叠匹配。
+    fn get_case_insensitive(&self, section: &str, key: &str) -> String {
+        if let Some(map) = self.data.get(section) {
+            if let Some(value) = map.get(key) {
+                return value.trim().to_string();
+            }
+            let needle = key.to_lowercase();
+            for (existing, value) in map {
+                if existing.to_lowercase() == needle {
+                    return value.trim().to_string();
+                }
+            }
+        }
+        String::new()
     }
 }
 
@@ -410,5 +449,38 @@ SMTP邮件服务器 = smtp.qq.com
     #[test]
     fn mask_hides_middle() {
         assert_eq!(mask("abc@qq.com"), "ab***om");
+    }
+
+    #[test]
+    fn main_config_keys_are_case_insensitive() {
+        let text = r#"
+[推送配置]
+smtp邮件服务器 = smtp.qq.com
+是否使用smtp服务ssl加密(是/否) = 是
+SMTP邮件服务器端口 = 465
+"#;
+        let ini = IniFile::parse(text).unwrap();
+        assert_eq!(
+            IniFile::get_case_insensitive(&ini, "推送配置", "SMTP邮件服务器"),
+            "smtp.qq.com"
+        );
+        assert_eq!(
+            IniFile::get_case_insensitive(&ini, "推送配置", "smtp邮件服务器端口"),
+            "465"
+        );
+    }
+
+    #[test]
+    fn fupan_is_yes_reads_fupan_file_only() {
+        let text = "[视频监控]\n自动下载新视频(是/否) = 否\n";
+        let ini = IniFile::parse(text).unwrap();
+        let cfg = Config {
+            project_dir: PathBuf::from("."),
+            config_ini: PathBuf::from("config.ini"),
+            fupan_config_ini: PathBuf::from("fupan_config.ini"),
+            main: IniFile::default(),
+            fupan: ini,
+        };
+        assert!(!cfg.is_yes_fupan("视频监控", "自动下载新视频(是/否)", true));
     }
 }

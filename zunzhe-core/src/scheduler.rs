@@ -327,8 +327,8 @@ async fn tick(
         .into_iter()
         .map(|s| (s.url, s.name, s.download))
         .collect();
-    let auto_download = config.is_yes("视频监控", "自动下载新视频(是/否)", true);
-    let notify_enabled = config.is_yes("复盘邮件", "发现新视频时发送通知(是/否)", true);
+    let auto_download = config.is_yes_fupan("视频监控", "自动下载新视频(是/否)", true);
+    let notify_enabled = config.is_yes_fupan("复盘邮件", "发现新视频时发送通知(是/否)", true);
     let item_count = items.len();
     for (source_url, name, item_download) in items {
         let adapter = platform::resolve_with_project_dir(&source_url, project_dir);
