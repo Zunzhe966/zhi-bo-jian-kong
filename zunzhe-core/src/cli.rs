@@ -88,13 +88,13 @@ enum Command {
         #[arg(default_value = "")]
         downloaded_only: String,
     },
-    /// 列出博主历史视频（调用平台适配器，骨架阶段为空）
+    /// 列出博主历史视频，供前端批量选择与下载
     BloggerVideos {
         url: String,
         #[arg(default_value = "30")]
         count: u32,
     },
-    /// 加入下载任务（骨架阶段只入队）
+    /// 下载指定视频到 downloads/短视频/
     DownloadVideo {
         url: String,
         #[arg(default_value = "手动下载")]
