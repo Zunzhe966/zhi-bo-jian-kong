@@ -293,6 +293,19 @@ pub fn diagnostics(project_dir: &Path) -> Result<serde_json::Value> {
     let daemon_ok = rust_daemon_alive(project_dir);
     let disk = disk_free_bytes(project_dir);
     let (uptime_secs, uptime_human) = daemon_uptime(project_dir);
+    let python_ok = python_bin(project_dir).is_file();
+    let pipeline_hint = if python_ok {
+        None
+    } else {
+        Some(
+            "缺少 .venv/bin/python：自动转写/知识提炼/精华切片复盘桥接不可用，\
+             请运行 scripts/setup-macos.sh 或重新创建虚拟环境",
+        )
+    };
+    let mut hints = Vec::new();
+    if let Some(hint) = pipeline_hint {
+        hints.push(hint);
+    }
     Ok(json!({
         "ok": true,
         "rust_daemon": daemon_ok,
@@ -303,7 +316,8 @@ pub fn diagnostics(project_dir: &Path) -> Result<serde_json::Value> {
         "run_dir_writable": run_dir.is_dir() || std::fs::create_dir_all(&run_dir).is_ok(),
         "ffmpeg": if ffmpeg.exists() { "ok" } else { "missing（将使用 PATH 中的 ffmpeg）" },
         "disk_free_mb": disk,
-        "hints": [],
+        "pipeline_python_ok": python_ok,
+        "hints": hints,
     }))
 }
 
@@ -556,6 +570,25 @@ mod tests {
         assert!(diag["run_dir_writable"].as_bool().unwrap());
         assert_eq!(diag["uptime_secs"].as_u64(), Some(0));
         assert_eq!(diag["uptime_human"].as_str(), Some(""));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diagnostics_reports_pipeline_python_environment() {
+        let dir = std::env::temp_dir().join(format!("zunzhe-diag-py-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("fupan_output").join("run")).unwrap();
+        let diag = diagnostics(&dir).unwrap();
+        assert_eq!(diag["pipeline_python_ok"], false);
+        assert!(
+            diag["hints"]
+                .as_array()
+                .and_then(|a| a
+                    .iter()
+                    .find(|h| { h.as_str().map(|s| s.contains("复盘桥接")).unwrap_or(false) }))
+                .is_some(),
+            "缺少 Python 复盘环境时 doctor 应给出可见提示"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

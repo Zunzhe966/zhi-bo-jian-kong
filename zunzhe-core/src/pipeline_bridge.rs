@@ -117,7 +117,11 @@ impl PythonTool {
         record_name: &str,
     ) -> Result<PipelineSummary> {
         if !self.python.exists() {
-            anyhow::bail!("找不到 Python 虚拟环境: {}", self.python.display());
+            anyhow::bail!(
+                "找不到复盘 Python 环境: {}。自动转写/知识提炼/精华切片需要虚拟环境，\
+                 请运行 scripts/setup-macos.sh（Windows/Linux 安装对应依赖后创建 .venv）",
+                self.python.display()
+            );
         }
         let mut cmd = Command::new(&self.python);
         cmd.kill_on_drop(true);
