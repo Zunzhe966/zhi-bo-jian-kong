@@ -33,6 +33,9 @@ pub async fn run_mcp(pool: SqlitePool, project_dir: &Path, cfg: Arc<Config>) -> 
     let fupan_dir = project_dir.join("fupan_output");
     let watch = Arc::new(Watchlist::new(project_dir.to_path_buf()));
     let api = Arc::new(ConfigApi::new(project_dir.to_path_buf()));
+    if let Err(e) = crate::video_library::migrate_legacy_video_db(&pool, &fupan_dir).await {
+        error!("视频库旧库合并失败（MCP 继续运行）: {e:#}");
+    }
 
     while let Ok(Some(line)) = reader.next_line().await {
         if line.trim().is_empty() {
@@ -336,7 +339,7 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
             }
             let persisted = library.list(&url, "", false).await?;
             Ok(serde_json::to_string(
-                &json!({"ok":true,"platform":adapter.name(),"count":persisted.len(),"videos":persisted}),
+                &json!({"ok":true,"platform":adapter.name(),"count":persisted.len(),"videos":crate::video_library::videos_compat_json(&persisted)}),
             )?)
         }
         "download_video" | "video_download" => {
@@ -364,7 +367,7 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
                 .unwrap_or(false);
             let videos = library.list(source, "", done).await?;
             Ok(serde_json::to_string(
-                &json!({"ok":true,"count":videos.len(),"videos":videos}),
+                &json!({"ok":true,"count":videos.len(),"videos":crate::video_library::videos_compat_json(&videos)}),
             )?)
         }
         "export_training_data" => {

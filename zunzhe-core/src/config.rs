@@ -175,9 +175,18 @@ impl Config {
     }
 
     pub fn push_channels(&self) -> PushChannels {
+        // 旧 Python 文档里的 `pushplus_token` 与当前真实配置文件里的
+        // `pushplus推送token` 可能混用；读取时优先真实键，缺失再兼容旧键，
+        // 避免用户在旧文档/配置里填入 token 后通知通道被静默漏掉。
+        let pushplus = self.get_main("推送配置", "pushplus推送token");
+        let pushplus = if pushplus.is_empty() {
+            self.get_main("推送配置", "pushplus_token")
+        } else {
+            pushplus
+        };
         PushChannels {
             serverchan: clean_push_value(&self.get_main("推送配置", "server酱SendKey")),
-            pushplus: clean_push_value(&self.get_main("推送配置", "pushplus推送token")),
+            pushplus: clean_push_value(&pushplus),
             bark: clean_push_value(&self.get_main("推送配置", "bark推送接口链接")),
             ntfy: clean_push_value(&self.get_main("推送配置", "ntfy推送地址")),
         }
@@ -649,6 +658,30 @@ SMTP邮件服务器端口 = 465
             fupan: ini,
         };
         assert!(!cfg.is_yes_fupan("视频监控", "自动下载新视频(是/否)", true));
+    }
+
+    #[test]
+    fn pushplus_reads_legacy_and_current_key_names() {
+        let cfg = |text: &str| {
+            let ini = IniFile::parse(text).unwrap();
+            Config {
+                project_dir: PathBuf::from("."),
+                config_ini: PathBuf::from("config.ini"),
+                fupan_config_ini: PathBuf::from("fupan_config.ini"),
+                main: ini,
+                fupan: IniFile::default(),
+            }
+        };
+
+        let modern = cfg("[推送配置]\npushplus推送token = modern-token\n");
+        assert_eq!(modern.push_channels().pushplus, "modern-token");
+
+        let legacy = cfg("[推送配置]\npushplus_token = legacy-token\n");
+        assert_eq!(legacy.push_channels().pushplus, "legacy-token");
+
+        let both =
+            cfg("[推送配置]\npushplus_token = legacy-token\npushplus推送token = modern-token\n");
+        assert_eq!(both.push_channels().pushplus, "modern-token");
     }
 
     #[test]

@@ -132,6 +132,7 @@ impl ConfigApi {
                         "直播状态推送渠道": "填「邮箱」启用邮件通知",
                         "server酱SendKey": "Server酱 SendKey，可推微信（secret）",
                         "pushplus推送token": "PushPlus token（secret）",
+                        "pushplus_token": "PushPlus token 旧键名（兼容读取，写入建议用 pushplus推送token）",
                         "bark推送接口链接": "iOS Bark 推送地址（secret）",
                         "ntfy推送地址": "ntfy 订阅地址（secret）",
                         "SMTP邮件服务器": "如 smtp.qq.com",
@@ -143,6 +144,10 @@ impl ConfigApi {
                         "发件人显示昵称": "邮件显示名",
                         "收件人邮箱": "通知收件人",
                         "开播推送开启(是/否)": "是/否"
+                    },
+                    "Cookie": {
+                        "抖音cookie": "录制抖音必填（secret）",
+                        "b站cookie": "B站部分功能需要（secret）"
                     }
                 },
                 "fupan_config.ini": {
@@ -183,6 +188,25 @@ mod tests {
         assert_eq!(mask_secret("推送配置", "发件人密码(授权码)", "abc"), "***");
         assert_eq!(mask_secret("视频监控", "b站cookie", "x"), "***");
         assert_eq!(mask_secret("推送配置", "收件人邮箱", "a@b.com"), "a@b.com");
+    }
+
+    #[test]
+    fn schema_includes_legacy_cookie_and_pushplus_compat() {
+        let dir = std::env::temp_dir().join(format!("zunzhe-config-schema-{}", std::process::id()));
+        let schema = ConfigApi::new(dir).schema();
+        assert_eq!(
+            schema["files"]["config.ini"]["Cookie"]["抖音cookie"],
+            "录制抖音必填（secret）"
+        );
+        assert_eq!(
+            schema["files"]["config.ini"]["推送配置"]["pushplus推送token"],
+            "PushPlus token（secret）"
+        );
+        assert!(
+            schema["files"]["config.ini"]["推送配置"]
+                .get("pushplus_token")
+                .is_some()
+        );
     }
 
     #[test]

@@ -418,6 +418,52 @@ pub async fn upsert_video(
     Ok(())
 }
 
+/// 旧视频库迁移专用：只在主库没有相同 id 时插入，绝不覆盖已有记录。
+///
+/// 返回 `true` 表示本次确实写入，返回 `false` 表示因主库已存在而跳过。
+/// 使用单条 `INSERT OR IGNORE`，比“先查再插”更不容易受并发影响，且幂等。
+#[allow(clippy::too_many_arguments)] // 对齐旧库 videos 字段，逐字段复制
+pub async fn insert_legacy_video(
+    tx: &mut sqlx::SqliteConnection,
+    id: &str,
+    platform: &str,
+    url: &str,
+    title: &str,
+    cover: &str,
+    cover_cache: &str,
+    published_at: &str,
+    duration: i64,
+    anchor: &str,
+    source_url: &str,
+    downloaded: bool,
+    downloaded_at: &str,
+    first_seen: &str,
+) -> anyhow::Result<bool> {
+    let result = sqlx::query(
+        r#"INSERT OR IGNORE INTO videos
+           (id, platform, url, title, cover, cover_cache, published_at, duration,
+            anchor, source_url, downloaded, downloaded_at, first_seen)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
+    )
+    .bind(id)
+    .bind(platform)
+    .bind(url)
+    .bind(title)
+    .bind(cover)
+    .bind(cover_cache)
+    .bind(published_at)
+    .bind(duration)
+    .bind(anchor)
+    .bind(source_url)
+    .bind(if downloaded { 1i64 } else { 0i64 })
+    .bind(downloaded_at)
+    .bind(first_seen)
+    .execute(&mut *tx)
+    .await
+    .context("写入旧视频库记录")?;
+    Ok(result.rows_affected() > 0)
+}
+
 pub async fn mark_downloaded(
     pool: &SqlitePool,
     video_id: &str,

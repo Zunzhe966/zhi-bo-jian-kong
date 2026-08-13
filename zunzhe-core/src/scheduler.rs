@@ -51,6 +51,11 @@ pub async fn run_daemon(
         let _ = writeln!(f, "{now} started pid={}", std::process::id());
     }
     let fupan_dir = project_dir.join("fupan_output");
+    // daemon 启动时合并旧 Python 独立视频库，确保 `已下载` 标记与历史视频
+    // 元数据不会因切换主 DB 而丢失；迁移幂等，只补缺失 id，不覆盖主库字段。
+    if let Err(e) = crate::video_library::migrate_legacy_video_db(&pool, &fupan_dir).await {
+        warn!("旧视频库迁移失败，继续调度: {e:#}");
+    }
     let watch = Watchlist::new(project_dir.to_path_buf());
     let monitor = LiveMonitor::new(&pool, project_dir, config, &watch);
     let mut stop = tokio::sync::watch::channel(false);

@@ -204,6 +204,12 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let db_path = cli.db.unwrap_or_else(|| project_dir.join("zunzhe-core.db"));
     let pool = db::open_pool(&db_path).await?;
     let fupan_dir = project_dir.join("fupan_output");
+    // 旧 Python 把视频库单独存在 fupan_output/video_library.db；启动命令前先
+    // 无副作用合并到 Rust 主 DB，避免已下载标记、历史视频元数据被另一套 DB 遗忘。
+    // 迁移接口本身幂等且跳过相同 id，失败不应阻塞只读查询，只记录诊断信息。
+    if let Err(e) = video_library::migrate_legacy_video_db(&pool, &fupan_dir).await {
+        eprintln!("视频库旧库合并失败（不影响本次命令）: {e:#}");
+    }
     let watch = watchlist::Watchlist::new(project_dir.clone());
     let api = config_api::ConfigApi::new(project_dir.clone());
 
@@ -384,7 +390,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 "platform": adapter.name(),
                 "url": url,
                 "count": persisted.len(),
-                "videos": persisted,
+                "videos": video_library::videos_compat_json(&persisted),
             });
             println!("{}", result);
         }
@@ -434,7 +440,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 .await?;
             println!(
                 "{}",
-                json!({"ok": true, "videos": videos, "count": videos.len()})
+                json!({"ok": true, "videos": video_library::videos_compat_json(&videos), "count": videos.len()})
             );
         }
         Command::TestEmail => {
