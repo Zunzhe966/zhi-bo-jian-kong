@@ -9,6 +9,7 @@ use tokio::process::Command;
 
 use crate::bilibili_auth::{browser_cookie_path, ensure_anon_cookie, ensure_user_cookie_file};
 use crate::db;
+use crate::process::{ChildError, ManagedChild};
 
 /// 下载器：优先走平台原生路径（B站浏览器内核提取直链 + ffmpeg 合流），
 /// 失败回退 yt-dlp。下载产物统一落到 downloads/短视频/<name>/。
@@ -99,21 +100,18 @@ impl Downloader {
                 }
             }
         }
-        let child = cmd
-            .stdin(Stdio::null())
+        cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .with_context(|| format!("启动 yt-dlp 失败: {ytdlp}"))?;
-
-        let output =
-            match tokio::time::timeout(Duration::from_secs(600), child.wait_with_output()).await {
-                Ok(output) => output?,
-                Err(_) => {
-                    // kill_on_drop 已开启：timeout 返回后 child 被丢弃即自动终止。
-                    anyhow::bail!("yt-dlp 下载超时（10 分钟），已终止任务");
-                }
-            };
+            .stderr(Stdio::piped());
+        let child =
+            ManagedChild::spawn(&mut cmd).with_context(|| format!("启动 yt-dlp 失败: {ytdlp}"))?;
+        let output = match child.wait_with_output(Duration::from_secs(600)).await {
+            Ok(output) => output,
+            Err(ChildError::Io(e)) => return Err(e).context("读取 yt-dlp 输出失败"),
+            Err(ChildError::Timeout) => {
+                anyhow::bail!("yt-dlp 下载超时（10 分钟），已终止整个进程组")
+            }
+        };
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -156,14 +154,22 @@ async fn bilibili_browser_download(project_dir: &Path, url: &str, dir: &Path) ->
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let status = match tokio::time::timeout(Duration::from_secs(60), cmd.status()).await {
-        Ok(Ok(status)) => status,
-        Ok(Err(e)) => {
+    let child = match ManagedChild::spawn(&mut cmd) {
+        Ok(child) => child,
+        Err(e) => {
             tracing::warn!("B站浏览器提取进程启动失败: {e}");
             return None;
         }
-        _ => {
+    };
+    let status = match child.wait(Duration::from_secs(60)).await {
+        Ok(status) => status,
+        Err(ChildError::Timeout) => {
             tracing::warn!("B站浏览器提取超时（60 秒）");
+            let _ = std::fs::remove_file(&out_file);
+            return None;
+        }
+        Err(ChildError::Io(e)) => {
+            tracing::warn!("B站浏览器提取进程读取失败: {e}");
             let _ = std::fs::remove_file(&out_file);
             return None;
         }
@@ -231,11 +237,11 @@ async fn bilibili_browser_download(project_dir: &Path, url: &str, dir: &Path) ->
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    let child = cmd.spawn().ok()?;
-    let output = tokio::time::timeout(Duration::from_secs(600), child.wait_with_output())
-        .await
-        .ok()?
-        .ok()?;
+    let child = ManagedChild::spawn(&mut cmd).ok()?;
+    let output = match child.wait_with_output(Duration::from_secs(600)).await {
+        Ok(output) => output,
+        Err(ChildError::Timeout) | Err(ChildError::Io(_)) => return None,
+    };
     if !output.status.success()
         || !std::fs::metadata(&output_file)
             .map(|m| m.is_file())

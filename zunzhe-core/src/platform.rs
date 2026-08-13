@@ -12,6 +12,7 @@ use crate::bilibili_auth::{
     ensure_user_cookie_file,
 };
 use crate::model::VideoMeta;
+use crate::process::{ChildError, ManagedChild};
 
 /// B 站 WBI 固定置换表（公开算法，非密钥）。
 const MIXIN_KEY_TAB: [usize; 64] = [
@@ -438,14 +439,12 @@ impl BilibiliAdapter {
         {
             cmd.args(["--cookies", anon.display().to_string().as_str()]);
         }
-        let child = cmd
-            .stdin(Stdio::null())
+        cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn();
-        if let Ok(child) = child {
-            match tokio::time::timeout(Duration::from_secs(30), child.wait_with_output()).await {
-                Ok(Ok(out)) => {
+            .stderr(Stdio::piped());
+        if let Ok(child) = ManagedChild::spawn(&mut cmd) {
+            match child.wait_with_output(Duration::from_secs(30)).await {
+                Ok(out) => {
                     let text = String::from_utf8_lossy(&out.stdout);
                     let ids: Vec<String> = text
                         .lines()
@@ -464,11 +463,11 @@ impl BilibiliAdapter {
                     }
                     return ids;
                 }
-                Ok(Err(e)) => {
+                Err(ChildError::Io(e)) => {
                     warn!("yt-dlp 读取输出失败: {e}");
                     return Vec::new();
                 }
-                Err(_) => {
+                Err(ChildError::Timeout) => {
                     warn!("yt-dlp 兜底超时（30 秒）");
                     return Vec::new();
                 }

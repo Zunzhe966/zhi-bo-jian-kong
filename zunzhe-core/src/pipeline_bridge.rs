@@ -8,6 +8,7 @@ use sqlx::sqlite::SqlitePool;
 use tokio::process::Command;
 
 use crate::config::Config;
+use crate::process::{ChildError, ManagedChild};
 
 /// 列出 fupan_output/<主播>/<场次>/ 下的复盘产物（与 Python notes 对齐）。
 pub fn list_notes(fupan_dir: &Path, name_filter: &str) -> Result<Vec<serde_json::Value>> {
@@ -141,17 +142,15 @@ impl PythonTool {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let child = cmd
-            .spawn()
+        let child = ManagedChild::spawn(&mut cmd)
             .with_context(|| format!("启动复盘流水线失败: {}", self.python.display()))?;
-        let output =
-            match tokio::time::timeout(Duration::from_secs(3600), child.wait_with_output()).await {
-                Ok(output) => output?,
-                Err(_) => {
-                    // kill_on_drop 已开启：timeout 返回后 child 被丢弃即自动终止。
-                    anyhow::bail!("复盘流水线超时（60 分钟），已终止任务");
-                }
-            };
+        let output = match child.wait_with_output(Duration::from_secs(3600)).await {
+            Ok(output) => output,
+            Err(ChildError::Io(e)) => return Err(e).context("读取复盘流水线输出失败"),
+            Err(ChildError::Timeout) => {
+                anyhow::bail!("复盘流水线超时（60 分钟），已终止整个进程组")
+            }
+        };
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !output.status.success() {

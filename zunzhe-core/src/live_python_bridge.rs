@@ -8,6 +8,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use tokio::process::Command;
 
 use crate::live_monitor::{LiveAdapter, LiveStatus};
+use crate::process::{ChildError, ManagedChild};
 
 /// 可交给旧 Python `src/spider.py` 解析的直播平台路由表。
 const PLATFORM_ROUTES: &[(&str, &str)] = &[
@@ -83,9 +84,12 @@ impl PythonLiveAdapter {
         mut cmd: Command,
     ) -> Pin<Box<dyn Future<Output = Result<LiveStatus>> + Send + '_>> {
         Box::pin(async move {
-            let output = tokio::time::timeout(self.timeout, cmd.output())
-                .await
-                .context("多平台直播桥接超时（25 秒）")??;
+            let child = ManagedChild::spawn(&mut cmd).context("启动多平台直播桥接失败")?;
+            let output = match child.wait_with_output(self.timeout).await {
+                Ok(output) => output,
+                Err(ChildError::Io(e)) => return Err(e).context("读取多平台直播桥接输出失败"),
+                Err(ChildError::Timeout) => anyhow::bail!("多平台直播桥接超时（25 秒）"),
+            };
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 bail!(

@@ -13,6 +13,7 @@ pub mod model;
 pub mod notify;
 pub mod pipeline_bridge;
 pub mod platform;
+pub mod process;
 pub mod scheduler;
 pub mod service;
 pub mod status_snapshot;
