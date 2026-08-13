@@ -17,7 +17,10 @@ impl IniFile {
         let mut data: HashMap<String, HashMap<String, String>> = HashMap::new();
         let mut current = String::new();
         for raw in text.lines() {
-            let line = raw.trim();
+            // 真实 config/config.ini 文件开头可能带 UTF-8 BOM（Windows 编辑器/旧版
+            // Python 保存结果），Python configparser 会按编码 BOM 自动忽略它。
+            // 如果不剥掉，第一行 `[录制设置]` 会被当成普通键，整段录制配置被漏读。
+            let line = raw.trim_start_matches('\u{feff}').trim();
             if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
                 continue;
             }
@@ -604,6 +607,15 @@ SMTP邮件服务器 = smtp.qq.com
             &ini.get("推送配置", "是否使用SMTP服务SSL加密(是/否)")
                 .unwrap()
         ));
+    }
+
+    #[test]
+    fn strips_utf8_bom_from_first_section() {
+        // Windows/旧 Python 保存的 config.ini 经常以 UTF-8 BOM 开头；若不剥离，
+        // 第一段会被 Rust 当成畸形内容整段忽略，导致录制设置等主配置静默回退默认值。
+        let text = "\u{feff}[录制设置]\n循环时间(秒) = 120\n";
+        let ini = IniFile::parse(text).unwrap();
+        assert_eq!(ini.get("录制设置", "循环时间(秒)").as_deref(), Some("120"));
     }
 
     #[test]
