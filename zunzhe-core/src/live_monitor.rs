@@ -348,6 +348,17 @@ impl<'a> LiveMonitor<'a> {
 
     pub async fn run_once(&self) -> Result<LiveCheckStats> {
         let mut stats = LiveCheckStats::default();
+        // 旧 Python 主程序允许用户单独关闭“开播/关播”通知，也允许“只推送不录制”。
+        // Rust 侧必须遵守这些开关，否则会把用户明确关掉的通知又发出去。
+        let begin_push = self
+            .config
+            .is_yes_main("推送配置", "开播推送开启(是/否)", true);
+        let over_push = self
+            .config
+            .is_yes_main("推送配置", "关播推送开启(是/否)", false);
+        let notify_only = self
+            .config
+            .is_yes_main("推送配置", "只推送通知不录制(是/否)", false);
         for item in self.watch.list_live() {
             if !item.enabled {
                 continue;
@@ -364,12 +375,42 @@ impl<'a> LiveMonitor<'a> {
             match tokio::time::timeout(Duration::from_secs(25), adapter.check(&item.url)).await {
                 Ok(Ok(status)) if status.is_live => {
                     stats.checked += 1;
-                    if let Err(e) = self.ensure_recording(&item, &status).await {
-                        warn!("[{}] 开始录制失败: {e:#}", item.remark);
+                    let anchor = if status.anchor_name.is_empty() {
+                        item.remark.clone()
+                    } else {
+                        status.anchor_name.clone()
+                    };
+                    let was_live = db::get_live_state(self.pool, &item.url)
+                        .await
+                        .unwrap_or(false);
+                    if !was_live && begin_push {
+                        self.send_live_alert(&item, &anchor, &status).await;
+                    }
+                    if let Err(e) = db::set_live_state(self.pool, &item.url, true).await {
+                        warn!("[{}] 记录开播状态失败: {e:#}", anchor);
+                    }
+                    if !notify_only && let Err(e) = self.ensure_recording(&item, &status).await {
+                        warn!("[{}] 开始录制失败: {e:#}", anchor);
                     }
                 }
                 Ok(Ok(_)) => {
                     stats.checked += 1;
+                    let was_live = db::get_live_state(self.pool, &item.url)
+                        .await
+                        .unwrap_or(false);
+                    if was_live && over_push {
+                        let anchor = db::active_live_session(self.pool, &item.url)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|s| s.anchor)
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| item.remark.clone());
+                        self.send_live_ended_alert(&item, &anchor).await;
+                    }
+                    if let Err(e) = db::set_live_state(self.pool, &item.url, false).await {
+                        warn!("[{}] 记录关播状态失败: {e:#}", item.remark);
+                    }
                     self.finish_if_stopped(&item.url).await;
                 }
                 Ok(Err(e)) => error!("[{}] 直播检测失败: {e:#}", item.remark),
@@ -377,6 +418,35 @@ impl<'a> LiveMonitor<'a> {
             }
         }
         Ok(stats)
+    }
+
+    async fn send_live_alert(&self, item: &LiveItem, anchor: &str, status: &LiveStatus) {
+        let title = "【尊者直播监控】主播开播".to_string();
+        let content = format!(
+            "主播：{}\n标题：{}\n链接：{}",
+            anchor, status.title, item.url
+        );
+        let channel = self.watch.notify_for(&item.url, anchor);
+        if let Err(e) = self
+            .notifier
+            .send("live_start", anchor, &title, &content, &channel)
+            .await
+        {
+            warn!("[{}] 开播通知失败: {e:#}", anchor);
+        }
+    }
+
+    async fn send_live_ended_alert(&self, item: &LiveItem, anchor: &str) {
+        let title = "【尊者直播监控】主播关播".to_string();
+        let content = format!("主播：{}\n链接：{}", anchor, item.url);
+        let channel = self.watch.notify_for(&item.url, anchor);
+        if let Err(e) = self
+            .notifier
+            .send("live_end", anchor, &title, &content, &channel)
+            .await
+        {
+            warn!("[{}] 关播通知失败: {e:#}", anchor);
+        }
     }
 
     async fn ensure_recording(&self, item: &LiveItem, status: &LiveStatus) -> Result<()> {
@@ -440,21 +510,6 @@ impl<'a> LiveMonitor<'a> {
         )
         .await?;
         info!("[{}] 开始录制 -> {}", anchor, output.display());
-
-        // 通知开播；失败只记日志，不阻断录制。
-        let title = "【尊者直播监控】主播开播".to_string();
-        let content = format!(
-            "主播：{}\n标题：{}\n链接：{}",
-            anchor, status.title, item.url
-        );
-        let channel = self.watch.notify_for(&item.url, &anchor);
-        if let Err(e) = self
-            .notifier
-            .send("live_start", &anchor, &title, &content, &channel)
-            .await
-        {
-            warn!("[{}] 开播通知失败: {e:#}", anchor);
-        }
 
         // 后台等待 ffmpeg 退出并回收状态，不阻塞检测循环。
         let pool = self.pool.clone();

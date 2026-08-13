@@ -83,6 +83,12 @@ CREATE TABLE IF NOT EXISTS live_sessions (
     updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
 CREATE INDEX IF NOT EXISTS idx_live_sessions_url ON live_sessions(url);
+
+CREATE TABLE IF NOT EXISTS live_states (
+    url        TEXT PRIMARY KEY,
+    is_live    INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
 "#;
 
 pub async fn init_db(pool: &SqlitePool) -> anyhow::Result<()> {
@@ -337,6 +343,33 @@ pub async fn active_live_session(
         error: row.try_get("error")?,
         updated_at: row.try_get("updated_at")?,
     }))
+}
+
+/// 读取某主播上一轮的直播状态，用于“开播/关播”边沿通知。
+pub async fn get_live_state(pool: &SqlitePool, url: &str) -> anyhow::Result<bool> {
+    let row: Option<i64> = sqlx::query_scalar("SELECT is_live FROM live_states WHERE url=?")
+        .bind(url)
+        .fetch_optional(pool)
+        .await
+        .context("查询直播状态")?;
+    Ok(row == Some(1))
+}
+
+/// 记录某主播当前直播状态；即使「只推送不录制」也能正确触发关播通知。
+pub async fn set_live_state(pool: &SqlitePool, url: &str, is_live: bool) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"INSERT INTO live_states (url, is_live, updated_at)
+           VALUES (?, ?, datetime('now','localtime'))
+           ON CONFLICT(url) DO UPDATE SET
+             is_live = excluded.is_live,
+             updated_at = excluded.updated_at"#,
+    )
+    .bind(url)
+    .bind(if is_live { 1i64 } else { 0i64 })
+    .execute(pool)
+    .await
+    .context("记录直播状态")?;
+    Ok(())
 }
 
 #[allow(dead_code)] // 直播状态机写入接口
@@ -998,5 +1031,16 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].status, "stopped");
         assert_eq!(sessions[0].error, "服务停止");
+    }
+
+    #[tokio::test]
+    async fn live_state_persists_and_updates() {
+        let pool = test_pool().await;
+        let url = "https://live.bilibili.com/320";
+        assert!(!get_live_state(&pool, url).await.unwrap());
+        set_live_state(&pool, url, true).await.unwrap();
+        assert!(get_live_state(&pool, url).await.unwrap());
+        set_live_state(&pool, url, false).await.unwrap();
+        assert!(!get_live_state(&pool, url).await.unwrap());
     }
 }
