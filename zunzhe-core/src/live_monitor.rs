@@ -419,8 +419,21 @@ impl<'a> LiveMonitor<'a> {
                     }
                     self.finish_if_stopped(&item.url).await;
                 }
-                Ok(Err(e)) => error!("[{}] 直播检测失败: {e:#}", item.remark),
-                Err(_) => error!("[{}] 直播检测超时（25 秒），跳过本轮", item.remark),
+                Ok(Err(e)) => {
+                    // 检测失败不能把旧的开播状态无限保留：网络抖动/平台限流都可能
+                    // 让某一轮失败，若不清除 DB 中的 live_state，下一轮一旦恢复就会
+                    // 被当成“刚刚开播”重复通知；旧录制会话也可能因主播已下播而残留。
+                    error!("[{}] 直播检测失败，本轮状态安全收敛: {e:#}", item.remark);
+                    stats.checked += 1;
+                    let _ = db::set_live_state(self.pool, &item.url, false).await;
+                    self.finish_if_stopped(&item.url).await;
+                }
+                Err(_) => {
+                    error!("[{}] 直播检测超时（25 秒），本轮状态安全收敛", item.remark);
+                    stats.checked += 1;
+                    let _ = db::set_live_state(self.pool, &item.url, false).await;
+                    self.finish_if_stopped(&item.url).await;
+                }
             }
         }
         Ok(stats)
@@ -990,6 +1003,55 @@ mod tests {
     fn clean_name_removes_invalid_chars() {
         assert_eq!(clean_name(" 主播/甲:测试? "), "主播_甲_测试");
         assert_eq!(clean_name("////"), "空白昵称");
+    }
+
+    #[tokio::test]
+    async fn failed_live_check_safely_converges_stale_state() {
+        // 失败适配器不能把上一轮的开播状态无限保留：否则下一次正常检查会把
+        // 一次短暂网络抖动误判成“刚刚开播”，重复通知并继续录制旧会话。
+        struct FailingAdapter;
+        impl LiveAdapter for FailingAdapter {
+            fn name(&self) -> &'static str {
+                "failing-test"
+            }
+
+            fn check<'a>(
+                &'a self,
+                _url: &'a str,
+            ) -> Pin<Box<dyn Future<Output = Result<LiveStatus>> + Send + 'a>> {
+                Box::pin(async { Err(anyhow!("simulated transient failure")) })
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("zunzhe-live-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::write(
+            dir.join("config").join("URL_config.ini"),
+            "https://live.example.test/1\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("config").join("config.ini"), "").unwrap();
+        std::fs::write(dir.join("config").join("fupan_config.ini"), "").unwrap();
+        let db_file = dir.join("live.db");
+        let pool = crate::db::open_pool(&db_file).await.unwrap();
+        let cfg = crate::config::Config::load(&dir).unwrap();
+        let watch = Watchlist::new(dir.clone());
+        crate::db::set_live_state(&pool, "https://live.example.test/1", true)
+            .await
+            .unwrap();
+
+        let monitor = LiveMonitor::new(&pool, &dir, &cfg, &watch);
+        let stats = monitor.run_once().await.unwrap();
+        assert_eq!(stats.checked, 1);
+        assert!(
+            !crate::db::get_live_state(&pool, "https://live.example.test/1")
+                .await
+                .unwrap(),
+            "检测失败后旧的 live_state 必须清除，避免后续误报开播"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
