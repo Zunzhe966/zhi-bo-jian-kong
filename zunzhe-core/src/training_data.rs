@@ -112,22 +112,25 @@ pub fn export(fupan_dir: &Path, anchor_filter: &str, output: &str) -> Result<Exp
                     }
                 }
 
-                if let Some(tf) = transcript_file
-                    && let Ok(transcript) = read_transcript(&tf)
-                {
-                    for seg in transcript.segments {
-                        transcript_segments += 1;
-                        records.push(TrainingRecord::Transcript {
-                            anchor: base.0.clone(),
-                            session: base.1.clone(),
-                            date: base.2.clone(),
-                            output_dir: base.3.clone(),
-                            source: transcript.source.clone(),
-                            language: transcript.language.clone(),
-                            text: seg.text,
-                            start_sec: seg.start,
-                            end_sec: seg.end,
-                        });
+                if let Some(tf) = transcript_file {
+                    match read_transcript(&tf) {
+                        Ok(transcript) => {
+                            for seg in transcript.segments {
+                                transcript_segments += 1;
+                                records.push(TrainingRecord::Transcript {
+                                    anchor: base.0.clone(),
+                                    session: base.1.clone(),
+                                    date: base.2.clone(),
+                                    output_dir: base.3.clone(),
+                                    source: transcript.source.clone(),
+                                    language: transcript.language.clone(),
+                                    text: seg.text,
+                                    start_sec: seg.start,
+                                    end_sec: seg.end,
+                                });
+                            }
+                        }
+                        Err(e) => errors.push(format!("{}: {}", tf.display(), e)),
                     }
                 }
             }
@@ -275,6 +278,36 @@ mod tests {
         assert_eq!(lines.len(), 3);
         assert!(lines[0].contains("\"anchor\":\"主播甲\""));
         assert!(lines[0].contains("\"date\":\""));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn malformed_transcript_is_reported_not_silently_dropped() {
+        let root = std::env::temp_dir().join(format!(
+            "zunzhe-training-bad-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let session = root.join("主播甲").join("bad-session");
+        fs::create_dir_all(&session).unwrap();
+        fs::write(session.join("bad-session.转写.json"), "{ not valid json").unwrap();
+
+        let out = root.join("out.jsonl");
+        let summary = export(&root, "", &out.display().to_string()).unwrap();
+        assert_eq!(summary.records, 0);
+        assert_eq!(summary.sessions, 1);
+        assert!(
+            summary
+                .errors
+                .iter()
+                .any(|e| e.contains("bad-session.转写.json")),
+            "转写解析错误必须进入 errors: {:?}",
+            summary.errors
+        );
         let _ = fs::remove_dir_all(&root);
     }
 }
