@@ -166,7 +166,7 @@ impl BilibiliAdapter {
             .map(|m| m.as_str().to_string())
     }
 
-    async fn view(&self, bvid: &str) -> VideoMeta {
+    async fn view(&self, bvid: &str) -> Option<VideoMeta> {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             reqwest::header::REFERER,
@@ -179,33 +179,31 @@ impl BilibiliAdapter {
             headers.insert(reqwest::header::COOKIE, v);
         }
         let url = format!("https://api.bilibili.com/x/web-interface/view?bvid={bvid}");
-        let fallback = VideoMeta {
-            id: bvid.to_string(),
-            platform: "bilibili".to_string(),
-            url: format!("https://www.bilibili.com/video/{bvid}"),
-            title: bvid.to_string(),
-            cover: String::new(),
-            published_at: String::new(),
-            duration: 0,
-        };
         let resp = match self.client.get(&url).headers(headers).send().await {
             Ok(r) => r,
-            Err(_) => return fallback,
+            Err(_) => return None,
         };
         let resp = match resp.error_for_status() {
             Ok(r) => r,
-            Err(_) => return fallback,
+            Err(_) => return None,
         };
         let data: serde_json::Value = match resp.json().await {
             Ok(d) => d,
-            Err(_) => return fallback,
+            Err(_) => return None,
         };
         if data.get("code").and_then(|c| c.as_i64()) != Some(0) {
-            return fallback;
+            return None;
         }
         let d = &data["data"];
+        if d.get("title")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .is_empty()
+        {
+            return None;
+        }
         let ts = d["pubdate"].as_i64().unwrap_or(0);
-        VideoMeta {
+        Some(VideoMeta {
             id: bvid.to_string(),
             platform: "bilibili".to_string(),
             url: format!("https://www.bilibili.com/video/{bvid}"),
@@ -220,7 +218,7 @@ impl BilibiliAdapter {
                 String::new()
             },
             duration: d["duration"].as_i64().unwrap_or(0),
-        }
+        })
     }
 }
 
@@ -257,7 +255,13 @@ impl Platform for BilibiliAdapter {
             }
             let mut out = Vec::with_capacity(tasks.len());
             for task in tasks {
-                out.push(task.await);
+                // 占位/补全失败的结果不能进入历史视频库，否则会伪装成“成功但空”。
+                if let Some(meta) = task.await {
+                    out.push(meta);
+                }
+            }
+            if out.is_empty() {
+                return Err(anyhow!("B站视频信息补全失败，请配置 B站 cookie 或稍后重试"));
             }
             Ok(out)
         })
