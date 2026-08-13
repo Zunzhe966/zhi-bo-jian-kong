@@ -359,13 +359,21 @@ impl BilibiliAdapter {
         // 官方接口优先使用 WBI 签名。无 Cookie 也可尝试，失败再走匿名/下方兜底。
         if let Ok(signed_query) = self.wbi_query(mid, count).await {
             let signed = format!("https://api.bilibili.com/x/space/wbi/arc/search?{signed_query}");
-            if let Ok(resp) = self
+            let Ok(resp) = self
                 .client
                 .get(&signed)
                 .headers(headers.clone())
                 .send()
                 .await
-                && let Ok(data) = resp.json::<serde_json::Value>().await
+            else {
+                return Vec::new();
+            };
+            // HTTP 层必须是成功状态，B站 412/5xx 时继续走 RSSHub/yt-dlp，
+            // 不能让 HTML 或错误 JSON 被当成“空列表”。
+            if !resp.status().is_success() {
+                return Vec::new();
+            }
+            if let Ok(data) = resp.json::<serde_json::Value>().await
                 && data.get("code").and_then(|c| c.as_i64()) == Some(0)
                 && let Some(rows) = data["data"]["list"]["vlist"].as_array()
             {
@@ -504,11 +512,11 @@ pub fn extract_bvids(text: &str) -> Vec<String> {
 }
 
 fn unix_to_date(ts: i64) -> String {
-    let days = ts / 86400;
-    let base = chrono::DateTime::from_timestamp(0, 0)
-        .map(|d| d + chrono::Duration::days(days))
-        .unwrap_or_else(|| chrono::DateTime::from_timestamp(ts, 0).unwrap_or_default());
-    base.format("%Y-%m-%d").to_string()
+    chrono::DateTime::from_timestamp(ts, 0)
+        .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).unwrap_or_default())
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d")
+        .to_string()
 }
 
 /// RSS/Atom 适配器：解析标题/链接/封面/日期，返回统一 VideoMeta。
@@ -870,7 +878,7 @@ mod tests {
 
     #[test]
     fn unix_ts_converts_date() {
-        assert_eq!(unix_to_date(1786550400), "2026-08-12");
+        assert_eq!(unix_to_date(1786464000), "2026-08-12");
     }
 
     #[test]
