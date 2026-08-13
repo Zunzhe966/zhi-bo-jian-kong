@@ -593,14 +593,16 @@ impl<'a> LiveMonitor<'a> {
             "copy".to_string(),
             "-c:a".to_string(),
             "copy".to_string(),
-            "-bsf:a".to_string(),
-            "aac_adtstoasc".to_string(),
         ];
         let ext = output
             .extension()
             .and_then(|s| s.to_str())
             .unwrap_or("ts")
             .to_lowercase();
+        let is_aac_container = is_aac_container(&ext);
+        if is_aac_container {
+            args.extend(["-bsf:a".to_string(), "aac_adtstoasc".to_string()]);
+        }
         if split_enabled {
             let split_time = self
                 .config
@@ -634,6 +636,7 @@ impl<'a> LiveMonitor<'a> {
                     args.extend(["-f".into(), "matroska".into()]);
                 }
                 "mp3" => {
+                    // 只取音频流并重编码为 MP3；不套 AAC bitstream filter。
                     args.extend([
                         "-map".into(),
                         "0:a".into(),
@@ -644,6 +647,7 @@ impl<'a> LiveMonitor<'a> {
                     ]);
                 }
                 "m4a" => {
+                    // m4a 容器配合 AAC bitstream filter，输出纯音频。
                     args.extend([
                         "-map".into(),
                         "0:a".into(),
@@ -661,6 +665,11 @@ impl<'a> LiveMonitor<'a> {
         }
         args
     }
+}
+
+/// mp4/m4a 用 AAC 的 bitstream filter；ts/flv/mkv 和 mp3 不需要。
+fn is_aac_container(ext: &str) -> bool {
+    matches!(ext, "mp4" | "m4a")
 }
 
 fn adapter_name(url: &str) -> &'static str {
@@ -939,5 +948,15 @@ mod tests {
     fn terminate_process_does_not_panic() {
         // 不存在的 pid 调用不应 panic；真实清理按 DB 会话驱动。
         terminate_process(u32::MAX);
+    }
+
+    #[test]
+    fn aac_bitstream_filter_only_applies_to_mp4_and_m4a() {
+        assert!(is_aac_container("mp4"));
+        assert!(is_aac_container("m4a"));
+        assert!(!is_aac_container("mp3"));
+        assert!(!is_aac_container("flv"));
+        assert!(!is_aac_container("mkv"));
+        assert!(!is_aac_container("ts"));
     }
 }
