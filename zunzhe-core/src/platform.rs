@@ -454,7 +454,19 @@ impl Platform for RssAdapter {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<VideoMeta>>> + Send + 'a>> {
         Box::pin(async move {
             let resp = self.client.get(url).send().await?;
+            // 非成功状态或非 XML/HTML 正文都是“没拿到有效订阅”，必须明确失败。
+            // 若把空列表当成正常基线，用户会永远收不到该博主的新视频通知。
+            if !resp.status().is_success() {
+                return Err(anyhow!(
+                    "RSS 源请求失败（HTTP {}）: {url}",
+                    resp.status().as_u16()
+                ));
+            }
             let text = resp.text().await?;
+            let trimmed = text.trim_start();
+            if !trimmed.starts_with('<') {
+                return Err(anyhow!("RSS 源未返回 XML/HTML 内容: {url}"));
+            }
             Ok(parse_rss(&text).into_iter().take(count as usize).collect())
         })
     }
@@ -475,7 +487,7 @@ pub fn parse_rss(text: &str) -> Vec<VideoMeta> {
         let cover = tag_attr_case(&item, "url")
             .or_else(|| tag_text_case(&item, "enclosure"))
             .unwrap_or_default();
-        let published_at = tag_text_case(&item, "pubdate").unwrap_or_default();
+        let published_at = normalize_rss_date(tag_text_case(&item, "pubdate"));
         out.push(VideoMeta {
             id: guid,
             platform: "rss".to_string(),
@@ -501,9 +513,9 @@ pub fn parse_rss(text: &str) -> Vec<VideoMeta> {
             let cover = tag_attr_case(&entry, "url")
                 .or_else(|| tag_text_case(&entry, "enclosure"))
                 .unwrap_or_default();
-            let published_at = tag_text_case(&entry, "published")
-                .or_else(|| tag_text_case(&entry, "updated"))
-                .unwrap_or_default();
+            let published_at = normalize_rss_date(
+                tag_text_case(&entry, "published").or_else(|| tag_text_case(&entry, "updated")),
+            );
             out.push(VideoMeta {
                 id: guid,
                 platform: "rss".to_string(),
@@ -516,6 +528,39 @@ pub fn parse_rss(text: &str) -> Vec<VideoMeta> {
         }
     }
     out
+}
+
+/// 把 RSS 2.0 / Atom 常见日期规范成 `YYYY-MM-DD`，失败时回退 `YYYY-MM-DD` 前缀。
+/// 与旧 Python `video_monitor.py` 的 `_rss_date` 语义保持一致。
+fn normalize_rss_date(raw: Option<String>) -> String {
+    let raw = raw.unwrap_or_default();
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return String::new();
+    }
+    // RFC 2822 / RFC 1123 日期（RSS 2.0 常用）。
+    let rfc = chrono::DateTime::parse_from_rfc2822(raw);
+    if let Ok(dt) = rfc {
+        return dt.format("%Y-%m-%d").to_string();
+    }
+    // ISO 8601（Atom 常用），含 `Z` 或时区偏移。
+    let iso = chrono::DateTime::parse_from_rfc3339(raw);
+    if let Ok(dt) = iso {
+        return dt.format("%Y-%m-%d").to_string();
+    }
+    // 兼容无时区的基础日期时间。
+    let plain = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S")
+        .map(|dt| dt.format("%Y-%m-%d").to_string());
+    if let Ok(date) = plain {
+        return date;
+    }
+    // 已无法识别时，保留前 10 位；连日期前缀都没有则返回空串。
+    let date = raw.chars().take(10).collect::<String>();
+    if date.len() == 10 && date.chars().nth(4) == Some('-') && date.chars().nth(7) == Some('-') {
+        date
+    } else {
+        String::new()
+    }
 }
 
 fn split_original(text: &str, tag: &str) -> Vec<String> {
@@ -617,7 +662,25 @@ mod tests {
         assert_eq!(items[0].title, "Atom 视频");
         assert_eq!(items[0].url, "https://x.test/1");
         assert_eq!(items[0].cover, "https://x.test/1.jpg");
-        assert_eq!(items[0].published_at, "2026-08-12T10:00:00+08:00");
+        assert_eq!(items[0].published_at, "2026-08-12");
+    }
+
+    #[test]
+    fn normalizes_rss_and_atom_dates() {
+        assert_eq!(
+            normalize_rss_date(Some("Wed, 12 Aug 2026 10:00:00 +0800".to_string())),
+            "2026-08-12"
+        );
+        assert_eq!(
+            normalize_rss_date(Some("2026-08-12T10:00:00+08:00".to_string())),
+            "2026-08-12"
+        );
+        assert_eq!(
+            normalize_rss_date(Some("2026-08-12T10:00:00".to_string())),
+            "2026-08-12"
+        );
+        assert_eq!(normalize_rss_date(Some("not a date".to_string())), "");
+        assert_eq!(normalize_rss_date(None), "");
     }
 
     #[test]
