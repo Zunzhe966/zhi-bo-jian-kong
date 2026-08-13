@@ -50,7 +50,7 @@ pub fn write_app_prefs(project_dir: &Path, updates: &Value) -> Result<Value> {
         std::fs::create_dir_all(parent)?;
     }
     let text = serde_json::to_string_pretty(&prefs)?;
-    std::fs::write(&path, text + "\n")?;
+    crate::config::atomic_write(&path, text + "\n")?;
     Ok(prefs)
 }
 

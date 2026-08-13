@@ -260,7 +260,7 @@ impl Watchlist {
             fs::create_dir_all(parent)?;
         }
         let text = serde_json::to_string_pretty(prefs).context("序列化监控偏好")?;
-        fs::write(&path, text + "\n").context("写监控偏好")
+        crate::config::atomic_write(&path, text + "\n").context("写监控偏好")
     }
 }
 
@@ -280,7 +280,7 @@ fn write_lines(path: &Path, lines: &[String]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, lines.join("\n") + "\n")
+    crate::config::atomic_write(path, lines.join("\n") + "\n")
         .with_context(|| format!("写监控列表失败: {}", path.display()))
 }
 

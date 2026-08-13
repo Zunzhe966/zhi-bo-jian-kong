@@ -976,7 +976,7 @@ pub async fn record_live_once(
     pid_for_cleanup.store(pid, std::sync::atomic::Ordering::SeqCst);
     if pid > 0 {
         let _ = std::fs::create_dir_all(&cleanup_path);
-        let _ = std::fs::write(&cleanup_file, pid.to_string());
+        let _ = crate::config::atomic_write(&cleanup_file, pid.to_string());
     }
     // 异步等待 Ctrl-C/SIGTERM；到点后结束 ffmpeg 进程组，避免孤儿。
     let cleanup_pid_2 = pid_for_cleanup.clone();

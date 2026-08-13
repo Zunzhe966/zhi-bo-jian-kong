@@ -189,7 +189,7 @@ pub async fn cache_cover(fupan_dir: &Path, cover_url: &str, video_id: &str) -> R
     let dest = dest.clone();
     match client.get(&cover).send().await {
         Ok(resp) if resp.status().is_success() => match resp.bytes().await {
-            Ok(bytes) if !bytes.is_empty() => Ok(fs::write(&dest, bytes)
+            Ok(bytes) if !bytes.is_empty() => Ok(crate::config::atomic_write(&dest, bytes)
                 .map(|_| dest.display().to_string())
                 .unwrap_or_else(|_| cover.clone())),
             _ => Ok(cover),

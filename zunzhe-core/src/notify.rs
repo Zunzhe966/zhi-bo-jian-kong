@@ -334,7 +334,8 @@ impl<'a> Notifier<'a> {
             "body": content.chars().take(500).collect::<String>(),
         }));
         let tail = items.split_off(items.len().saturating_sub(30));
-        let _ = std::fs::write(&path, serde_json::to_string(&tail).unwrap_or_default());
+        let _ =
+            crate::config::atomic_write(&path, serde_json::to_string(&tail).unwrap_or_default());
     }
 
     /// 仅记录一次测试事件。发送成功与否不在此处重复判断。

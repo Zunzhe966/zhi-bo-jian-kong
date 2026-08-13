@@ -589,12 +589,12 @@ pub fn patch_ini_file(path: &Path, pairs: &[(&str, &str, &str)]) -> Result<()> {
     Ok(())
 }
 
-/// 原子写文本文件：先写同目录临时文件并 fsync，再 rename 覆盖目标。
+/// 原子写文件：先写同目录临时文件并 fsync，再 rename 覆盖目标。
 ///
 /// 配置文件包含 QQ 授权码等敏感信息，任何情况下都不能因为写入中断而变成
 /// 半截文件。临时文件放在同一目录，保证 rename 不跨文件系统，Unix/Windows
 /// 都具备替换语义；失败时原始文件保持原样。
-fn atomic_write(path: &Path, contents: String) -> std::io::Result<()> {
+pub fn atomic_write(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
@@ -615,7 +615,7 @@ fn atomic_write(path: &Path, contents: String) -> std::io::Result<()> {
             .write(true)
             .create_new(true)
             .open(&tmp)?;
-        file.write_all(contents.as_bytes())?;
+        file.write_all(contents.as_ref())?;
         file.flush()?;
         file.sync_all()?;
         if let Some(permissions) = original_permissions {

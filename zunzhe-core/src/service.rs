@@ -246,7 +246,7 @@ pub fn touch_heartbeat(project_dir: &Path) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(&path, chrono::Local::now().to_rfc3339());
+    let _ = crate::config::atomic_write(&path, chrono::Local::now().to_rfc3339());
 }
 
 fn heartbeat_file(project_dir: &Path) -> std::path::PathBuf {
@@ -410,7 +410,7 @@ fn write_pid(project_dir: &Path, name: &str, pid: u32) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(path, pid.to_string());
+    let _ = crate::config::atomic_write(&path, pid.to_string());
 }
 
 /// 供启动脚本/桌面端写入 Rust daemon pid，保持同一查询接口。
@@ -426,7 +426,7 @@ pub fn write_rust_live_pid(project_dir: &Path, url: &str, pid: u32) {
         .join("rust_live");
     let _ = std::fs::create_dir_all(&dir);
     let name = rust_live_pid_name(url);
-    let _ = std::fs::write(dir.join(format!("{name}.pid")), pid.to_string());
+    let _ = crate::config::atomic_write(&dir.join(format!("{name}.pid")), pid.to_string());
 }
 
 /// 删除某个直播地址对应的录制 pid 文件，供会话结束、启动失败或兜底清理使用。

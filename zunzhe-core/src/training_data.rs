@@ -142,7 +142,7 @@ pub fn export(fupan_dir: &Path, anchor_filter: &str, output: &str) -> Result<Exp
         content.push_str(&serde_json::to_string(record)?);
         content.push('\n');
     }
-    fs::write(&out_path, content)
+    crate::config::atomic_write(&out_path, content)
         .with_context(|| format!("写 JSONL 失败: {}", out_path.display()))?;
 
     Ok(ExportSummary {

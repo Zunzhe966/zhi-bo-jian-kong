@@ -101,7 +101,7 @@ pub fn ensure_user_cookie_file(project_dir: &Path, cookie: &str) -> Option<PathB
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    std::fs::write(&path, text).ok()?;
+    crate::config::atomic_write(&path, text).ok()?;
     Some(path)
 }
 
@@ -141,7 +141,7 @@ pub async fn ensure_anon_cookie(project_dir: &Path) -> Option<PathBuf> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if std::fs::write(&path, text).is_ok() {
+    if crate::config::atomic_write(&path, text).is_ok() {
         Some(path)
     } else {
         None
