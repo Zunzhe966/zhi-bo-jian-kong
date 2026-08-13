@@ -171,6 +171,9 @@ fn first_glob(dir: &Path, pattern: &str) -> Option<PathBuf> {
 fn read_points(path: &Path) -> Result<Vec<KnowledgePoint>> {
     let text = fs::read_to_string(path)?;
     let raw: Vec<serde_json::Value> = serde_json::from_str(&text)?;
+    if raw.is_empty() {
+        anyhow::bail!("知识点文件为空数组");
+    }
     let mut out = Vec::new();
     for v in raw {
         let title = v
@@ -306,6 +309,36 @@ mod tests {
                 .iter()
                 .any(|e| e.contains("bad-session.转写.json")),
             "转写解析错误必须进入 errors: {:?}",
+            summary.errors
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn empty_or_non_array_points_file_is_reported() {
+        let root = std::env::temp_dir().join(format!(
+            "zunzhe-training-empty-points-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let session = root.join("主播甲").join("empty-points");
+        fs::create_dir_all(&session).unwrap();
+        fs::write(session.join("empty-points.知识点.json"), "[]").unwrap();
+
+        let out = root.join("out.jsonl");
+        let summary = export(&root, "", &out.display().to_string()).unwrap();
+        assert_eq!(summary.sessions, 1);
+        assert_eq!(summary.knowledge, 0);
+        assert!(
+            summary
+                .errors
+                .iter()
+                .any(|e| e.contains("empty-points.知识点.json")),
+            "空知识点文件必须与旧 Python 一样进入 errors: {:?}",
             summary.errors
         );
         let _ = fs::remove_dir_all(&root);
