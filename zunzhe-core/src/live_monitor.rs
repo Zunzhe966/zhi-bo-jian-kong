@@ -16,7 +16,7 @@ use crate::config::Config;
 use crate::db;
 use crate::live_python_bridge::PythonLiveAdapter;
 use crate::notify::Notifier;
-use crate::service::write_rust_live_pid;
+use crate::service::{remove_rust_live_pid, write_rust_live_pid};
 use crate::watchlist::{LiveItem, Watchlist};
 
 /// 平台无关的直播状态。适配器只输出这一种结构。
@@ -478,6 +478,7 @@ impl<'a> LiveMonitor<'a> {
                 warn!("[{}] 检测到录制进程已退出，结束旧会话", item.remark);
                 db::end_live_session(self.pool, session.id, "interrupted", "录制进程已退出")
                     .await?;
+                remove_rust_live_pid(self.project_dir, &item.url);
             }
         }
         let anchor = if status.anchor_name.is_empty() {
@@ -517,7 +518,7 @@ impl<'a> LiveMonitor<'a> {
             .with_context(|| format!("启动 ffmpeg 失败，请检查 ffmpeg: {}", ffmpeg.display()))?;
         let pid = child.id().unwrap_or(0);
         write_rust_live_pid(self.project_dir, &item.url, pid);
-        let session_id = db::start_live_session(
+        let session_id = match db::start_live_session(
             self.pool,
             &item.url,
             &anchor,
@@ -527,13 +528,28 @@ impl<'a> LiveMonitor<'a> {
             pid,
             &output.display().to_string(),
         )
-        .await?;
+        .await
+        {
+            Ok(session_id) => session_id,
+            Err(e) => {
+                // ffmpeg 已启动但 DB 写入失败：不能让一个无法被状态机追踪的
+                // 录制进程变成孤儿。先终止进程组并清理 pid 文件，再返回错误。
+                if pid > 0 {
+                    terminate_process(pid);
+                    let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+                }
+                remove_rust_live_pid(self.project_dir, &item.url);
+                return Err(e);
+            }
+        };
         info!("[{}] 开始录制 -> {}", anchor, output.display());
 
         // 后台等待 ffmpeg 退出并回收状态，不阻塞检测循环。
         let pool = self.pool.clone();
         let anchor_name = anchor.clone();
         let output_path = output.display().to_string();
+        let project_dir = self.project_dir.to_path_buf();
+        let item_url = item.url.clone();
         let split_enabled = self.config.is_yes("录制设置", "分段录制是否开启", false);
         tokio::spawn(async move {
             // 等待 ffmpeg 退出后回收状态。若会话已被 stop_all_recordings 结束
@@ -545,11 +561,13 @@ impl<'a> LiveMonitor<'a> {
                 .unwrap_or(false);
             if !still_recording {
                 info!("[{}] 会话已被外部停止，跳过状态回收", anchor_name);
+                remove_rust_live_pid(&project_dir, &item_url);
                 return;
             }
             if code == 0 {
                 info!("[{}] 录制正常结束", anchor_name);
                 let _ = db::end_live_session(&pool, session_id, "done", "").await;
+                remove_rust_live_pid(&project_dir, &item_url);
                 // 录制结束后入队复盘任务；失败只记日志，不拖垮 daemon。
                 let media = if split_enabled {
                     find_latest_segment(&output_path).unwrap_or_else(|| output_path.clone())
@@ -566,6 +584,7 @@ impl<'a> LiveMonitor<'a> {
                 let msg = format!("录制退出 code={code}: {}", last_log_lines(&log, 200));
                 error!("[{}] {msg}", anchor_name);
                 let _ = db::end_live_session(&pool, session_id, "failed", &msg).await;
+                remove_rust_live_pid(&project_dir, &item_url);
             }
         });
         Ok(())
@@ -578,6 +597,7 @@ impl<'a> LiveMonitor<'a> {
                 return;
             }
             let _ = db::end_live_session(self.pool, session.id, "interrupted", "直播已结束").await;
+            remove_rust_live_pid(self.project_dir, url);
             info!("[{}] 直播结束，会话已回收", session.anchor);
         }
     }
@@ -593,6 +613,7 @@ impl<'a> LiveMonitor<'a> {
                 info!("[{}] 已停止录制进程 pid={}", session.anchor, session.pid);
             }
             let _ = db::end_live_session(self.pool, session.id, "stopped", "服务停止").await;
+            remove_rust_live_pid(self.project_dir, &session.url);
         }
         Ok(stopped)
     }

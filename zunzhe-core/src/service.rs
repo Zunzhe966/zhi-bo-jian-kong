@@ -429,6 +429,16 @@ pub fn write_rust_live_pid(project_dir: &Path, url: &str, pid: u32) {
     let _ = std::fs::write(dir.join(format!("{name}.pid")), pid.to_string());
 }
 
+/// 删除某个直播地址对应的录制 pid 文件，供会话结束、启动失败或兜底清理使用。
+pub fn remove_rust_live_pid(project_dir: &Path, url: &str) {
+    let path = project_dir
+        .join("fupan_output")
+        .join("run")
+        .join("rust_live")
+        .join(format!("{}.pid", rust_live_pid_name(url)));
+    let _ = std::fs::remove_file(path);
+}
+
 /// 直播地址 -> 录制 pid 文件名（同一 URL 稳定映射，供停止兜底清理）。
 pub fn rust_live_pid_name(text: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
@@ -534,12 +544,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         write_rust_live_pid(&dir, "https://live.bilibili.com/320", 12345);
-        let file = std::fs::read_dir(dir.join("fupan_output").join("run").join("rust_live"))
+        let pid_dir = dir.join("fupan_output").join("run").join("rust_live");
+        let file = std::fs::read_dir(&pid_dir)
             .unwrap()
             .next()
             .unwrap()
             .unwrap();
         assert_eq!(std::fs::read_to_string(file.path()).unwrap(), "12345");
+        remove_rust_live_pid(&dir, "https://live.bilibili.com/320");
+        assert!(
+            std::fs::read_dir(&pid_dir).unwrap().next().is_none(),
+            "remove_rust_live_pid 应删除同一个 URL 对应的 pid 文件"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
