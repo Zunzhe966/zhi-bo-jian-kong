@@ -5,9 +5,11 @@ use lettre::transport::smtp::SmtpTransport;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, Transport};
 use serde::Serialize;
+use serde_json::Value;
 use sqlx::sqlite::SqlitePool;
 use std::time::Duration;
 
+use crate::app_prefs;
 use crate::config::{Config, EmailSettings};
 use crate::db;
 
@@ -104,11 +106,30 @@ impl Channel {
 pub struct Notifier<'a> {
     pool: &'a SqlitePool,
     config: &'a Config,
+    project_dir: &'a std::path::Path,
 }
 
 impl<'a> Notifier<'a> {
     pub fn new(pool: &'a SqlitePool, config: &'a Config) -> Self {
-        Self { pool, config }
+        Self {
+            pool,
+            config,
+            project_dir: std::path::Path::new("."),
+        }
+    }
+
+    /// 带项目目录的构造器；桌面端本地通知队列依赖项目目录定位
+    /// `fupan_output/run/pending_notify.json`。
+    pub fn for_project(
+        pool: &'a SqlitePool,
+        config: &'a Config,
+        project_dir: &'a std::path::Path,
+    ) -> Self {
+        Self {
+            pool,
+            config,
+            project_dir,
+        }
     }
 
     pub async fn send(
@@ -137,6 +158,11 @@ impl<'a> Notifier<'a> {
             }
             let id =
                 db::add_notify(self.pool, event, anchor, title, content, channel.name()).await?;
+            if channel == Channel::Email {
+                // 与旧 Python 一样，无论远程邮件是否最终成功，都先写本地队列，
+                // 由 Electron 桌面端负责弹系统通知，避免代理/额度失败时完全无提醒。
+                Self::queue_local(self.project_dir, title, content);
+            }
             if channel == Channel::None {
                 // “不通知”本身是有效投递策略：保留审计记录但立即完成。
                 db::mark_notify_done(self.pool, id).await?;
@@ -164,6 +190,7 @@ impl<'a> Notifier<'a> {
                 db::fail_notify(self.pool, id).await?;
             }
         }
+        // 本地队列只在选中的 Email 通道中写入；“不通知”或仅 HTTPS 通道不会弹窗。
         Ok(any_sent)
     }
 
@@ -202,6 +229,7 @@ impl<'a> Notifier<'a> {
         let channels = self.config.push_channels();
         let mut sent = false;
         let mut channel_names = Vec::new();
+        Self::queue_local(self.project_dir, title, content);
 
         if self.config.email_configured() {
             let settings = self.config.email_settings();
@@ -254,6 +282,47 @@ impl<'a> Notifier<'a> {
             sent,
             channels: channel_names,
         })
+    }
+
+    /// 把一条消息追加到 Electron 本地通知队列。
+    ///
+    /// 桌面端 `main.cjs` 每 4 秒读取 `fupan_output/run/pending_notify.json` 并弹出
+    /// 系统通知；队列最多保留最近 30 条，与旧 Python `_queue_local` 对齐。
+    fn queue_local(project_dir: &std::path::Path, title: &str, content: &str) {
+        if project_dir == std::path::Path::new(".") {
+            // `new` 构造器仅用于不依赖文件系统的单元测试；真实调用必须使用
+            // `for_project`。这里直接返回，避免测试污染源码目录。
+            return;
+        }
+        if app_prefs::read_app_prefs(project_dir)
+            .get("localNotify")
+            .and_then(Value::as_bool)
+            == Some(false)
+        {
+            return;
+        }
+
+        let path = project_dir
+            .join("fupan_output")
+            .join("run")
+            .join("pending_notify.json");
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mut items: Vec<Value> = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default();
+        items.push(serde_json::json!({
+            "id": format!("{:.3}", std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or_default()),
+            "title": title.chars().take(64).collect::<String>(),
+            "body": content.chars().take(500).collect::<String>(),
+        }));
+        let tail = items.split_off(items.len().saturating_sub(30));
+        let _ = std::fs::write(&path, serde_json::to_string(&tail).unwrap_or_default());
     }
 
     /// 仅记录一次测试事件。发送成功与否不在此处重复判断。
@@ -445,22 +514,24 @@ pub async fn send_pushplus(token: &str, title: &str, content: &str) -> bool {
         tracing::warn!("PushPlus 客户端初始化失败");
         return false;
     };
-    let result = client
-        .post("https://www.pushplus.plus/send")
-        .json(&serde_json::json!({"token": token, "title": title, "content": content}))
-        .send()
-        .await;
-    let Ok(resp) = result else {
-        tracing::warn!("PushPlus 请求失败");
-        return false;
-    };
-    match resp.json::<serde_json::Value>().await {
-        Ok(v) => v.get("code").and_then(|c| c.as_i64()) == Some(200),
-        Err(e) => {
-            tracing::warn!("PushPlus 响应解析失败: {e:#}");
-            false
+    let mut success = false;
+    for item in split_credentials(token) {
+        let result = client
+            .post("https://www.pushplus.plus/send")
+            .json(&serde_json::json!({"token": item, "title": title, "content": content}))
+            .send()
+            .await;
+        let Ok(resp) = result else {
+            tracing::warn!("PushPlus 请求失败");
+            continue;
+        };
+        match resp.json::<serde_json::Value>().await {
+            Ok(v) if v.get("code").and_then(|c| c.as_i64()) == Some(200) => success = true,
+            Ok(_) => {}
+            Err(e) => tracing::warn!("PushPlus 响应解析失败: {e:#}"),
         }
     }
+    success
 }
 
 /// Bark 推送：`code == 200` 视为成功。
@@ -475,33 +546,35 @@ pub async fn send_bark(api: &str, title: &str, content: &str) -> bool {
         tracing::warn!("Bark 客户端初始化失败");
         return false;
     };
-    let result = client
-        .post(api)
-        .json(&serde_json::json!({
-            "title": title,
-            "body": content,
-            "level": "active",
-            "badge": 1,
-            "autoCopy": 1,
-            "sound": "",
-            "icon": "",
-            "group": "",
-            "isArchive": 1,
-            "url": ""
-        }))
-        .send()
-        .await;
-    let Ok(resp) = result else {
-        tracing::warn!("Bark 请求失败");
-        return false;
-    };
-    match resp.json::<serde_json::Value>().await {
-        Ok(v) => v.get("code").and_then(|c| c.as_i64()) == Some(200),
-        Err(e) => {
-            tracing::warn!("Bark 响应解析失败: {e:#}");
-            false
+    let mut success = false;
+    for item in split_credentials(api) {
+        let result = client
+            .post(item)
+            .json(&serde_json::json!({
+                "title": title,
+                "body": content,
+                "level": "active",
+                "badge": 1,
+                "autoCopy": 1,
+                "sound": "",
+                "icon": "",
+                "group": "",
+                "isArchive": 1,
+                "url": ""
+            }))
+            .send()
+            .await;
+        let Ok(resp) = result else {
+            tracing::warn!("Bark 请求失败");
+            continue;
+        };
+        match resp.json::<serde_json::Value>().await {
+            Ok(v) if v.get("code").and_then(|c| c.as_i64()) == Some(200) => success = true,
+            Ok(_) => {}
+            Err(e) => tracing::warn!("Bark 响应解析失败: {e:#}"),
         }
     }
+    success
 }
 
 /// ntfy 推送：服务端响应无 `error` 字段视为成功；多个地址以英文逗号分隔。
@@ -517,7 +590,7 @@ pub async fn send_ntfy(api: &str, title: &str, content: &str) -> bool {
         return false;
     };
     let mut success = false;
-    for endpoint in api.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+    for endpoint in split_credentials(api) {
         let (server, topic) = match endpoint.rsplit_once('/') {
             Some(pair) => pair,
             None => {
@@ -555,6 +628,17 @@ pub async fn send_ntfy(api: &str, title: &str, content: &str) -> bool {
     success
 }
 
+/// 与旧 Python `msg_push` 对齐：PushPlus/Bark/ntfy 都允许用英文或中文逗号
+/// 一次配置多个目标，发送时任一目标成功即视为该通道成功。
+fn split_credentials(value: &str) -> Vec<String> {
+    value
+        .split([',', '，'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -568,6 +652,38 @@ mod tests {
         assert_eq!(Channel::parse("ntfy"), Channel::Ntfy);
         assert_eq!(Channel::parse("不通知"), Channel::None);
         assert_eq!(Channel::parse("跟随全局"), Channel::Email);
+    }
+
+    #[test]
+    fn splits_mixed_comma_credentials() {
+        assert_eq!(
+            split_credentials(" a , b ， c "),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        assert!(split_credentials("").is_empty());
+    }
+
+    #[test]
+    fn local_notify_can_be_disabled_in_prefs() {
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-notify-local-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        crate::app_prefs::write_app_prefs(&dir, &serde_json::json!({"localNotify": false}))
+            .unwrap();
+        Notifier::queue_local(&dir, "标题", "内容");
+        assert!(
+            !dir.join("fupan_output")
+                .join("run")
+                .join("pending_notify.json")
+                .exists()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

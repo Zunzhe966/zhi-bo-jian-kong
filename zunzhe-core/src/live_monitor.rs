@@ -342,7 +342,7 @@ impl<'a> LiveMonitor<'a> {
             project_dir,
             config,
             watch,
-            notifier: Notifier::new(pool, config),
+            notifier: Notifier::for_project(pool, config, project_dir),
         }
     }
 

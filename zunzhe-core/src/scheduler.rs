@@ -314,7 +314,7 @@ async fn tick(
     config: &Config,
 ) -> Result<TickStats> {
     // 0. 重试上次发送失败/超时的邮件通知；失败保留 pending 下一轮再试。
-    let notifier = Notifier::new(pool, config);
+    let notifier = Notifier::for_project(pool, config, project_dir);
     let notified_retry = notifier.flush_pending(50).await.unwrap_or(0);
 
     // 1. 下载队列由独立后台 worker 处理，不在 70 秒 tick 里同步执行。

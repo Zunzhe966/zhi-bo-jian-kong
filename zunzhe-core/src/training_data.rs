@@ -2,7 +2,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use chrono::Local;
 
 use crate::model::{KnowledgePoint, TrainingRecord, Transcript, TranscriptSegment};
 
@@ -69,7 +68,25 @@ pub fn export(fupan_dir: &Path, anchor_filter: &str, output: &str) -> Result<Exp
                     continue;
                 }
                 sessions += 1;
-                let date = Local::now().format("%Y-%m-%d").to_string();
+                let date = session_dir
+                    .metadata()
+                    .ok()
+                    .and_then(|meta| meta.modified().ok())
+                    .and_then(|modified| {
+                        chrono::DateTime::from_timestamp(
+                            modified
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .ok()?
+                                .as_secs() as i64,
+                            0,
+                        )
+                        .map(|dt| {
+                            dt.with_timezone(&chrono::Local)
+                                .format("%Y-%m-%d")
+                                .to_string()
+                        })
+                    })
+                    .unwrap_or_default();
                 let output_dir = session_dir.display().to_string();
                 let base = (anchor.clone(), session.clone(), date, output_dir);
 

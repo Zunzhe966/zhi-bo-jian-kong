@@ -133,6 +133,7 @@ pub fn tools_list() -> Vec<Value> {
         json!({"name":"download_video","description":"下载视频到 downloads/短视频/","inputSchema":{"type":"object","properties":{"url":{"type":"string"},"name":{"type":"string"}},"required":["url"]}}),
         json!({"name":"video_download","description":"下载视频到 downloads/短视频/（Python 兼容别名）","inputSchema":{"type":"object","properties":{"url":{"type":"string"},"name":{"type":"string"}},"required":["url"]}}),
         json!({"name":"video_library","description":"查询视频库","inputSchema":{"type":"object","properties":{"source_url":{"type":"string"},"downloaded_only":{"type":"boolean"}}}}),
+        json!({"name":"status","description":"桌面端状态快照（含最近录制、复盘产物与目录）","inputSchema":{"type":"object","properties":{}}}),
         json!({"name":"export_training_data","description":"导出训练数据 JSONL","inputSchema":{"type":"object","properties":{"anchor":{"type":"string"},"output":{"type":"string"}}}}),
         json!({"name":"email_status","description":"查看邮箱配置状态","inputSchema":{"type":"object","properties":{}}}),
         json!({"name":"email_setup","description":"写入 QQ 邮箱配置","inputSchema":{"type":"object","properties":{"email":{"type":"string"},"auth":{"type":"string"},"to":{"type":"string"}},"required":["email","auth"]}}),
@@ -166,13 +167,12 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
         project_dir,
     } = ctx;
     match name {
-        "live_status" => {
-            let videos = library.list("", "", false).await?;
-            Ok(serde_json::to_string(
-                &json!({"ok":true,"video_count":videos.len(),"email":cfg.email_status(),
-                        "live_watchlist":watch.list_live(),"video_watchlist":watch.list_video()}),
-            )?)
-        }
+        "live_status" => Ok(serde_json::to_string(
+            &crate::status_snapshot::build(project_dir, pool, cfg).await?,
+        )?),
+        "status" => Ok(serde_json::to_string(
+            &crate::status_snapshot::build(project_dir, pool, cfg).await?,
+        )?),
         "live_list" => Ok(serde_json::to_string(
             &json!({"ok":true,"rooms":watch.list_live()}),
         )?),
@@ -476,7 +476,7 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
         }
         "service_status" => {
             let rust_running = crate::service::rust_daemon_alive(project_dir);
-            let mut result = crate::service::status(project_dir)?;
+            let mut result = crate::status_snapshot::build(project_dir, pool, cfg).await?;
             let sessions = db::list_live_sessions(pool, "recording", 100).await?;
             result
                 .as_object_mut()
@@ -486,13 +486,6 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
                 .as_object_mut()
                 .unwrap()
                 .insert("rust_daemon".to_string(), json!(rust_running));
-            result.as_object_mut().unwrap().insert(
-                "services".to_string(),
-                json!({
-                    "live_monitor": {"running": rust_running},
-                    "video_monitor": {"running": rust_running},
-                }),
-            );
             Ok(serde_json::to_string(&result)?)
         }
         "test_email" => {
@@ -510,7 +503,7 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
             Ok(serde_json::to_string(&json!({"ok":true,"sent":true}))?)
         }
         "test_notify" => {
-            let notifier = crate::notify::Notifier::new(pool, cfg);
+            let notifier = crate::notify::Notifier::for_project(pool, cfg, project_dir);
             match notifier
                 .send_test(
                     "【尊者直播监控】通知测试",

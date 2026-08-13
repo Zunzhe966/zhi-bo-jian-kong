@@ -457,7 +457,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     "收到这条消息说明通知通道配置成功。",
                 ) {
                     Ok(_) => {
-                        let notifier = notify::Notifier::new(&pool, &cfg);
+                        let notifier = notify::Notifier::for_project(&pool, &cfg, &project_dir);
                         let _ = notifier
                             .record_sent(
                                 "test",
@@ -477,7 +477,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
         }
         Command::TestNotify => {
-            let notifier = notify::Notifier::new(&pool, &cfg);
+            let notifier = notify::Notifier::for_project(&pool, &cfg, &project_dir);
             match notifier
                 .send_test(
                     "【尊者直播监控】通知测试",
@@ -536,29 +536,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             println!("{}", json!({"ok": true, "notes": notes}));
         }
         Command::Status => {
-            let anchors = db::list_anchors(&pool).await?;
-            let library = video_library::VideoLibrary::new(pool.clone(), fupan_dir.clone());
-            let videos = library.list("", "", false).await?;
-            let email = cfg.email_status();
-            let live = watch.list_live();
-            let video_sources = watch.list_video();
-            let rust_running = crate::service::rust_daemon_alive(&project_dir);
             println!(
                 "{}",
-                json!({
-                    "ok": true,
-                    "anchors": anchors,
-                    "live_watchlist": live,
-                    "video_watchlist": video_sources,
-                    "video_count": videos.len(),
-                    "email": email,
-                    "rust_daemon": rust_running,
-                    "services": {
-                        "live_monitor": {"running": rust_running},
-                        "video_monitor": {"running": rust_running},
-                    },
-                    "version": env!("CARGO_PKG_VERSION"),
-                })
+                crate::status_snapshot::build(&project_dir, &pool, &cfg).await?
             );
         }
         Command::RunDaemon {

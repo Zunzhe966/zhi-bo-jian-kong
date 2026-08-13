@@ -125,6 +125,7 @@ impl ConfigApi {
     pub fn schema(&self) -> Value {
         json!({
             "description": "尊者直播监控工具配置。大模型由外部智能体自带，通过 MCP/CLI 写入 [知识提炼] 即可。",
+            "mcp_hint": "智能体用 set_config 写入 api地址/api密钥/模型，或用 bulk 一次写入。",
             "files": {
                 "config.ini": {
                     "录制设置": {"循环时间(秒)": "监控轮询间隔", "视频保存格式ts|mkv|flv|mp4|mp3音频|m4a音频": "保存格式"},

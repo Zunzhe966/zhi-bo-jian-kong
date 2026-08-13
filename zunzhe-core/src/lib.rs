@@ -15,6 +15,7 @@ pub mod pipeline_bridge;
 pub mod platform;
 pub mod scheduler;
 pub mod service;
+pub mod status_snapshot;
 pub mod training_data;
 pub mod video_library;
 pub mod watchlist;
