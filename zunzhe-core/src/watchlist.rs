@@ -472,4 +472,34 @@ mod tests {
         assert_eq!(w.notify_for("https://x.test/1", ""), "跟随全局");
         let _ = fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn remove_live_is_disable_not_delete() {
+        let dir = temp_project("disable-live");
+        let w = Watchlist::new(dir.clone());
+        w.add_live("https://live.bilibili.com/1", "主播甲", "原画")
+            .unwrap();
+        assert_eq!(w.list_live().len(), 1, "启用状态应先出现在监控列表");
+
+        assert!(w.remove_live("https://live.bilibili.com/1").unwrap());
+        assert!(
+            w.list_live().is_empty(),
+            "remove-live 后 disabled 项不应参与实际监控"
+        );
+
+        let text = fs::read_to_string(w.url_config()).unwrap();
+        assert!(
+            text.lines().any(|line| {
+                let s = line.trim();
+                s.starts_with('#') && s.contains("https://live.bilibili.com/1")
+            }),
+            "remove-live 应保留为注释项，便于恢复: {text}"
+        );
+
+        // 恢复被暂停的主播，确认列表重新出现。
+        w.add_live("https://live.bilibili.com/1", "主播甲", "原画")
+            .unwrap();
+        assert_eq!(w.list_live().len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

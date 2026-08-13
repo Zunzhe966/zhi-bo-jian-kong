@@ -223,11 +223,12 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             );
         }
         Command::RemoveLive { url } | Command::RemoveAnchor { url } => {
-            let removed = db::remove_anchor(&pool, &url).await?;
-            let _ = watch.remove_live(&url);
+            // `remove-live` 与 Python/旧桌面端一致是“暂停监控”，只注释 URL 行，
+            // 不清掉 SQLite anchors。否则列表页和 daemon 实际监控源会长期不一致。
+            let removed = watch.remove_live(&url)?;
             println!(
                 "{}",
-                json!({"ok": removed, "url": url, "action": "remove-anchor"})
+                json!({"ok": removed, "url": url, "action": "remove-live", "disabled": removed})
             );
         }
         Command::DeleteLive { url } => {
