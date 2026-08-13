@@ -97,13 +97,23 @@ impl BilibiliAdapter {
             .timeout(std::time::Duration::from_secs(20))
             .build()
             .unwrap_or_default();
-        let nav = client
+        // nav 是 WBI 图片 key 的来源；有配置/浏览器 Cookie 时也必须一并带上，
+        // 否则即使用户已授权，这一步仍可能被 B站当成匿名出口并 412，导致
+        // 官方投稿接口永远回退到 RSSHub/yt-dlp。
+        let cookie = self.effective_cookie();
+        let mut req = client
             .get("https://api.bilibili.com/x/web-interface/nav")
-            .header("User-Agent", "Mozilla/5.0")
-            .send()
-            .await?
-            .json::<serde_json::Value>()
-            .await?;
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+            )
+            .header("Referer", "https://www.bilibili.com");
+        if !cookie.is_empty()
+            && let Ok(v) = reqwest::header::HeaderValue::from_str(&cookie)
+        {
+            req = req.header(reqwest::header::COOKIE, v);
+        }
+        let nav = req.send().await?.json::<serde_json::Value>().await?;
         let img_url = nav["data"]["wbi_img"]["img_url"].as_str().unwrap_or("");
         let sub_url = nav["data"]["wbi_img"]["sub_url"].as_str().unwrap_or("");
         if img_url.is_empty() || sub_url.is_empty() {
@@ -257,6 +267,13 @@ impl Platform for BilibiliAdapter {
 impl BilibiliAdapter {
     async fn upload_ids_official(&self, mid: &str, count: u32) -> Vec<String> {
         let cookie = self.effective_cookie();
+        // 匿名请求再补一次 buvid3/buvid4 设备 Cookie，降低 B站 412 风控概率。
+        // 配置 Cookie / 浏览器授权 Cookie 优先级更高，不会被匿名 Cookie 覆盖。
+        let cookie = if cookie.is_empty() {
+            self.anon_cookie_header().await
+        } else {
+            cookie
+        };
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             reqwest::header::REFERER,
@@ -299,6 +316,18 @@ impl BilibiliAdapter {
             }
         }
         Vec::new()
+    }
+
+    /// 读取/领取 B站匿名 buvid Cookie，并转成 `name=value; ...` 请求头。
+    /// 这层只做设备标识兜底，不包含账号登录态。
+    async fn anon_cookie_header(&self) -> String {
+        let Some(path) = crate::bilibili_auth::ensure_anon_cookie(&self.project_dir).await else {
+            return String::new();
+        };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return String::new();
+        };
+        crate::bilibili_auth::cookie_header_from_netscape_public(&text)
     }
 
     async fn upload_ids_rsshub(&self, mid: &str, count: u32) -> Vec<String> {

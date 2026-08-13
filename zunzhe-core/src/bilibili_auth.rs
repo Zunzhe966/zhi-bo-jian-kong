@@ -94,6 +94,11 @@ pub async fn ensure_anon_cookie(project_dir: &Path) -> Option<PathBuf> {
 
 /// 解析 Netscape Cookie 文本，忽略空行和注释。列数为 7 且名称不为 `0` 时保留。
 fn cookie_header_from_netscape(text: &str) -> String {
+    cookie_header_from_netscape_public(text)
+}
+
+/// 公开解析入口，供 `platform` 读取匿名 Cookie 后转成请求头。
+pub fn cookie_header_from_netscape_public(text: &str) -> String {
     let mut pairs = Vec::new();
     for line in text.lines() {
         let line = line.trim();
