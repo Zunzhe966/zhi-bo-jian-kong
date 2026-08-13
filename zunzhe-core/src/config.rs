@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -582,9 +584,51 @@ pub fn patch_ini_file(path: &Path, pairs: &[(&str, &str, &str)]) -> Result<()> {
         }
     }
 
-    fs::write(path, lines.join("\n") + "\n")
+    atomic_write(path, format!("{}\n", lines.join("\n")))
         .with_context(|| format!("写配置失败: {}", path.display()))?;
     Ok(())
+}
+
+/// 原子写文本文件：先写同目录临时文件并 fsync，再 rename 覆盖目标。
+///
+/// 配置文件包含 QQ 授权码等敏感信息，任何情况下都不能因为写入中断而变成
+/// 半截文件。临时文件放在同一目录，保证 rename 不跨文件系统，Unix/Windows
+/// 都具备替换语义；失败时原始文件保持原样。
+fn atomic_write(path: &Path, contents: String) -> std::io::Result<()> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.tmp");
+    let tmp = parent.join(format!(
+        ".{file_name}.tmp.{}.{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    let original_permissions = fs::metadata(path).ok().map(|meta| meta.permissions());
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(contents.as_bytes())?;
+        file.flush()?;
+        file.sync_all()?;
+        if let Some(permissions) = original_permissions {
+            fs::set_permissions(&tmp, permissions)?;
+        }
+        fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    write_result
 }
 
 #[cfg(test)]
@@ -712,6 +756,38 @@ SMTP邮件服务器端口 = 465
         assert!(!text.contains("SMTP邮件服务器 ="));
         assert!(text.contains("邮箱登录账号 = me@qq.com"));
         assert!(text.contains("收件人邮箱 = you@qq.com"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn patch_ini_file_is_atomic_and_leaves_no_temp_files() {
+        let dir = std::env::temp_dir().join(format!("zunzhe-atomic-{}", std::process::id()));
+        let cfg_dir = dir.join("config");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let path = cfg_dir.join("fupan_config.ini");
+        std::fs::write(&path, "[视频监控]\n检查间隔秒 = 900\n").unwrap();
+
+        patch_ini_file(&path, &[("视频监控", "检查间隔秒", "600")]).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("检查间隔秒 = 600"));
+        assert!(!text.contains("检查间隔秒 = 900"));
+
+        let temp_files: Vec<_> = std::fs::read_dir(&cfg_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".fupan_config.ini.tmp.")
+            })
+            .collect();
+        assert!(
+            temp_files.is_empty(),
+            "原子写完成后不应留下临时文件: {temp_files:?}"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
