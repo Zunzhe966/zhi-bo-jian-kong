@@ -496,7 +496,7 @@ impl Platform for RssAdapter {
             if !trimmed.starts_with('<') {
                 return Err(anyhow!("RSS 源未返回 XML/HTML 内容: {url}"));
             }
-            Ok(parse_rss(&text).into_iter().take(count as usize).collect())
+            Ok(parse_rss(&text)?.into_iter().take(count as usize).collect())
         })
     }
 }
@@ -509,10 +509,8 @@ const MRSS_NS: &str = "http://search.yahoo.com/mrss/";
 /// 使用只读 XML DOM 而不是字符串切分，才能正确识别 XML 命名空间（如
 /// `<atom:link>`、`<media:thumbnail>`）和 CDATA 文本；这两类在真实订阅源里很常见，
 /// 旧 Python 依赖 `xml.etree.ElementTree`，Rust 侧也必须对齐同样的解析语义。
-pub fn parse_rss(text: &str) -> Vec<VideoMeta> {
-    let Ok(doc) = roxmltree::Document::parse(text) else {
-        return Vec::new();
-    };
+pub fn parse_rss(text: &str) -> Result<Vec<VideoMeta>> {
+    let doc = roxmltree::Document::parse(text).context("RSS/Atom XML 解析失败")?;
 
     let mut rss = Vec::new();
     for item in doc
@@ -540,7 +538,7 @@ pub fn parse_rss(text: &str) -> Vec<VideoMeta> {
         });
     }
     if !rss.is_empty() {
-        return rss;
+        return Ok(rss);
     }
 
     let mut atom = Vec::new();
@@ -573,15 +571,17 @@ pub fn parse_rss(text: &str) -> Vec<VideoMeta> {
             duration: 0,
         });
     }
-    atom
+    Ok(atom)
 }
 
 fn child_text<'a, 'input>(node: roxmltree::Node<'a, 'input>, name: &str) -> String {
     node.children()
-        .find(|n| n.is_element() && matches_local_name(*n, name, None))
-        .map(|n| n.text().unwrap_or("").trim())
-        .unwrap_or("")
-        .to_string()
+        .filter(|n| n.is_element() && matches_local_name(*n, name, None))
+        .find_map(|n| {
+            let text = n.text().unwrap_or("").trim();
+            (!text.is_empty()).then(|| text.to_string())
+        })
+        .unwrap_or_default()
 }
 
 fn matches_local_name<'a, 'input>(
@@ -606,15 +606,17 @@ fn namespaced_child_text<'a, 'input>(
     name: &str,
 ) -> String {
     node.children()
-        .find(|n| {
+        .filter(|n| {
             n.is_element()
                 && (n.tag_name().namespace() == Some(namespace)
                     || n.tag_name().namespace().is_none())
                 && n.has_tag_name(name)
         })
-        .map(|n| n.text().unwrap_or("").trim())
-        .unwrap_or("")
-        .to_string()
+        .find_map(|n| {
+            let text = n.text().unwrap_or("").trim();
+            (!text.is_empty()).then(|| text.to_string())
+        })
+        .unwrap_or_default()
 }
 
 fn element_attr<'a, 'input>(
@@ -623,21 +625,27 @@ fn element_attr<'a, 'input>(
     attr: &str,
 ) -> Option<String> {
     node.children()
-        .find(|n| n.is_element() && n.has_tag_name(name))
-        .and_then(|n| n.attribute(attr))
-        .map(|s| s.trim().to_string())
+        .filter(|n| n.is_element() && n.has_tag_name(name))
+        .find_map(|n| {
+            n.attribute(attr)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+        })
 }
 
 fn media_cover<'a, 'input>(node: roxmltree::Node<'a, 'input>) -> Option<String> {
     ["thumbnail", "content"].into_iter().find_map(|name| {
         node.children()
-            .find(|n| {
+            .filter(|n| {
                 n.is_element() && n.tag_name().namespace() == Some(MRSS_NS) && n.has_tag_name(name)
             })
-            .and_then(|n| n.attribute("url"))
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(ToOwned::to_owned)
+            .find_map(|n| {
+                n.attribute("url")
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(ToOwned::to_owned)
+            })
     })
 }
 
@@ -711,7 +719,7 @@ mod tests {
           <media:thumbnail url="https://x.test/1.jpg"/></item>
           <item><title>测试二</title><link>https://x.test/2</link><guid>g2</guid></item>
         </channel></rss>"#;
-        let items = parse_rss(xml);
+        let items = parse_rss(xml).unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].title, "测试一");
         assert_eq!(items[0].cover, "https://x.test/1.jpg");
@@ -727,7 +735,7 @@ mod tests {
           <media:thumbnail url="https://x.test/1.jpg"/>
           <published>2026-08-12T10:00:00+08:00</published></entry>
         </feed>"#;
-        let items = parse_rss(xml);
+        let items = parse_rss(xml).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title, "Atom 视频");
         assert_eq!(items[0].url, "https://x.test/1");
@@ -745,10 +753,29 @@ mod tests {
             </item>
           </channel>
         </rss>"#;
-        let items = parse_rss(xml);
+        let items = parse_rss(xml).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title, "一个 <带标签> 的标题");
         assert_eq!(items[0].url, "https://x.test/cdata");
+    }
+
+    #[test]
+    fn malformed_rss_is_an_error_not_empty_baseline() {
+        assert!(parse_rss("<rss><item><title>未闭合").is_err());
+    }
+
+    #[test]
+    fn rss_link_is_preferred_over_empty_atom_link() {
+        let xml = r#"<rss xmlns:atom="http://www.w3.org/2005/Atom"><channel>
+          <item>
+            <title>RSS 标题</title>
+            <atom:link href=""/>
+            <link>https://x.test/rss</link>
+          </item>
+        </channel></rss>"#;
+        let items = parse_rss(xml).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].url, "https://x.test/rss");
     }
 
     #[test]
