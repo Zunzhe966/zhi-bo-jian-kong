@@ -158,60 +158,72 @@ impl<'a> Notifier<'a> {
             }
             let id =
                 db::add_notify(self.pool, event, anchor, title, content, channel.name()).await?;
-            if channel == Channel::Email {
-                // 与旧 Python 一样，无论远程邮件是否最终成功，都先写本地队列，
-                // 由 Electron 桌面端负责弹系统通知，避免代理/额度失败时完全无提醒。
-                Self::queue_local(self.project_dir, title, content);
-            }
-            if channel == Channel::None {
-                // “不通知”本身是有效投递策略：保留审计记录但立即完成。
-                db::mark_notify_done(self.pool, id).await?;
-                continue;
-            }
-            let sent = match channel {
-                Channel::Email => {
-                    let settings = self.config.email_settings();
-                    let subject = title.to_string();
-                    let body = content.to_string();
-                    Self::send_email_with_timeout(settings, subject, body).await
-                }
-                Channel::Wechat => self.send_wechat(title, content).await,
-                Channel::PushPlus => self.send_pushplus(title, content).await,
-                Channel::Bark => self.send_bark(title, content).await,
-                Channel::Ntfy => self.send_ntfy(title, content).await,
-                Channel::None => false,
-            };
-            if sent {
-                db::mark_notify_done(self.pool, id).await?;
+            if self.send_record(id, title, content, &channel).await? {
                 any_sent = true;
-            } else {
-                // SMTP/HTTPS 明确失败或超时后不留在 pending，避免配置错误时每轮重试
-                // 并无限膨胀通知队列；临时网络抖动可由用户重试或重新触发。
-                db::fail_notify(self.pool, id).await?;
             }
         }
         // 本地队列只在选中的 Email 通道中写入；“不通知”或仅 HTTPS 通道不会弹窗。
         Ok(any_sent)
     }
 
+    /// 对已经落库的通知记录执行实际发送，并更新这一条记录。
+    ///
+    /// 新通知和 pending 重试共用这段逻辑，避免重试时再插入一条新 pending，
+    /// 导致原记录永不收敛、通知表无限膨胀。
+    async fn send_record(
+        &self,
+        id: i64,
+        title: &str,
+        content: &str,
+        channel: &Channel,
+    ) -> Result<bool> {
+        if channel == &Channel::Email {
+            // 与旧 Python 一样，无论远程邮件是否最终成功，都先写本地队列，
+            // 由 Electron 桌面端负责弹系统通知，避免代理/额度失败时完全无提醒。
+            Self::queue_local(self.project_dir, title, content);
+            if !self.config.email_configured() {
+                // 重试时配置可能已被清空；落定 failed，避免通知行永久 pending。
+                db::fail_notify(self.pool, id).await?;
+                return Ok(false);
+            }
+        }
+        if channel == &Channel::None {
+            // “不通知”本身是有效投递策略：保留审计记录但立即完成。
+            db::mark_notify_done(self.pool, id).await?;
+            return Ok(false);
+        }
+        let sent = match channel {
+            Channel::Email => {
+                let settings = self.config.email_settings();
+                let subject = title.to_string();
+                let body = content.to_string();
+                Self::send_email_with_timeout(settings, subject, body).await
+            }
+            Channel::Wechat => self.send_wechat(title, content).await,
+            Channel::PushPlus => self.send_pushplus(title, content).await,
+            Channel::Bark => self.send_bark(title, content).await,
+            Channel::Ntfy => self.send_ntfy(title, content).await,
+            Channel::None => false,
+        };
+        if sent {
+            db::mark_notify_done(self.pool, id).await?;
+        } else {
+            // SMTP/HTTPS 明确失败或超时后不留在 pending，避免配置错误时每轮重试
+            // 并无限膨胀通知队列；临时网络抖动可由用户重试或重新触发。
+            db::fail_notify(self.pool, id).await?;
+        }
+        Ok(sent)
+    }
+
     /// 重试通知队列中的 pending 通知：一次最多处理 50 条，失败保留 pending，
     /// 成功标记 sent。发送失败只记日志，不拖垮 daemon tick。
     pub async fn flush_pending(&self, limit: i64) -> Result<usize> {
-        if !self.config.email_configured() && !self.config.push_channels().configured() {
-            return Ok(0);
-        }
         let pending = db::list_notify(self.pool, "pending", limit).await?;
         let mut sent_count = 0;
         for item in pending {
-            let channel = item.channel.clone();
+            let channel = Channel::parse(&item.channel);
             match self
-                .send(
-                    &item.event,
-                    &item.anchor,
-                    &item.title,
-                    &item.content,
-                    &channel,
-                )
+                .send_record(item.id, &item.title, &item.content, &channel)
                 .await
             {
                 Ok(true) => sent_count += 1,
@@ -852,6 +864,49 @@ mod tests {
         assert!(!sent);
         // 未配置邮箱时不写 pending，避免通知表无限膨胀。
         assert_eq!(db::list_notify(&pool, "", 10).await.unwrap().len(), 0);
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_file(file.with_extension("db-shm"));
+        let _ = std::fs::remove_file(file.with_extension("db-wal"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn flush_pending_updates_existing_record_without_duplicate() {
+        // 重试路径必须更新原 pending 记录，不能再次调用 send 插入新 pending；
+        // 否则未配置 SMTP 的通知会每轮成倍增长，且原记录永远无法收敛。
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-notify-flush-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::write(dir.join("config").join("config.ini"), "[推送配置]\n").unwrap();
+        std::fs::write(dir.join("config").join("fupan_config.ini"), "").unwrap();
+        let file = std::env::temp_dir().join(format!(
+            "zunzhe-notify-flush-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pool = db::open_pool(&file).await.unwrap();
+        let cfg = crate::config::Config::load(&dir).unwrap();
+        let notifier = Notifier::new(&pool, &cfg);
+        let original = db::add_notify(&pool, "live", "主播", "开播", "内容", "邮箱")
+            .await
+            .unwrap();
+
+        let sent = notifier.flush_pending(10).await.unwrap();
+        assert_eq!(sent, 0);
+        let all = db::list_notify(&pool, "", 10).await.unwrap();
+        assert_eq!(all.len(), 1, "重试不应插入新通知记录");
+        assert_eq!(all[0].id, original);
+        assert_eq!(all[0].status, "failed", "未配置邮箱应把原记录收敛为 failed");
+
         let _ = std::fs::remove_file(&file);
         let _ = std::fs::remove_file(file.with_extension("db-shm"));
         let _ = std::fs::remove_file(file.with_extension("db-wal"));
