@@ -93,12 +93,12 @@ pub fn start_rust_daemon(project_dir: &Path, interval_secs: u64) -> Result<serde
         .join("zunzhe-core")
         .join("target")
         .join("release")
-        .join("zunzhe-core");
+        .join(core_binary_name());
     let debug_exe = project_dir
         .join("zunzhe-core")
         .join("target")
         .join("debug")
-        .join("zunzhe-core");
+        .join(core_binary_name());
     let exe = if exe.exists() { exe } else { debug_exe };
     if !exe.exists() {
         bail!("找不到 Rust 核心二进制: {}", exe.display());
@@ -141,6 +141,15 @@ pub fn start_rust_daemon(project_dir: &Path, interval_secs: u64) -> Result<serde
         }
     }
     bail!("Rust daemon 启动超时（5 秒），请查看 logs/zunzhe-core.log")
+}
+
+/// 当前平台的核心二进制名。Windows 上 cargo 输出 `.exe`，Unix 上没有后缀。
+fn core_binary_name() -> &'static str {
+    if cfg!(windows) {
+        "zunzhe-core.exe"
+    } else {
+        "zunzhe-core"
+    }
 }
 
 pub fn stop_rust_daemon(project_dir: &Path) -> Result<serde_json::Value> {

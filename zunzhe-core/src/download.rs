@@ -271,12 +271,24 @@ fn find_electron(project_dir: &Path) -> Option<PathBuf> {
 }
 
 fn find_ffmpeg(project_dir: &Path) -> PathBuf {
-    let bundled = project_dir.join("ffmpeg").join("ffmpeg");
+    find_binary(project_dir, "ffmpeg", "ffmpeg.exe")
+}
+
+/// 跨平台查找项目内置二进制：优先本机后缀，再回退另一平台后缀，最后使用 PATH。
+fn find_binary(project_dir: &Path, name: &str, windows_name: &str) -> PathBuf {
+    let unix_name = if cfg!(windows) { windows_name } else { name };
+    let bundled = project_dir.join("ffmpeg").join(unix_name);
     if bundled.exists() {
-        bundled
-    } else {
-        PathBuf::from("ffmpeg")
+        return bundled;
     }
+    let cross_bundled =
+        project_dir
+            .join("ffmpeg")
+            .join(if cfg!(windows) { name } else { windows_name });
+    if cross_bundled.exists() {
+        return cross_bundled;
+    }
+    PathBuf::from(name)
 }
 
 fn is_bilibili(url: &str) -> bool {

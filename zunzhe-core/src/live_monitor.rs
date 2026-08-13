@@ -652,12 +652,7 @@ impl<'a> LiveMonitor<'a> {
     }
 
     fn ffmpeg_bin(&self) -> PathBuf {
-        let bundled = self.project_dir.join("ffmpeg").join("ffmpeg");
-        if bundled.exists() {
-            bundled
-        } else {
-            PathBuf::from("ffmpeg")
-        }
+        find_ffmpeg_bin(self.project_dir)
     }
 
     fn output_path(&self, item: &LiveItem, status: &LiveStatus, anchor: &str) -> Result<PathBuf> {
@@ -798,6 +793,29 @@ impl<'a> LiveMonitor<'a> {
 /// mp4/m4a 用 AAC 的 bitstream filter；ts/flv/mkv 和 mp3 不需要。
 fn is_aac_container(ext: &str) -> bool {
     matches!(ext, "mp4" | "m4a")
+}
+
+/// 跨平台查找 ffmpeg：Windows 使用 `ffmpeg.exe`，Unix 使用 `ffmpeg`。
+///
+/// 原实现只检查 `ffmpeg/ffmpeg`，在 Windows 上即使正确放置了
+/// `ffmpeg/ffmpeg.exe` 也会回退到 PATH；如果 PATH 未配置，录制会直接失败。
+fn find_ffmpeg_bin(project_dir: &Path) -> PathBuf {
+    let (candidate, fallback) = if cfg!(windows) {
+        (
+            project_dir.join("ffmpeg").join("ffmpeg.exe"),
+            PathBuf::from("ffmpeg.exe"),
+        )
+    } else {
+        (
+            project_dir.join("ffmpeg").join("ffmpeg"),
+            PathBuf::from("ffmpeg"),
+        )
+    };
+    if candidate.exists() {
+        candidate
+    } else {
+        fallback
+    }
 }
 
 fn adapter_name(url: &str) -> &'static str {
