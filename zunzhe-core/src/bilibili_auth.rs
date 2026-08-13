@@ -9,6 +9,17 @@ pub fn browser_cookie_path(project_dir: &Path) -> PathBuf {
         .join("bilibili_browser_cookies.txt")
 }
 
+/// 用户粘贴在 `[视频监控] b站cookie` 里的 Cookie 生成的 Netscape 文件路径。
+///
+/// 与旧 Python `fupan/video_monitor.py::_bilibili_user_cookies_file()` 保持同一路径，
+/// 让桌面端/CLI 和旧 Python 在混用期间共享同一份缓存，避免两边生成不同文件。
+pub fn user_cookie_path(project_dir: &Path) -> PathBuf {
+    project_dir
+        .join("fupan_output")
+        .join("run")
+        .join("bilibili_user_cookies.txt")
+}
+
 /// 把 Netscape 格式的 Cookie 文件转成 `name=value; ...` 请求头字符串。
 ///
 /// 桌面端 Electron 导出的文件可能是注释 + 以 tab 分隔的 7 列；这里只保留
@@ -47,6 +58,51 @@ pub fn build_anon_cookie_netscape(b_3: &str, b_4: &str, expire: i64) -> String {
     }
     lines.push(String::new());
     lines.join("\n")
+}
+
+/// 把浏览器 `name=value; name2=value2` Cookie 字符串转成 Netscape 文本。
+///
+/// 旧 Python 用 `.bilibili.com`、路径 `/`、`secure=false`，expire 设置为未来
+/// 半年；这里保持同一形状，供 `yt-dlp --cookies` 与 B站接口 Cookie 使用。
+pub fn build_user_cookie_netscape(cookie: &str, expire: i64) -> String {
+    let mut lines = vec!["# Netscape HTTP Cookie File".to_string()];
+    for pair in cookie.split(';') {
+        let pair = pair.trim();
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty() || value.is_empty() {
+            continue;
+        }
+        lines.push(format!(
+            ".bilibili.com\tTRUE\t/\tFALSE\t{expire}\t{key}\t{value}"
+        ));
+    }
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+/// 若用户配置了 `b站cookie`，把它写成旧 Python 同路径的 Netscape Cookie 文件。
+///
+/// 返回 `Some(path)` 仅表示写文件成功；调用方仍需按优先级决定是否使用它。
+pub fn ensure_user_cookie_file(project_dir: &Path, cookie: &str) -> Option<PathBuf> {
+    let cookie = cookie.trim();
+    if cookie.is_empty() {
+        return None;
+    }
+    let path = user_cookie_path(project_dir);
+    let expire = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64 + 86400 * 180)
+        .unwrap_or(86400 * 180);
+    let text = build_user_cookie_netscape(cookie, expire);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(&path, text).ok()?;
+    Some(path)
 }
 
 /// 从 B站匿名设备接口获取 buvid3/buvid4，并缓存为 Netscape Cookie 文件。
@@ -155,5 +211,14 @@ mod tests {
         let text = build_anon_cookie_netscape("", "b4-token", 1);
         assert!(!text.contains("buvid3"));
         assert!(text.contains("buvid4\tb4-token"));
+    }
+
+    #[test]
+    fn builds_user_cookie_netscape_like_python_fallback() {
+        let text = build_user_cookie_netscape("SESSDATA=abc; bili_jct=xyz; ; empty=", 1800000);
+        assert!(text.starts_with("# Netscape HTTP Cookie File"));
+        assert!(text.contains(".bilibili.com\tTRUE\t/\tFALSE\t1800000\tSESSDATA\tabc"));
+        assert!(text.contains(".bilibili.com\tTRUE\t/\tFALSE\t1800000\tbili_jct\txyz"));
+        assert!(!text.contains("empty="));
     }
 }

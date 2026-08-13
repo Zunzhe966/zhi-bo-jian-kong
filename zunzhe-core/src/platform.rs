@@ -7,7 +7,10 @@ use std::time::Duration;
 use tokio::process::Command;
 use tracing::{debug, warn};
 
-use crate::bilibili_auth::cookie_header_from_project;
+use crate::bilibili_auth::{
+    browser_cookie_path, cookie_header_from_netscape_public, cookie_header_from_project,
+    ensure_user_cookie_file,
+};
 use crate::model::VideoMeta;
 
 /// B 站 WBI 固定置换表（公开算法，非密钥）。
@@ -143,6 +146,67 @@ impl BilibiliAdapter {
         cookie_header_from_project(&self.project_dir)
     }
 
+    /// 用户配置 Cookie 写入旧 Python 同路径的 Netscape 文件，并转成请求头。
+    ///
+    /// 返回空串表示没有可用的用户 Cookie；调用方应继续使用浏览器导出或匿名兜底。
+    fn configured_cookie_header(&self) -> String {
+        let Some(cookie) = crate::config::Config::load(&self.project_dir)
+            .ok()
+            .map(|c| c.get_fupan("视频监控", "b站cookie"))
+        else {
+            return String::new();
+        };
+        let cookie = cookie.trim();
+        if cookie.is_empty() {
+            return String::new();
+        }
+        let Some(path) = ensure_user_cookie_file(&self.project_dir, cookie) else {
+            return cookie.to_string();
+        };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return cookie.to_string();
+        };
+        let header = cookie_header_from_netscape_public(&text);
+        if header.is_empty() {
+            cookie.to_string()
+        } else {
+            header
+        }
+    }
+
+    /// 用户配置 Cookie 的 Netscape 文件（优先返回旧 Python 同路径文件）。
+    ///
+    /// 只有文件不存在时才现场生成；文件已存在时优先复用，避免写覆盖旧 Python 产物。
+    fn user_cookie_file(&self) -> Option<PathBuf> {
+        let cookie = crate::config::Config::load(&self.project_dir)
+            .ok()
+            .map(|c| c.get_fupan("视频监控", "b站cookie"))
+            .unwrap_or_default();
+        let cookie = cookie.trim();
+        if cookie.is_empty() {
+            return None;
+        }
+        let path = crate::bilibili_auth::user_cookie_path(&self.project_dir);
+        if path.exists() {
+            return Some(path);
+        }
+        ensure_user_cookie_file(&self.project_dir, cookie)
+    }
+
+    /// 投稿列表专用 Cookie：旧 Python 明确不使用匿名 buvid，只允许账号 Cookie，
+    /// 否则会更容易触发 412。这里遵循同一优先级。
+    fn upload_list_cookie(&self) -> String {
+        let configured = self.configured_cookie_header();
+        if !configured.is_empty() {
+            return configured;
+        }
+        let browser = self.browser_cookie_from_project();
+        if !browser.is_empty() {
+            return browser;
+        }
+        String::new()
+    }
+
     pub fn with_cookie_and_project_dir(cookie: impl Into<String>, project_dir: PathBuf) -> Self {
         Self {
             cookie: cookie.into(),
@@ -154,6 +218,11 @@ impl BilibiliAdapter {
     fn effective_cookie(&self) -> String {
         if !self.cookie.is_empty() {
             self.cookie.clone()
+        } else if let Some(cookie) = self.user_cookie_file() {
+            let Ok(text) = std::fs::read_to_string(cookie) else {
+                return self.browser_cookie_from_project();
+            };
+            cookie_header_from_netscape_public(&text)
         } else {
             self.browser_cookie_from_project()
         }
@@ -270,14 +339,9 @@ impl Platform for BilibiliAdapter {
 
 impl BilibiliAdapter {
     async fn upload_ids_official(&self, mid: &str, count: u32) -> Vec<String> {
-        let cookie = self.effective_cookie();
-        // 匿名请求再补一次 buvid3/buvid4 设备 Cookie，降低 B站 412 风控概率。
-        // 配置 Cookie / 浏览器授权 Cookie 优先级更高，不会被匿名 Cookie 覆盖。
-        let cookie = if cookie.is_empty() {
-            self.anon_cookie_header().await
-        } else {
-            cookie
-        };
+        // 旧 Python 的投稿列表接口明确不使用匿名 buvid：那会更容易触发 412。
+        // 这里只使用用户配置或浏览器授权 Cookie，不补匿名设备 Cookie。
+        let cookie = self.upload_list_cookie();
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             reqwest::header::REFERER,
@@ -322,18 +386,6 @@ impl BilibiliAdapter {
         Vec::new()
     }
 
-    /// 读取/领取 B站匿名 buvid Cookie，并转成 `name=value; ...` 请求头。
-    /// 这层只做设备标识兜底，不包含账号登录态。
-    async fn anon_cookie_header(&self) -> String {
-        let Some(path) = crate::bilibili_auth::ensure_anon_cookie(&self.project_dir).await else {
-            return String::new();
-        };
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return String::new();
-        };
-        crate::bilibili_auth::cookie_header_from_netscape_public(&text)
-    }
-
     async fn upload_ids_rsshub(&self, mid: &str, count: u32) -> Vec<String> {
         let rss = format!("https://rsshub.app/bilibili/user/video/{mid}");
         if let Ok(resp) = self.client.get(&rss).send().await
@@ -351,7 +403,8 @@ impl BilibiliAdapter {
 
     async fn upload_ids_ytdlp(&self, mid: &str, count: u32) -> Vec<String> {
         let cookie = self.effective_cookie();
-        // 先找项目 .venv 里的 yt-dlp，再回退到系统 PATH，避免依赖当前工作目录。
+        // 与旧 Python 一致：用户配置 Cookie 优先转成 `--cookies`；没有账号 Cookie
+        // 才补匿名 buvid 文件，且不把用户 Cookie 写成易被截断的 `--add-header`。
         let candidate = self
             .project_venv_ytdlp()
             .unwrap_or_else(|| PathBuf::from("yt-dlp"));
@@ -366,9 +419,16 @@ impl BilibiliAdapter {
             .arg(count.to_string())
             .args(["--print", "%(id)s"])
             .arg(format!("https://space.bilibili.com/{mid}/video"));
-        // 带用户 Cookie 可显著降低 B站风控；匿名请求容易被 352/412 拒绝。
-        if !cookie.is_empty() {
-            cmd.args(["--add-header", &format!("Cookie: {cookie}")]);
+        let user_cookies = self.user_cookie_file();
+        let browser_cookies = browser_cookie_path(&self.project_dir);
+        if let Some(user_cookies) = user_cookies {
+            cmd.args(["--cookies", user_cookies.display().to_string().as_str()]);
+        } else if browser_cookies.exists() {
+            cmd.args(["--cookies", browser_cookies.display().to_string().as_str()]);
+        } else if cookie.is_empty()
+            && let Some(anon) = crate::bilibili_auth::ensure_anon_cookie(&self.project_dir).await
+        {
+            cmd.args(["--cookies", anon.display().to_string().as_str()]);
         }
         let child = cmd
             .stdin(Stdio::null())

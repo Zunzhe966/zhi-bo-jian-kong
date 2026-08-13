@@ -7,7 +7,7 @@ use serde::Serialize;
 use sqlx::sqlite::SqlitePool;
 use tokio::process::Command;
 
-use crate::bilibili_auth::{browser_cookie_path, ensure_anon_cookie};
+use crate::bilibili_auth::{browser_cookie_path, ensure_anon_cookie, ensure_user_cookie_file};
 use crate::db;
 
 /// 下载器：优先走平台原生路径（B站浏览器内核提取直链 + ffmpeg 合流），
@@ -82,7 +82,8 @@ impl Downloader {
         // B站风控时带用户 cookie（config/fupan_config.ini [视频监控] b站cookie）
         if url.contains("bilibili.com") || url.contains("b23.tv") {
             // 桌面端「B站授权」导出的浏览器会话 Cookie 最可靠；没有再回退
-            // config 里粘贴的 cookie；两者都没有时领取匿名 buvid 设备标识。
+            // config 里粘贴的 cookie，并写成旧 Python 同路径的 Netscape 文件，
+            // 保证 yt-dlp 走 `--cookies` 而不是容易被编码/换行截断的 `--add-header`。
             let browser_cookies = browser_cookie_path(&self.project_dir);
             if browser_cookies.exists() {
                 cmd.args(["--cookies", browser_cookies.display().to_string().as_str()]);
@@ -91,8 +92,8 @@ impl Downloader {
                     .ok()
                     .map(|c| c.get_fupan("视频监控", "b站cookie"))
                     .unwrap_or_default();
-                if !cookie.is_empty() {
-                    cmd.args(["--add-header", &format!("Cookie: {cookie}")]);
+                if let Some(user_cookies) = ensure_user_cookie_file(&self.project_dir, &cookie) {
+                    cmd.args(["--cookies", user_cookies.display().to_string().as_str()]);
                 } else if let Some(anon) = ensure_anon_cookie(&self.project_dir).await {
                     cmd.args(["--cookies", anon.display().to_string().as_str()]);
                 }
