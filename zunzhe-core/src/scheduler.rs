@@ -135,10 +135,14 @@ pub async fn run_daemon(
         // tick 结束后立即刷新心跳：即使本轮被 70 秒护栏截断，也证明调度器仍活跃。
         crate::service::touch_heartbeat(project_dir);
         if once || exited || *stop.1.borrow() {
-            let _ = monitor.stop_all_recordings().await;
-            stop_download_worker(&pool, &stop.0, &mut download_worker).await;
-            stop_pipeline_worker(&pool, &stop.0, &mut pipeline_worker).await;
-            return Ok(());
+            return shutdown_daemon(
+                &pool,
+                &monitor,
+                &stop.0,
+                &mut download_worker,
+                &mut pipeline_worker,
+            )
+            .await;
         }
         // duration 未到点且 tick 提前结束后，等待下一轮；期间继续响应退出。
         let mut wait_exit = false;
@@ -152,12 +156,32 @@ pub async fn run_daemon(
             }
         }
         if wait_exit || *stop.1.borrow() {
-            let _ = monitor.stop_all_recordings().await;
-            stop_download_worker(&pool, &stop.0, &mut download_worker).await;
-            stop_pipeline_worker(&pool, &stop.0, &mut pipeline_worker).await;
-            return Ok(());
+            return shutdown_daemon(
+                &pool,
+                &monitor,
+                &stop.0,
+                &mut download_worker,
+                &mut pipeline_worker,
+            )
+            .await;
         }
     }
+}
+
+/// 所有退出路径共用同一套收尾逻辑，确保 SIGTERM/SIGINT、--once、--duration、
+/// 外部 stop 命令都不会遗留 ffmpeg 或下载/复盘子任务。
+async fn shutdown_daemon(
+    pool: &SqlitePool,
+    monitor: &LiveMonitor<'_>,
+    stop: &tokio::sync::watch::Sender<bool>,
+    download_worker: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+    pipeline_worker: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+) -> Result<()> {
+    let _ = stop.send(true);
+    let _ = monitor.stop_all_recordings().await;
+    stop_download_worker(pool, stop, download_worker).await;
+    stop_pipeline_worker(pool, stop, pipeline_worker).await;
+    Ok(())
 }
 
 /// 退出 daemon 时停止下载 worker：先通知停止，再 abort 当前下载并归还
