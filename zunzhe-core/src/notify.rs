@@ -428,20 +428,16 @@ pub fn send_email(cfg: EmailSettings, subject: &str, body: &str) -> Result<bool>
             .parse()
             .with_context(|| format!("发件邮箱不合法: {}", cfg.login))?,
     );
-    let to: Vec<Mailbox> = cfg
-        .to
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.parse().with_context(|| format!("收件邮箱不合法: {s}")))
-        .collect::<Result<Vec<_>>>()?;
-    let message = Message::builder()
+    let to = parse_mailboxes(&cfg.to).with_context(|| format!("收件人邮箱不合法: {}", cfg.to))?;
+    let mut builder = Message::builder()
         .from(from)
-        .to(to[0].clone())
         .subject(subject)
         .header(ContentType::TEXT_PLAIN)
-        .body(body.to_string())
-        .context("构造邮件失败")?;
+        .to(to[0].clone());
+    for recipient in to.iter().skip(1) {
+        builder = builder.to(recipient.clone());
+    }
+    let message = builder.body(body.to_string()).context("构造邮件失败")?;
     let port = cfg
         .port
         .parse::<u16>()
@@ -464,6 +460,19 @@ pub fn send_email(cfg: EmailSettings, subject: &str, body: &str) -> Result<bool>
         .send(&message)
         .context("SMTP 发送失败，请检查账号/授权码/端口/网络")?;
     Ok(true)
+}
+
+/// 解析中英文逗号分隔的收件人列表，过滤空白并拒绝格式错误的地址。
+///
+/// 旧 Python 的 `msg_push.send_email` 接受多个收件人；Rust 若把 `a,b` 当单一
+/// 邮箱字符串解析，就会静默漏掉第二个收件人，甚至在配置错误时整封邮件构造失败。
+fn parse_mailboxes(value: &str) -> Result<Vec<Mailbox>> {
+    value
+        .split([',', '，'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse().with_context(|| format!("收件邮箱不合法: {s}")))
+        .collect()
 }
 
 /// 测试通知结果：是否至少一个通道成功，以及本次尝试过的通道列表。
@@ -673,6 +682,16 @@ mod tests {
             vec!["a".to_string(), "b".to_string(), "c".to_string()]
         );
         assert!(split_credentials("").is_empty());
+    }
+
+    #[test]
+    fn parses_multiple_email_recipients() {
+        let boxes = parse_mailboxes("a@qq.com,b@qq.com， c@qq.com").unwrap();
+        assert_eq!(boxes.len(), 3);
+        assert_eq!(boxes[0].email.to_string(), "a@qq.com");
+        assert_eq!(boxes[1].email.to_string(), "b@qq.com");
+        assert_eq!(boxes[2].email.to_string(), "c@qq.com");
+        assert!(parse_mailboxes("not-an-email").is_err());
     }
 
     #[test]

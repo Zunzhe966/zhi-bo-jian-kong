@@ -372,7 +372,12 @@ impl<'a> LiveMonitor<'a> {
             let adapter = resolve_live_for_project(&item.url, self.project_dir, &cookie);
             // 单个直播检查总时限 25 秒：B站 room_init/主播名/标题/流地址可能串行
             // 多次网络请求，不设总超时会让整个 daemon tick 被拖到 70 秒上限。
-            match tokio::time::timeout(Duration::from_secs(25), adapter.check(&item.url)).await {
+            let check_url = item.url.clone();
+            match tokio::time::timeout(Duration::from_secs(25), async move {
+                adapter.check(&check_url).await
+            })
+            .await
+            {
                 Ok(Ok(status)) if status.is_live => {
                     stats.checked += 1;
                     let anchor = if status.anchor_name.is_empty() {
@@ -1014,5 +1019,42 @@ mod tests {
         assert!(!is_aac_container("flv"));
         assert!(!is_aac_container("mkv"));
         assert!(!is_aac_container("ts"));
+    }
+
+    #[tokio::test]
+    async fn live_check_can_be_wrapped_in_total_timeout() {
+        // 守护进程必须能在 25 秒总超时内等待任意 LiveAdapter，避免借用 item.url
+        // 越过 await 后无法继续执行。这里用一个延迟适配器证明 same 路径可编译运行。
+        struct SlowAdapter;
+        impl LiveAdapter for SlowAdapter {
+            fn name(&self) -> &'static str {
+                "slow-test"
+            }
+
+            fn check<'a>(
+                &'a self,
+                _url: &'a str,
+            ) -> Pin<Box<dyn Future<Output = Result<LiveStatus>> + Send + 'a>> {
+                Box::pin(async {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Ok(LiveStatus {
+                        is_live: true,
+                        title: "t".into(),
+                        anchor_name: "a".into(),
+                        stream_url: "s".into(),
+                    })
+                })
+            }
+        }
+
+        let adapter = Box::new(SlowAdapter) as Box<dyn LiveAdapter>;
+        let url = "https://live.example.test/1".to_string();
+        let check_url = url.clone();
+        let result = tokio::time::timeout(Duration::from_millis(100), async move {
+            adapter.check(&check_url).await
+        })
+        .await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().unwrap().is_live);
     }
 }
