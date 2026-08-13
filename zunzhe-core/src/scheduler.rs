@@ -10,7 +10,7 @@ use crate::daemon_lock::DaemonLock;
 use crate::db;
 use crate::download;
 use crate::live_monitor::{LiveCheckStats, LiveMonitor};
-use crate::notify::{Channel, Notifier};
+use crate::notify::Notifier;
 use crate::platform;
 use crate::video_library::VideoLibrary;
 use crate::watchlist::Watchlist;
@@ -376,7 +376,7 @@ async fn tick(
                                         &name,
                                         &title,
                                         &content,
-                                        Channel::parse(&watch.notify_for(&source_url, &name)),
+                                        &watch.notify_for(&source_url, &name),
                                     )
                                     .await
                                 {

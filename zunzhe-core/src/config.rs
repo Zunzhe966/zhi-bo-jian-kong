@@ -363,48 +363,99 @@ pub fn write_qq_email(project_dir: &Path, email: &str, auth: &str, to: &str) -> 
         bail!("邮箱账号和授权码不能为空");
     }
     let path = project_dir.join("config").join("config.ini");
-    let mut ini = IniFile::load(&path)?;
-    let section = ini.data.entry("推送配置".to_string()).or_default();
-    section.insert("直播状态推送渠道".to_string(), "邮箱".to_string());
-    section.insert("SMTP邮件服务器".to_string(), "smtp.qq.com".to_string());
-    section.insert(
-        "是否使用SMTP服务SSL加密(是/否)".to_string(),
-        "是".to_string(),
-    );
-    section.insert("SMTP邮件服务器端口".to_string(), "465".to_string());
-    section.insert("邮箱登录账号".to_string(), email.to_string());
-    section.insert("发件人密码(授权码)".to_string(), auth.to_string());
-    section.insert("发件人邮箱".to_string(), email.to_string());
-    section.insert("发件人显示昵称".to_string(), "尊者直播监控".to_string());
-    section.insert(
-        "收件人邮箱".to_string(),
-        if to.is_empty() {
-            email.to_string()
-        } else {
-            to.to_string()
-        },
-    );
-    section.insert("开播推送开启(是/否)".to_string(), "是".to_string());
-    write_ini(&path, &ini)?;
+    let to = if to.is_empty() { email } else { to };
+    // 逐行 patch 保留注释与顺序，并按大小写不敏感匹配已有键，避免旧文件里
+    // `smtp邮件服务器` 与新增 `SMTP邮件服务器` 并存造成重复键。
+    patch_ini_file(
+        &path,
+        &[
+            ("推送配置", "直播状态推送渠道", "邮箱"),
+            ("推送配置", "SMTP邮件服务器", "smtp.qq.com"),
+            ("推送配置", "是否使用SMTP服务SSL加密(是/否)", "是"),
+            ("推送配置", "SMTP邮件服务器端口", "465"),
+            ("推送配置", "邮箱登录账号", email),
+            ("推送配置", "发件人密码(授权码)", auth),
+            ("推送配置", "发件人邮箱", email),
+            ("推送配置", "发件人显示昵称", "尊者直播监控"),
+            ("推送配置", "收件人邮箱", to),
+            ("推送配置", "开播推送开启(是/否)", "是"),
+        ],
+    )?;
     Ok(())
 }
 
-fn write_ini(path: &Path, ini: &IniFile) -> Result<()> {
+/// 逐行原地修改 INI，保留注释、空行、顺序与已有键大小写。
+///
+/// 更新已有键时按大小写不敏感匹配（对齐 Python `config_api._match_existing_key`），
+/// 避免旧文件使用小写键时插入大写同名键；新增节/键追加到文件末尾。
+pub fn patch_ini_file(path: &Path, pairs: &[(&str, &str, &str)]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut out = String::new();
-    for section in ini.sections() {
-        out.push_str(&format!("[{section}]\n"));
-        let keys = ini.section(&section).unwrap();
-        let mut list: Vec<(&String, &String)> = keys.iter().collect();
-        list.sort_by(|a, b| a.0.cmp(b.0));
-        for (k, v) in list {
-            out.push_str(&format!("{k} = {v}\n"));
+    let text = if path.exists() {
+        fs::read_to_string(path).with_context(|| format!("读取配置文件失败: {}", path.display()))?
+    } else {
+        String::new()
+    };
+    let mut lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
+    let mut pending: Vec<(&str, &str, &str)> = pairs.to_vec();
+    let mut i = 0;
+    while i < lines.len() {
+        let raw = lines[i].trim_start_matches('\u{feff}').trim().to_string();
+        if let Some(name) = raw.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            let section = name.trim().to_string();
+            let mut j = i + 1;
+            while j < lines.len() {
+                let inner = lines[j].trim_start_matches('\u{feff}').trim().to_string();
+                if inner.starts_with('[') {
+                    break;
+                }
+                if let Some((k, _)) = inner.split_once('=') {
+                    let k = k.trim().to_string();
+                    if let Some(pos) = pending.iter().position(|(s, pk, _)| {
+                        *s == section && pk.to_lowercase() == k.to_lowercase()
+                    }) {
+                        let (_, _, v) = pending.remove(pos);
+                        lines[j] = format!("{k} = {v}");
+                    }
+                }
+                j += 1;
+            }
+            i = j;
+            continue;
         }
-        out.push('\n');
+        i += 1;
     }
-    fs::write(path, out).with_context(|| format!("写配置失败: {}", path.display()))?;
+
+    for (section, key, value) in pending {
+        let sec_line = format!("[{section}]");
+        let sec_pos = lines
+            .iter()
+            .position(|l| l.trim_start_matches('\u{feff}').trim() == sec_line);
+        if let Some(pos) = sec_pos {
+            let mut insert_at = pos + 1;
+            while insert_at < lines.len() {
+                let t = lines[insert_at]
+                    .trim_start_matches('\u{feff}')
+                    .trim()
+                    .to_string();
+                if t.starts_with('[') {
+                    break;
+                }
+                insert_at += 1;
+            }
+            lines.insert(insert_at, format!("{key} = {value}"));
+        } else {
+            if !lines.is_empty() && !lines.last().map(|l| l.trim().is_empty()).unwrap_or(true) {
+                lines.push(String::new());
+            }
+            lines.push(sec_line);
+            lines.push(format!("{key} = {value}"));
+        }
+    }
+
+    fs::write(path, lines.join("\n") + "\n")
+        .with_context(|| format!("写配置失败: {}", path.display()))?;
     Ok(())
 }
 
@@ -482,5 +533,24 @@ SMTP邮件服务器端口 = 465
             fupan: ini,
         };
         assert!(!cfg.is_yes_fupan("视频监控", "自动下载新视频(是/否)", true));
+    }
+
+    #[test]
+    fn write_qq_email_reuses_lowercase_existing_keys() {
+        let dir = std::env::temp_dir().join(format!("zunzhe-qq-email-{}", std::process::id()));
+        let cfg_dir = dir.join("config");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("config.ini"),
+            "[推送配置]\nsmtp邮件服务器 = smtp.qq.com\n",
+        )
+        .unwrap();
+        write_qq_email(&dir, "me@qq.com", "authcode", "you@qq.com").unwrap();
+        let text = std::fs::read_to_string(cfg_dir.join("config.ini")).unwrap();
+        assert!(text.contains("smtp邮件服务器 = smtp.qq.com"));
+        assert!(!text.contains("SMTP邮件服务器 ="));
+        assert!(text.contains("邮箱登录账号 = me@qq.com"));
+        assert!(text.contains("收件人邮箱 = you@qq.com"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -15,7 +15,7 @@ use crate::bilibili_auth::cookie_header_from_project;
 use crate::config::Config;
 use crate::db;
 use crate::live_python_bridge::PythonLiveAdapter;
-use crate::notify::{Channel, Notifier};
+use crate::notify::Notifier;
 use crate::service::write_rust_live_pid;
 use crate::watchlist::{LiveItem, Watchlist};
 
@@ -447,10 +447,10 @@ impl<'a> LiveMonitor<'a> {
             "主播：{}\n标题：{}\n链接：{}",
             anchor, status.title, item.url
         );
-        let channel = Channel::parse(&self.watch.notify_for(&item.url, &anchor));
+        let channel = self.watch.notify_for(&item.url, &anchor);
         if let Err(e) = self
             .notifier
-            .send("live_start", &anchor, &title, &content, channel)
+            .send("live_start", &anchor, &title, &content, &channel)
             .await
         {
             warn!("[{}] 开播通知失败: {e:#}", anchor);

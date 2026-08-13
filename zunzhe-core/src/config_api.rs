@@ -1,9 +1,9 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
-use crate::config::IniFile;
+use crate::config::{IniFile, patch_ini_file};
 
 /// 与 Python fupan.config_api 对齐的 JSON 配置读写。
 pub struct ConfigApi {
@@ -174,73 +174,6 @@ fn mask_secret<'a>(section: &str, key: &str, value: &'a str) -> &'a str {
     if secret { "***" } else { value }
 }
 
-/// 逐行原地修改 INI：保留注释、空行、顺序与键大小写；新节/新键追加到文件末尾。
-fn patch_ini_file(path: &Path, pairs: &[(&str, &str, &str)]) -> Result<()> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("读取配置文件失败: {}", path.display()))?;
-    let mut lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
-    let mut pending: Vec<(&str, &str, &str)> = pairs.to_vec();
-    let mut i = 0;
-    while i < lines.len() {
-        let line = lines[i].trim_start_matches('\u{feff}').trim().to_string();
-        if let Some(name) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-            let current_section = name.trim().to_string();
-            // 找当前节内待改键，保留原行
-            let mut j = i + 1;
-            while j < lines.len() {
-                let inner = lines[j].trim_start_matches('\u{feff}').trim().to_string();
-                if inner.starts_with('[') {
-                    break;
-                }
-                if let Some((k, _)) = inner.split_once('=') {
-                    let k = k.trim();
-                    if let Some(pos) = pending
-                        .iter()
-                        .position(|(s, pk, _)| *s == current_section && *pk == k)
-                    {
-                        let (_, _, v) = pending.remove(pos);
-                        lines[j] = format!("{k} = {v}");
-                    }
-                }
-                j += 1;
-            }
-            i = j;
-            continue;
-        }
-        i += 1;
-    }
-    // 剩余待写键：找对应节，节内没有则追加；没有节则新建节。
-    for (section, key, value) in pending {
-        let sec_line = format!("[{section}]");
-        let sec_pos = lines
-            .iter()
-            .position(|l| l.trim_start_matches('\u{feff}').trim() == sec_line);
-        if let Some(pos) = sec_pos {
-            let mut insert_at = pos + 1;
-            while insert_at < lines.len() {
-                let t = lines[insert_at]
-                    .trim_start_matches('\u{feff}')
-                    .trim()
-                    .to_string();
-                if t.starts_with('[') {
-                    break;
-                }
-                insert_at += 1;
-            }
-            lines.insert(insert_at, format!("{key} = {value}"));
-        } else {
-            if !lines.is_empty() && !lines.last().map(|l| l.trim().is_empty()).unwrap_or(true) {
-                lines.push(String::new());
-            }
-            lines.push(sec_line);
-            lines.push(format!("{key} = {value}"));
-        }
-    }
-    std::fs::write(path, lines.join("\n") + "\n")
-        .with_context(|| format!("写配置失败: {}", path.display()))?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,6 +221,29 @@ mod tests {
         assert!(text.contains("# 间隔注释"));
         assert!(text.contains("检查间隔秒 = 600"));
         assert!(!text.contains("检查间隔秒 = 900"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn patch_matches_existing_key_case_insensitively() {
+        let dir = std::env::temp_dir().join(format!("zunzhe-config-case-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        let path = dir.join("config").join("config.ini");
+        std::fs::write(
+            &path,
+            "[推送配置]\nsmtp邮件服务器 = smtp.qq.com\n是否使用smtp服务ssl加密(是/否) = 是\n",
+        )
+        .unwrap();
+        let api = ConfigApi::new(dir.clone());
+        api.set("config", "推送配置", "SMTP邮件服务器", "smtp.qq.com")
+            .unwrap();
+        api.set("config", "推送配置", "是否使用SMTP服务SSL加密(是/否)", "是")
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("smtp邮件服务器 = smtp.qq.com"));
+        assert!(text.contains("是否使用smtp服务ssl加密(是/否) = 是"));
+        assert!(!text.contains("SMTP邮件服务器 ="));
+        assert!(!text.contains("是否使用SMTP服务SSL加密(是/否) ="));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

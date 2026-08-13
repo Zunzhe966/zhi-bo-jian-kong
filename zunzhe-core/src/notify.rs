@@ -35,6 +35,59 @@ impl Channel {
         }
     }
 
+    /// 把用户偏好字符串解析成真正要发送的通道集合。
+    ///
+    /// 与旧 Python `_channels_for_pref` 对齐：
+    /// `不通知` 返回空集合；明确通道只返回该通道；`跟随全局`/空值返回
+    /// 邮箱优先 + 当前已配置的 HTTPS 推送通道。
+    pub fn resolve_pref(
+        value: &str,
+        email_configured: bool,
+        push: &crate::config::PushChannels,
+    ) -> Vec<Channel> {
+        let pref = value.trim();
+        if pref == "不通知" {
+            return Vec::new();
+        }
+        if pref == "微信" {
+            return vec![Channel::Wechat];
+        }
+        if pref == "邮箱" {
+            return vec![Channel::Email];
+        }
+        if pref == "PushPlus" {
+            return vec![Channel::PushPlus];
+        }
+        if pref == "Bark" {
+            return vec![Channel::Bark];
+        }
+        if pref == "ntfy" {
+            return vec![Channel::Ntfy];
+        }
+        // 跟随全局 / 空值：邮箱优先，其余已配置通道作为兜底。
+        let mut out = Vec::new();
+        if email_configured {
+            out.push(Channel::Email);
+        }
+        if !push.serverchan.is_empty() {
+            out.push(Channel::Wechat);
+        }
+        if !push.pushplus.is_empty() {
+            out.push(Channel::PushPlus);
+        }
+        if !push.bark.is_empty() {
+            out.push(Channel::Bark);
+        }
+        if !push.ntfy.is_empty() {
+            out.push(Channel::Ntfy);
+        }
+        if out.is_empty() {
+            // 没有任何通道可用时，保留 Email 语义，让调用方得到“未配置邮箱”的可诊断结果。
+            out.push(Channel::Email);
+        }
+        out
+    }
+
     fn name(&self) -> &'static str {
         match self {
             Channel::Email => "邮箱",
@@ -64,41 +117,54 @@ impl<'a> Notifier<'a> {
         anchor: &str,
         title: &str,
         content: &str,
-        channel: Channel,
+        pref: &str,
     ) -> Result<bool> {
-        // 只有“邮箱”需要特殊跳过：未配置邮箱不落库，避免通知表被空配置撑满。
-        // 其它 HTTPS 通道即便未配置也会写一条 failed，供用户定位配置缺口。
-        if channel == Channel::Email && !self.config.email_configured() {
-            tracing::warn!("邮箱未配置，跳过发送并保持通知可审计性（不写入 pending 队列）");
+        let channels = Channel::resolve_pref(
+            pref,
+            self.config.email_configured(),
+            &self.config.push_channels(),
+        );
+        if channels.is_empty() {
             return Ok(false);
         }
-        let id = db::add_notify(self.pool, event, anchor, title, content, channel.name()).await?;
-        if channel == Channel::None {
-            // “不通知”本身是有效投递策略：保留审计记录但立即完成。
-            db::mark_notify_done(self.pool, id).await?;
-            return Ok(false);
-        }
-        let sent = match channel {
-            Channel::Email => {
-                let settings = self.config.email_settings();
-                let subject = title.to_string();
-                let body = content.to_string();
-                Self::send_email_with_timeout(settings, subject, body).await
+        let mut any_sent = false;
+        for channel in channels {
+            // 只有“邮箱”需要特殊跳过：未配置邮箱不落库，避免通知表被空配置撑满。
+            // 其它 HTTPS 通道即便未配置也会写一条 failed，供用户定位配置缺口。
+            if channel == Channel::Email && !self.config.email_configured() {
+                tracing::warn!("邮箱未配置，跳过发送并保持通知可审计性（不写入 pending 队列）");
+                continue;
             }
-            Channel::Wechat => self.send_wechat(title, content).await,
-            Channel::PushPlus => self.send_pushplus(title, content).await,
-            Channel::Bark => self.send_bark(title, content).await,
-            Channel::Ntfy => self.send_ntfy(title, content).await,
-            Channel::None => false,
-        };
-        if sent {
-            db::mark_notify_done(self.pool, id).await?;
-        } else {
-            // SMTP/HTTPS 明确失败或超时后不留在 pending，避免配置错误时每轮重试
-            // 并无限膨胀通知队列；临时网络抖动可由用户重试或重新触发。
-            db::fail_notify(self.pool, id).await?;
+            let id =
+                db::add_notify(self.pool, event, anchor, title, content, channel.name()).await?;
+            if channel == Channel::None {
+                // “不通知”本身是有效投递策略：保留审计记录但立即完成。
+                db::mark_notify_done(self.pool, id).await?;
+                continue;
+            }
+            let sent = match channel {
+                Channel::Email => {
+                    let settings = self.config.email_settings();
+                    let subject = title.to_string();
+                    let body = content.to_string();
+                    Self::send_email_with_timeout(settings, subject, body).await
+                }
+                Channel::Wechat => self.send_wechat(title, content).await,
+                Channel::PushPlus => self.send_pushplus(title, content).await,
+                Channel::Bark => self.send_bark(title, content).await,
+                Channel::Ntfy => self.send_ntfy(title, content).await,
+                Channel::None => false,
+            };
+            if sent {
+                db::mark_notify_done(self.pool, id).await?;
+                any_sent = true;
+            } else {
+                // SMTP/HTTPS 明确失败或超时后不留在 pending，避免配置错误时每轮重试
+                // 并无限膨胀通知队列；临时网络抖动可由用户重试或重新触发。
+                db::fail_notify(self.pool, id).await?;
+            }
         }
-        Ok(sent)
+        Ok(any_sent)
     }
 
     /// 重试通知队列中的 pending 通知：一次最多处理 50 条，失败保留 pending，
@@ -110,14 +176,14 @@ impl<'a> Notifier<'a> {
         let pending = db::list_notify(self.pool, "pending", limit).await?;
         let mut sent_count = 0;
         for item in pending {
-            let channel = Channel::parse(&item.channel);
+            let channel = item.channel.clone();
             match self
                 .send(
                     &item.event,
                     &item.anchor,
                     &item.title,
                     &item.content,
-                    channel,
+                    &channel,
                 )
                 .await
             {
@@ -504,6 +570,29 @@ mod tests {
         assert_eq!(Channel::parse("跟随全局"), Channel::Email);
     }
 
+    #[test]
+    fn resolves_pref_to_configured_channels() {
+        let push = crate::config::PushChannels {
+            serverchan: "SCT-real".to_string(),
+            pushplus: "".to_string(),
+            bark: "https://bark.example/key".to_string(),
+            ntfy: "".to_string(),
+        };
+        assert_eq!(
+            Channel::resolve_pref("跟随全局", true, &push),
+            vec![Channel::Email, Channel::Wechat, Channel::Bark]
+        );
+        assert_eq!(
+            Channel::resolve_pref("微信", false, &push),
+            vec![Channel::Wechat]
+        );
+        assert_eq!(Channel::resolve_pref("不通知", true, &push), vec![]);
+        assert_eq!(
+            Channel::resolve_pref("跟随全局", false, &crate::config::PushChannels::default()),
+            vec![Channel::Email]
+        );
+    }
+
     #[tokio::test]
     async fn unconfigured_wechat_marks_failed_not_pending() {
         let dir = std::env::temp_dir().join(format!(
@@ -529,7 +618,7 @@ mod tests {
         let cfg = crate::config::Config::load(&dir).unwrap();
         let notifier = Notifier::new(&pool, &cfg);
         let sent = notifier
-            .send("video", "博主", "新视频", "内容", Channel::Wechat)
+            .send("video", "博主", "新视频", "内容", "微信")
             .await
             .unwrap();
         assert!(!sent);
@@ -641,7 +730,7 @@ mod tests {
         let cfg = crate::config::Config::load(&dir).unwrap();
         let notifier = Notifier::new(&pool, &cfg);
         let sent = notifier
-            .send("live", "主播", "开播", "内容", Channel::Email)
+            .send("live", "主播", "开播", "内容", "邮箱")
             .await
             .unwrap();
         assert!(!sent);
@@ -678,7 +767,7 @@ mod tests {
         let cfg = crate::config::Config::load(&dir).unwrap();
         let notifier = Notifier::new(&pool, &cfg);
         let sent = notifier
-            .send("video", "博主", "新视频", "内容", Channel::Wechat)
+            .send("video", "博主", "新视频", "内容", "微信")
             .await
             .unwrap();
         assert!(!sent);
