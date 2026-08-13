@@ -55,9 +55,11 @@ pub async fn cache_cover(fupan_dir: &Path, cover_url: &str, video_id: &str) -> R
     if dest.exists() && dest.metadata().map(|m| m.len() > 0).unwrap_or(false) {
         return Ok(dest.display().to_string());
     }
-    // 异步下载小封面；失败保留原 URL 作为兜底。
+    // 异步下载小封面；失败保留原 URL 作为兜底。封面图偶尔会慢或不可达，
+    // 必须给请求加显式超时，避免视频库 upsert 卡住拖慢整个监控轮次。
     let client = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)")
+        .timeout(std::time::Duration::from_secs(10))
         .build()
         .unwrap_or_default();
     let cover = cover_url.to_string();

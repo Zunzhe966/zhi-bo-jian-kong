@@ -407,13 +407,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             );
         }
         Command::EmailImportLegacy { legacy_file } => {
-            // Python 旧版从 fupan_config/旧配置导入邮箱；Rust 已统一读 config.ini，
-            // 这里保留命令名与提示，避免桌面端/脚本因缺命令中断。
-            println!(
-                "{}",
-                json!({"ok": true, "legacy_file": legacy_file,
-                       "hint": "Rust 版邮箱配置统一使用 config.ini 的 [推送配置] 字段"})
-            );
+            match config::import_legacy_email(&project_dir, &legacy_file) {
+                Ok(result) => println!("{}", serde_json::to_string(&result)?),
+                Err(e) => println!(
+                    "{}",
+                    json!({"ok": false, "error": e.to_string(), "legacy_file": legacy_file})
+                ),
+            }
         }
         Command::ExportTrainingData { anchor, output } => {
             let summary = training_data::export(&fupan_dir, &anchor, &output)?;

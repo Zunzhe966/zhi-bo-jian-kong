@@ -384,6 +384,122 @@ pub fn write_qq_email(project_dir: &Path, email: &str, auth: &str, to: &str) -> 
     Ok(())
 }
 
+/// 从老项目 `accounts.json` 迁移 QQ 邮箱账号。
+///
+/// 安全边界与 Python `email_setup.import_legacy_account` 一致：只读取
+/// 账号文件，绝不猜测授权码。若密码字段是明文，直接写入；若是加密字符串
+/// 且本机没有老项目解密密钥，则返回可读错误，让用户重新填写授权码。
+pub fn import_legacy_email(project_dir: &Path, legacy_file: &str) -> Result<serde_json::Value> {
+    use serde_json::json;
+
+    let default_path = dirs::home_dir()
+        .unwrap_or_default()
+        .join("Projects")
+        .join("owned")
+        .join("zunzhe-dev")
+        .join("mcp_server")
+        .join("data")
+        .join("email")
+        .join("accounts.json");
+    let path = if legacy_file.is_empty() {
+        default_path
+    } else {
+        PathBuf::from(legacy_file)
+    };
+    if !path.exists() {
+        return Ok(json!({
+            "ok": false,
+            "error": format!("老项目邮箱账号文件不存在: {}。老项目里只有代码支持，没有实际账号，需要你提供 QQ 邮箱授权码。", path.display()),
+            "file": path.display().to_string()
+        }));
+    }
+
+    let text = fs::read_to_string(&path)
+        .with_context(|| format!("读取老项目账号文件失败: {}", path.display()))?;
+    let data: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("老项目账号文件 JSON 解析失败: {}", path.display()))?;
+    let accounts = match &data {
+        serde_json::Value::Array(list) => list.clone(),
+        serde_json::Value::Object(map) => map
+            .get("accounts")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    if accounts.is_empty() {
+        return Ok(
+            json!({"ok": false, "error": "账号文件为空，没有可迁移的邮箱账号", "file": path.display().to_string()}),
+        );
+    }
+
+    let account = accounts
+        .iter()
+        .filter_map(|v| v.as_object())
+        .find(|m| {
+            m.get("email")
+                .or_else(|| m.get("email_addr"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_lowercase().ends_with("@qq.com"))
+                .unwrap_or(false)
+        })
+        .or_else(|| accounts.first().and_then(|v| v.as_object()));
+
+    let Some(account) = account else {
+        return Ok(
+            json!({"ok": false, "error": "账号文件没有可识别的账号", "file": path.display().to_string()}),
+        );
+    };
+    let email = account
+        .get("email")
+        .or_else(|| account.get("email_addr"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    // 老项目密码字段为 AES-256-GCM 密文；Rust 不猜解密密钥，因此先识别
+    // `_password`，避免后面的明文 `auth/password` 字段掩盖加密风险。
+    let encrypted = account
+        .get("_password")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let auth = account
+        .get("auth")
+        .or_else(|| account.get("password"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if email.is_empty() {
+        return Ok(json!({
+            "ok": false,
+            "error": "账号记录缺少邮箱，无法迁移。请在桌面端「全局设置」重新填写邮箱。",
+            "file": path.display().to_string()
+        }));
+    }
+    if !encrypted.is_empty() {
+        return Ok(json!({
+            "ok": false,
+            "error": "找到 QQ 邮箱账号，但授权码是加密存储且无法在本项目解密。请在桌面端「全局设置」重新填写授权码。",
+            "email": email,
+            "file": path.display().to_string()
+        }));
+    }
+    if auth.is_empty() {
+        return Ok(json!({
+            "ok": false,
+            "error": "账号记录缺少授权码，无法迁移。请在桌面端「全局设置」重新填写授权码。",
+            "file": path.display().to_string()
+        }));
+    }
+    write_qq_email(project_dir, email, auth, email)?;
+    Ok(json!({
+        "ok": true,
+        "email": email,
+        "to": email,
+        "hint": "已从老项目迁移 QQ 邮箱账号。"
+    }))
+}
+
 /// 逐行原地修改 INI，保留注释、空行、顺序与已有键大小写。
 ///
 /// 更新已有键时按大小写不敏感匹配（对齐 Python `config_api._match_existing_key`），
@@ -551,6 +667,39 @@ SMTP邮件服务器端口 = 465
         assert!(!text.contains("SMTP邮件服务器 ="));
         assert!(text.contains("邮箱登录账号 = me@qq.com"));
         assert!(text.contains("收件人邮箱 = you@qq.com"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_legacy_email_rejects_encrypted_password() {
+        let dir = std::env::temp_dir().join(format!("zunzhe-import-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = dir.join("accounts.json");
+        std::fs::write(
+            &legacy,
+            r#"[{"email":"me@qq.com","_password":"aes-cipher-not-plaintext"}]"#,
+        )
+        .unwrap();
+
+        let result = import_legacy_email(&dir, legacy.to_str().unwrap()).unwrap();
+        assert_eq!(result["ok"], false);
+        assert!(result["error"].as_str().unwrap().contains("加密存储"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_legacy_email_writes_plaintext_auth() {
+        let dir = std::env::temp_dir().join(format!("zunzhe-import-plain-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = dir.join("accounts.json");
+        std::fs::write(&legacy, r#"[{"email":"me@qq.com","auth":"qq-smtp-code"}]"#).unwrap();
+
+        let result = import_legacy_email(&dir, legacy.to_str().unwrap()).unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["email"], "me@qq.com");
+        let text = std::fs::read_to_string(dir.join("config").join("config.ini")).unwrap();
+        assert!(text.contains("邮箱登录账号 = me@qq.com"));
+        assert!(text.contains("发件人密码(授权码) = qq-smtp-code"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
