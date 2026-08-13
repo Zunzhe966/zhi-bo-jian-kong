@@ -8,8 +8,8 @@ use tokio::process::Command;
 use tracing::{debug, warn};
 
 use crate::bilibili_auth::{
-    browser_cookie_path, cookie_header_from_netscape_public, cookie_header_from_project,
-    ensure_user_cookie_file,
+    browser_cookie_path, cookie_header_from_netscape_public, ensure_anon_cookie,
+    ensure_user_cookie_file, read_browser_cookie_file,
 };
 use crate::model::VideoMeta;
 use crate::process::{ChildError, ManagedChild};
@@ -47,6 +47,8 @@ fn build_wbi_query(img_key: &str, sub_key: &str, mid: &str, count: u32, wts: u64
         ("ps".to_string(), count.to_string()),
         ("pn".to_string(), "1".to_string()),
         ("order".to_string(), "pubdate".to_string()),
+        ("platform".to_string(), "web".to_string()),
+        ("web_location".to_string(), "1550101".to_string()),
         ("wts".to_string(), wts.to_string()),
     ];
     params.sort();
@@ -104,7 +106,7 @@ impl BilibiliAdapter {
         // nav 是 WBI 图片 key 的来源；有配置/浏览器 Cookie 时也必须一并带上，
         // 否则即使用户已授权，这一步仍可能被 B站当成匿名出口并 412，导致
         // 官方投稿接口永远回退到 RSSHub/yt-dlp。
-        let cookie = self.effective_cookie();
+        let cookie = self.effective_cookie().await;
         let mut req = client
             .get("https://api.bilibili.com/x/web-interface/nav")
             .header(
@@ -143,8 +145,18 @@ impl BilibiliAdapter {
     }
 
     /// 从桌面端「B站授权」导出的 Netscape cookie 文件读取 Cookie 字符串。
+    ///
+    /// 读取失败（如文件存在但无权限或损坏）时返回错误，而不是静默假装没有 Cookie，
+    /// 让真实授权状态和程序缺陷不会混在一起。
     fn browser_cookie_from_project(&self) -> String {
-        cookie_header_from_project(&self.project_dir)
+        match read_browser_cookie_file(&self.project_dir) {
+            Ok(Some(text)) => cookie_header_from_netscape_public(&text),
+            Ok(None) => String::new(),
+            Err(e) => {
+                tracing::warn!("读取 B站授权 Cookie 失败: {e:#}");
+                String::new()
+            }
+        }
     }
 
     /// 用户配置 Cookie 写入旧 Python 同路径的 Netscape 文件，并转成请求头。
@@ -205,7 +217,23 @@ impl BilibiliAdapter {
         if !browser.is_empty() {
             return browser;
         }
-        String::new()
+        // 没有账号 Cookie 时，桌面端导出的浏览器 Cookie 里通常至少会有
+        // bili_ticket/buvid 等风控校验字段；这里补一次同步读取，避免上面
+        // `browser_cookie_from_project` 的日志路径把可恢复文件当成空状态。
+        match read_browser_cookie_file(&self.project_dir) {
+            Ok(Some(text)) => {
+                let header = cookie_header_from_netscape_public(&text);
+                if header.is_empty() {
+                    tracing::warn!("B站授权 Cookie 文件存在但没有可导出字段");
+                }
+                header
+            }
+            Ok(None) => String::new(),
+            Err(e) => {
+                tracing::warn!("读取 B站授权 Cookie 失败: {e:#}");
+                String::new()
+            }
+        }
     }
 
     pub fn with_cookie_and_project_dir(cookie: impl Into<String>, project_dir: PathBuf) -> Self {
@@ -216,11 +244,16 @@ impl BilibiliAdapter {
         }
     }
 
-    fn effective_cookie(&self) -> String {
+    async fn effective_cookie(&self) -> String {
         if !self.cookie.is_empty() {
             self.cookie.clone()
         } else if let Some(cookie) = self.user_cookie_file() {
             let Ok(text) = std::fs::read_to_string(cookie) else {
+                return self.browser_cookie_from_project();
+            };
+            cookie_header_from_netscape_public(&text)
+        } else if let Some(anon) = ensure_anon_cookie(&self.project_dir).await {
+            let Ok(text) = std::fs::read_to_string(anon) else {
                 return self.browser_cookie_from_project();
             };
             cookie_header_from_netscape_public(&text)
@@ -242,7 +275,7 @@ impl BilibiliAdapter {
             reqwest::header::REFERER,
             reqwest::header::HeaderValue::from_static("https://www.bilibili.com"),
         );
-        let cookie = self.effective_cookie();
+        let cookie = self.effective_cookie().await;
         if !cookie.is_empty()
             && let Ok(v) = reqwest::header::HeaderValue::from_str(&cookie)
         {
@@ -411,7 +444,7 @@ impl BilibiliAdapter {
     }
 
     async fn upload_ids_ytdlp(&self, mid: &str, count: u32) -> Vec<String> {
-        let cookie = self.effective_cookie();
+        let cookie = self.effective_cookie().await;
         // 与旧 Python 一致：用户配置 Cookie 优先转成 `--cookies`；没有账号 Cookie
         // 才补匿名 buvid 文件，且不把用户 Cookie 写成易被截断的 `--add-header`。
         let candidate = self
@@ -767,7 +800,14 @@ fn normalize_rss_date(raw: Option<String>) -> String {
 /// 带项目根的平台注册表：yt-dlp 兜底按项目 .venv 查找，跨目录运行也可用。
 pub fn resolve_with_project_dir(url: &str, project_dir: &Path) -> Box<dyn Platform> {
     if url.contains("bilibili.com") || url.contains("b23.tv") {
-        Box::new(BilibiliAdapter::with_project_dir(project_dir.to_path_buf()))
+        let cookie = crate::config::Config::load(project_dir)
+            .ok()
+            .map(|c| c.get_fupan("视频监控", "b站cookie"))
+            .unwrap_or_default();
+        Box::new(BilibiliAdapter::with_cookie_and_project_dir(
+            cookie,
+            project_dir.to_path_buf(),
+        ))
     } else {
         Box::new(RssAdapter::new())
     }
@@ -892,7 +932,7 @@ mod tests {
         );
         assert_eq!(
             query,
-            "mid=946974&order=pubdate&pn=1&ps=10&wts=1786550400&w_rid=6ee69f49fe6f88e479e6a504b0521981"
+            "mid=946974&order=pubdate&platform=web&pn=1&ps=10&web_location=1550101&wts=1786550400&w_rid=1b8f0e19353b02df0a82591de339a31f"
         );
         assert!(query.contains("&w_rid="));
     }

@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use anyhow::Context;
+
 /// 桌面端「B站授权」导出的浏览器 Cookie 固定相对路径。
 pub fn browser_cookie_path(project_dir: &Path) -> PathBuf {
     project_dir
@@ -30,6 +32,21 @@ pub fn cookie_header_from_project(project_dir: &Path) -> String {
         return String::new();
     };
     cookie_header_from_netscape(&text)
+}
+
+/// 同步读取桌面端导出的 Netscape Cookie 文件。
+///
+/// `cookie_header_from_project` 为了兼容旧调用直接吞掉 IO 错误，导致“文件存在但
+/// 打不开/被截断”与“从未授权”都返回空串。这里返回可区分的 `Result`，供新调用
+/// 在失败时报告真实原因，避免把权限问题伪装成“没有 Cookie”。
+pub fn read_browser_cookie_file(project_dir: &Path) -> anyhow::Result<Option<String>> {
+    let path = browser_cookie_path(project_dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("读取 B站 Cookie 文件失败: {}", path.display()))?;
+    Ok(Some(text))
 }
 
 /// B站匿名设备 Cookie 文件（buvid3/buvid4）固定相对路径。
