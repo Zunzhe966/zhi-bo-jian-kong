@@ -243,6 +243,17 @@ fn maintenance_marker_age(marker: &Path) -> Option<Duration> {
     ))
 }
 
+/// 读取维护哨兵的时间戳（Unix 秒）；缺失/损坏返回 `None`。
+///
+/// daemon 启动时用真实哨兵恢复维护计时，避免“重启即重置”让 6 小时周期
+/// 永远推迟；CLI/MCP 的 `maintenance_if_due` 与 daemon 主循环共用同一哨兵，
+/// 不能各记各的。
+pub fn maintenance_marker_timestamp(marker: &Path) -> Option<i64> {
+    let text = std::fs::read_to_string(marker).ok()?;
+    let ts = chrono::DateTime::parse_from_rfc3339(text.trim()).ok()?;
+    Some(ts.timestamp())
+}
+
 /// daemon 主循环与独立入口共用的维护周期（6 小时）。
 pub const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(6 * 3600);
 
@@ -448,6 +459,29 @@ mod maintenance_tests {
 mod opportunistic_maintenance_tests {
     use super::*;
     use std::time::SystemTime;
+
+    #[test]
+    fn maintenance_marker_timestamp_recovers_after_restart() {
+        let project = temp_project("marker-ts");
+        let marker = project
+            .0
+            .join("fupan_output")
+            .join("run")
+            .join("zunzhe-core.maintenance");
+        // 哨兵缺省时返回 None：daemon 启动会立即执行一次维护，而不是把计时
+        // 重置成“现在”后继续推迟 6 小时。
+        assert_eq!(maintenance_marker_timestamp(&marker), None);
+        // 写入 3 小时前的哨兵：返回真实时间戳，重启后仍按“已运行 3 小时”恢复。
+        let three_hours_ago = (chrono::Local::now() - chrono::Duration::hours(3)).to_rfc3339();
+        std::fs::write(&marker, three_hours_ago).unwrap();
+        let ts = maintenance_marker_timestamp(&marker).unwrap();
+        let now = chrono::Local::now().timestamp();
+        assert!(
+            now - ts >= 3 * 3600 - 5 && now - ts <= 3 * 3600 + 5,
+            "哨兵时间戳应接近写入时刻: now={now} ts={ts}"
+        );
+        let _ = std::fs::remove_dir_all(&project.0);
+    }
 
     fn temp_project(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
         let project = std::env::temp_dir().join(format!(

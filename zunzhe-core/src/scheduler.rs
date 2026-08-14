@@ -88,8 +88,15 @@ pub async fn run_daemon(
     }
     let mut stop = tokio::sync::watch::channel(false);
     // SQLite 维护计数器：每 6 小时 checkpoint/optimize 一次，防长期 WAL 膨胀。
+    // 必须从持久化哨兵恢复，而不是每次启动都重置为当前时间，否则频繁重启
+    // 会让维护永远推迟，run 目录残留/数据库 WAL 长期得不到周期收敛。
     let maintenance_interval = 6 * 3600u64;
-    let mut last_maintenance = chrono::Local::now().timestamp();
+    let maintenance_marker = fupan_dir.join("run").join("zunzhe-core.maintenance");
+    let mut last_maintenance = match crate::db::maintenance_marker_timestamp(&maintenance_marker) {
+        Some(ts) if ts > 0 => ts,
+        // 哨兵缺失/损坏：立即执行一次维护，让新目录或异常状态尽快收敛。
+        _ => 0,
+    };
     // 独立下载队列 worker：不参与 70 秒 tick 护栏，每个任务自身有 600 秒超时。
     // 下载耗时不会阻塞直播/视频检查，也不会被 tick abort 后永远卡 processing。
     let mut download_worker = tokio::spawn(download::run_download_worker(
