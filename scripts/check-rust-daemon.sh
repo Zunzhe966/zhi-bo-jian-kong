@@ -14,6 +14,25 @@ fi
 LOG="$ROOT/logs/zunzhe-core.watchdog.log"
 mkdir -p "$(dirname "$LOG")"
 
+# 桌面端 watchdog 每分钟追加一行；按大小轮转并保留最近 5 份，避免
+# 24×30 期间只靠桌面端运行时日志无限增长。
+rotate_if_large() {
+  local file="$1"
+  local max_bytes="${2:-5242880}"
+  if [ -f "$file" ] && [ "$(stat -f%z "$file" 2>/dev/null || echo 0)" -ge "$max_bytes" ]; then
+    for i in 5 4 3 2 1; do
+      if [ -f "$file.$i" ]; then
+        mv -f "$file.$i" "$file.$((i+1))" 2>/dev/null || true
+      fi
+    done
+    if [ -f "$file.1" ]; then
+      mv -f "$file.1" "$file.2" 2>/dev/null || true
+    fi
+    mv -f "$file" "$file.1" 2>/dev/null || true
+  fi
+}
+rotate_if_large "$LOG"
+
 now="$(date '+%Y-%m-%d %H:%M:%S %z')"
 pid="$(cat "$ROOT/fupan_output/run/zunzhe-core.pid" 2>/dev/null || true)"
 

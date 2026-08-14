@@ -15,7 +15,19 @@ if (-not (Test-Path $RustBin)) {
 
 $LogDir = Join-Path $Root 'logs'
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
-$Log = Join-Path $LogDir 'zunzhe-core.uptime.log'
+$Log = Join-Path $LogDir 'zunzhe-core.watchdog.log'
+function Rotate-IfLarge {
+  param([string]$Path, [int]$MaxBytes = 5242880, [int]$Keep = 5)
+  if (-not (Test-Path $Path)) { return }
+  $item = Get-Item $Path
+  if ($item.Length -lt $MaxBytes) { return }
+  for ($i = $Keep; $i -ge 1; $i--) {
+    $from = if ($i -eq 1) { $Path } else { "$Path.$($i-1)" }
+    $to = "$Path.$i"
+    if (Test-Path $from) { Move-Item -Force $from $to }
+  }
+}
+Rotate-IfLarge $Log
 $PidFile = Join-Path $Root 'fupan_output\run\zunzhe-core.pid'
 $Pid = if (Test-Path $PidFile) { (Get-Content -Raw $PidFile).Trim() } else { 'none' }
 

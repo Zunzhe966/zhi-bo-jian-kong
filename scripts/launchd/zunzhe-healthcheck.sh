@@ -32,6 +32,8 @@ rotate_if_large() {
 }
 rotate_if_large "$LOG_DIR/zunzhe-core.log"
 rotate_if_large "$LOG_DIR/zunzhe-core.err.log"
+rotate_if_large "$LOG_DIR/zunzhe-healthcheck.log"
+rotate_if_large "$LOG_DIR/zunzhe-healthcheck.err.log"
 
 now="$(date '+%Y-%m-%d %H:%M:%S %z')"
 # watchdog 日志独立成文件，避免与 daemon 心跳日志混写；pid 读取失败只
