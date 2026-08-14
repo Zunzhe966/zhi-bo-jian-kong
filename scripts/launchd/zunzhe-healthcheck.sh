@@ -32,6 +32,13 @@ if [ -x "$GUARD" ]; then
   ZUNZHE_PROJECT_ROOT="$ROOT" "$GUARD" >> "$HOME/Library/Logs/zunzhe/zunzhe-healthcheck.log" 2>/dev/null || true
 fi
 
+# 24×30 体检：把 doctor 的 health_audit 指标按分钟写入 logs/zunzhe-core.audit.log，
+# 供长期验收读取 RSS/心跳/断档；失败不阻塞健康看门狗。
+AUDIT="$ROOT/scripts/audit-longrun.sh"
+if [ -x "$AUDIT" ]; then
+  ZUNZHE_PROJECT_ROOT="$ROOT" "$AUDIT" >> "$HOME/Library/Logs/zunzhe/zunzhe-healthcheck.log" 2>/dev/null || true
+fi
+
 case "$ROOT" in
   "$HOME/Desktop/"*)
     echo "项目在 $ROOT：macOS TCC 会阻止 launchd 稳定运行。请把项目迁移到 ~/Projects 或 ~/Documents 后再注册 launchd。" >&2

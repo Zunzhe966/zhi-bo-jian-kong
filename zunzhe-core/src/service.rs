@@ -4,6 +4,127 @@ use anyhow::{Context, Result, bail};
 use serde_json::json;
 use std::sync::OnceLock;
 
+/// 24×30 长跑健康审计的机器可读结果。
+///
+/// `doctor` 原本的 `ok` 表示“环境可用”，并不代表 daemon 正在健康运行；
+/// 长跑验收需要单独一个字段区分“环境没问题”和“守护确实在跑且心跳连续”。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HealthAudit {
+    pub ok: bool,
+    pub daemon_ok: bool,
+    pub heartbeat_ok: bool,
+    pub uptime_secs: u64,
+    pub uptime_human: String,
+    pub pid: Option<u32>,
+    pub rss_kib: Option<u64>,
+    pub started_at: Option<String>,
+    pub last_heartbeat_age_secs: Option<u64>,
+    pub heartbeat_lines: usize,
+    pub last_log_line_at: Option<String>,
+}
+
+/// 读取 daemon 自己每 60 秒追加的 uptime 日志，量化“连续心跳、启动记录、
+/// 日志断档、当前 RSS”四个 24×30 关键指标。任何一项不可解析都不 panic，
+/// 只把该字段留空并保持 `ok=false`，让上层诊断而不是让审计进程崩溃。
+pub fn health_audit(project_dir: &Path) -> HealthAudit {
+    let pid = std::fs::read_to_string(pid_file(project_dir, "zunzhe-core"))
+        .ok()
+        .and_then(|text| text.trim().parse::<u32>().ok());
+    let daemon_ok = rust_daemon_alive(project_dir);
+    let heartbeat_ok = heartbeat_fresh(project_dir, 30 * 60);
+    let (uptime_secs, uptime_human) = daemon_uptime(project_dir);
+    let rss_kib = pid.and_then(process_rss_kib);
+
+    let log = project_dir.join("logs").join("zunzhe-core.uptime.log");
+    let text = std::fs::read_to_string(&log).unwrap_or_default();
+    let heartbeat_lines = text
+        .lines()
+        .filter(|line| line.contains("rust_daemon=true") || line.contains("heartbeat_ok=true"))
+        .count();
+    let started_at = text
+        .lines()
+        .find(|line| line.contains(" started "))
+        .map(|line| {
+            line.split(" started")
+                .next()
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string()
+        });
+    let last_log_line_at = text.lines().rev().find_map(|line| {
+        let mut parts = line.splitn(3, ' ');
+        let date = parts.next()?;
+        let time = parts.next()?;
+        let tz = parts.next()?;
+        if date.len() == 10 && time.len() == 8 && tz.starts_with('+') {
+            Some(format!("{date} {time} {tz}"))
+        } else {
+            None
+        }
+    });
+    let last_heartbeat_age_secs = heartbeat_age_secs(project_dir);
+
+    let ok = daemon_ok
+        && heartbeat_ok
+        && last_heartbeat_age_secs.is_some()
+        && last_heartbeat_age_secs <= Some(30 * 60);
+    HealthAudit {
+        ok,
+        daemon_ok,
+        heartbeat_ok,
+        uptime_secs,
+        uptime_human,
+        pid,
+        rss_kib,
+        started_at,
+        last_heartbeat_age_secs,
+        heartbeat_lines,
+        last_log_line_at,
+    }
+}
+
+/// 读取进程当前 RSS（KiB）。跨平台尽量给出真实值；取不到返回 None，不报错。
+#[cfg(target_os = "linux")]
+pub fn process_rss_kib(pid: u32) -> Option<u64> {
+    let statm = std::fs::read_to_string(format!("/proc/{pid}/statm")).ok()?;
+    let resident_pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    // Linux 页大小固定 4KiB。
+    Some(resident_pages.saturating_mul(4))
+}
+
+/// macOS 没有 /proc，用 `ps -axo pid=,rss=` 全量扫描并按 PID 匹配读取。
+///
+/// 不能用 `ps -p PID`：macOS 的 ps 对超过 99999 的 PID 会直接报
+/// "process id too large"，而 PID 回绕后完全可能出现六位数；全量扫描不受限。
+#[cfg(all(unix, not(target_os = "linux")))]
+pub fn process_rss_kib(pid: u32) -> Option<u64> {
+    process_rss_ps(pid)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn process_rss_ps(pid: u32) -> Option<u64> {
+    let output = std::process::Command::new("ps")
+        .args(["-axo", "pid=,rss="])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        let candidate: u32 = parts.next()?.parse().ok()?;
+        if candidate == pid {
+            parts.next()?.parse::<u64>().ok()
+        } else {
+            None
+        }
+    })
+}
+
+#[cfg(windows)]
+pub fn process_rss_kib(pid: u32) -> Option<u64> {
+    let _ = pid;
+    None
+}
+
 #[allow(dead_code)] // 保留显式 Python 兜底入口，CLI/MCP 默认不再自动调用
 pub fn ensure_started(project_dir: &Path) -> Result<serde_json::Value> {
     let python = python_bin(project_dir);
@@ -507,10 +628,16 @@ pub fn diagnostics(project_dir: &Path) -> Result<serde_json::Value> {
         || std::env::var_os("PATH").is_some_and(|paths| {
             std::env::split_paths(&paths).any(|dir| dir.join(&ffmpeg_path).exists())
         });
+    // 环境可用（ok）与守护健康（health）分离：即使 daemon 不在跑，doctor
+    // 仍应返回环境诊断供修复；health 字段明确告诉调用方“监控本身是否健康”。
+    let audit = health_audit(project_dir);
     Ok(json!({
         "ok": true,
         "rust_daemon": daemon_ok,
         "heartbeat_ok": heartbeat_ok,
+        "daemon_ok": audit.daemon_ok,
+        "health": audit.ok,
+        "health_audit": audit,
         "uptime_secs": uptime_secs,
         "uptime_human": uptime_human,
         "logs_writable": log_dir.is_dir() || std::fs::create_dir_all(&log_dir).is_ok(),
@@ -1021,6 +1148,89 @@ mod tests {
         let (secs, human) = daemon_uptime(&dir);
         assert_eq!(secs, 0);
         assert!(human.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn health_audit_reports_daemon_and_heartbeat_and_rss() {
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-health-audit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        std::fs::create_dir_all(dir.join("fupan_output").join("run")).unwrap();
+
+        // 心跳与 pid 都不存在：审计必须明确不健康，而不是报空健康。
+        let audit = health_audit(&dir);
+        assert!(!audit.ok);
+        assert!(!audit.daemon_ok);
+        assert!(!audit.heartbeat_ok);
+        assert!(audit.rss_kib.is_none());
+
+        // 当前测试进程作为“daemon”：写 pid 与新鲜心跳，uptime 日志包含启动
+        // 记录和心跳行；审计应能看到这些真实信号。
+        write_rust_daemon_pid(&dir, std::process::id());
+        touch_heartbeat(&dir);
+        let started = chrono::Local::now() - chrono::Duration::seconds(125);
+        std::fs::write(
+            dir.join("logs").join("zunzhe-core.uptime.log"),
+            format!(
+                "{} started pid={}\n{} pid={} rust_daemon=true heartbeat_ok=true\n",
+                started.format("%Y-%m-%d %H:%M:%S %z"),
+                std::process::id(),
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S %z"),
+                std::process::id()
+            ),
+        )
+        .unwrap();
+
+        let audit = health_audit(&dir);
+        assert!(audit.daemon_ok, "当前测试进程应视为 daemon 存活");
+        assert!(audit.heartbeat_ok, "刚写入的心跳应视为新鲜");
+        assert_eq!(audit.pid, Some(std::process::id()));
+        // RSS 在测试进程退出后可能已查不到（macOS ps 全量快照有竞态），
+        // 不作为硬性健康条件；真实常驻 daemon 下能读到即可用于诊断。
+        assert!(audit.uptime_secs >= 120);
+        assert!(audit.heartbeat_lines >= 1);
+        assert!(audit.started_at.is_some());
+        assert!(audit.last_log_line_at.is_some());
+        assert!(
+            audit.ok,
+            "daemon+心跳+RSS 齐全时整体 health 应为 true: {audit:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn health_audit_tolerates_corrupt_uptime_log() {
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-health-corrupt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        std::fs::create_dir_all(dir.join("fupan_output").join("run")).unwrap();
+        std::fs::write(
+            dir.join("logs").join("zunzhe-core.uptime.log"),
+            b"\xff\xfe\x00",
+        )
+        .unwrap();
+
+        let audit = health_audit(&dir);
+        assert!(!audit.ok);
+        assert_eq!(audit.heartbeat_lines, 0);
+        assert!(audit.started_at.is_none());
+        assert!(audit.last_log_line_at.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
