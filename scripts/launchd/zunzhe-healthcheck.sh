@@ -18,10 +18,16 @@ if [ ! -f "$ROOT/config/config.ini.example" ] && [ ! -f "$ROOT/config/config.ini
   exit 1
 fi
 
-# 先执行完全访问守卫：即使 launchd 因 TCC 无法读项目，也能在迁移后自愈
-# Codex 的权限配置，避免 App 更新或误切把完全访问改成受限模式。
-if [ -x "$ROOT/scripts/ensure-full-access.sh" ]; then
-  "$ROOT/scripts/ensure-full-access.sh" >> "$HOME/Library/Logs/zunzhe/zunzhe-healthcheck.log" 2>/dev/null || true
+# 先执行完全访问守卫：即使 launchd 因 TCC 无法读项目，也能自愈 Codex 的
+# 权限配置。优先使用随脚本一起安装到 LaunchAgents 的独立副本，避免 launchd
+# 连 ~/Desktop 下的项目脚本都读不到时守卫也被一起挡掉；迁移后项目内副本
+# 更新，setup 会重新覆盖这份副本。
+GUARD="$HOME/Library/LaunchAgents/ensure-full-access.sh"
+if [ ! -x "$GUARD" ]; then
+  GUARD="$ROOT/scripts/ensure-full-access.sh"
+fi
+if [ -x "$GUARD" ]; then
+  "$GUARD" >> "$HOME/Library/Logs/zunzhe/zunzhe-healthcheck.log" 2>/dev/null || true
 fi
 
 case "$ROOT" in
