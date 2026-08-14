@@ -18,6 +18,12 @@ if [ ! -f "$ROOT/config/config.ini.example" ] && [ ! -f "$ROOT/config/config.ini
   exit 1
 fi
 
+# 先执行完全访问守卫：即使 launchd 因 TCC 无法读项目，也能在迁移后自愈
+# Codex 的权限配置，避免 App 更新或误切把完全访问改成受限模式。
+if [ -x "$ROOT/scripts/ensure-full-access.sh" ]; then
+  "$ROOT/scripts/ensure-full-access.sh" >> "$HOME/Library/Logs/zunzhe/zunzhe-healthcheck.log" 2>/dev/null || true
+fi
+
 case "$ROOT" in
   "$HOME/Desktop/"*)
     echo "项目在 $ROOT：macOS TCC 会阻止 launchd 稳定运行。请把项目迁移到 ~/Projects 或 ~/Documents 后再注册 launchd。" >&2
