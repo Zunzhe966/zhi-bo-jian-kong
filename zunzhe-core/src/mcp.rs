@@ -11,7 +11,6 @@ use crate::app_prefs;
 use crate::config::Config;
 use crate::config_api::ConfigApi;
 use crate::db;
-use crate::download::Downloader;
 use crate::platform;
 use crate::scheduler;
 use crate::training_data;
@@ -35,7 +34,6 @@ pub async fn run_mcp(pool: SqlitePool, project_dir: &Path, cfg: Arc<Config>) -> 
         pool.clone(),
         project_dir.join("fupan_output"),
     ));
-    let downloader = Arc::new(Downloader::new(project_dir.to_path_buf()));
     let fupan_dir = project_dir.join("fupan_output");
     let watch = Arc::new(Watchlist::new(project_dir.to_path_buf()));
     let api = Arc::new(ConfigApi::new(project_dir.to_path_buf()));
@@ -86,7 +84,6 @@ pub async fn run_mcp(pool: SqlitePool, project_dir: &Path, cfg: Arc<Config>) -> 
                 let current = reload_config_for_mcp(project_dir, &cfg);
                 let ctx = ToolContext {
                     library: &library,
-                    downloader: &downloader,
                     fupan_dir: &fupan_dir,
                     cfg: &current,
                     pool: &pool,
@@ -135,7 +132,6 @@ fn reload_config_for_mcp(project_dir: &Path, fallback: &Config) -> Config {
 
 struct ToolContext<'a> {
     library: &'a VideoLibrary,
-    downloader: &'a Downloader,
     fupan_dir: &'a Path,
     cfg: &'a Config,
     pool: &'a SqlitePool,
@@ -196,7 +192,6 @@ pub fn tools_list() -> Vec<Value> {
 async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<String> {
     let ToolContext {
         library,
-        downloader,
         fupan_dir,
         cfg,
         pool,
@@ -390,8 +385,20 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
                 .and_then(|v| v.as_str())
                 .unwrap_or("手动下载")
                 .to_string();
-            let result = downloader.download(&url, &name, pool).await?;
-            Ok(serde_json::to_string(&result)?)
+            // 与 CLI 一样统一走下载任务队列，避免与 daemon worker 并发下载。
+            // daemon 未运行时先拉起，确保入队任务真的会被消费。
+            if !crate::service::rust_daemon_alive(project_dir) {
+                crate::service::ensure_core(project_dir)?;
+            }
+            let task_id = crate::download::enqueue_download(pool, &url, &name).await?;
+            Ok(serde_json::to_string(&json!({
+                "ok": true,
+                "queued": true,
+                "task_id": task_id,
+                "url": url,
+                "name": name,
+                "hint": "已加入 daemon 下载队列，下载完成后会自动标记已下载",
+            }))?)
         }
         "video_library" => {
             let source = args

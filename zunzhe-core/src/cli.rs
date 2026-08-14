@@ -405,10 +405,39 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             println!("{}", result);
         }
         Command::DownloadVideo { url, name } => {
-            let downloader = download::Downloader::new(project_dir.clone());
-            match downloader.download(&url, &name, &pool).await {
-                Ok(result) => println!("{}", serde_json::to_string(&result)?),
-                Err(e) => println!("{}", json!({"ok": false, "error": e.to_string()})),
+            // 手动下载与 daemon 下载 worker 必须共用任务队列：直接调用
+            // Downloader::download 会绕过队列，可能与 worker 并发下载同一 URL。
+            // daemon 未运行时先拉起，保证“点了就会下载”而不是只在队列里躺着。
+            if !crate::service::rust_daemon_alive(&project_dir) {
+                let started = crate::service::ensure_core(&project_dir);
+                if let Err(e) = started {
+                    println!(
+                        "{}",
+                        json!({
+                            "ok": false,
+                            "queued": false,
+                            "error": format!("下载任务未入队，且 daemon 启动失败: {e:#}"),
+                        })
+                    );
+                    return Ok(());
+                }
+            }
+            match download::enqueue_download(&pool, &url, &name).await {
+                Ok(task_id) => println!(
+                    "{}",
+                    serde_json::to_string(&json!({
+                        "ok": true,
+                        "queued": true,
+                        "task_id": task_id,
+                        "url": url,
+                        "name": name,
+                        "hint": "已加入 daemon 下载队列，下载完成后会自动标记已下载",
+                    }))?
+                ),
+                Err(e) => println!(
+                    "{}",
+                    json!({"ok": false, "queued": false, "error": e.to_string()})
+                ),
             }
         }
         Command::EmailStatus => {

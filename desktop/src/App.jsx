@@ -642,11 +642,11 @@ export default function App() {
     for (const url of historySelected) {
       try {
         const r = await window.desktop.cli('download-video', url, name)
-        r.ok ? ok++ : fail++
+        r.ok && r.queued ? ok++ : fail++
       } catch { fail++ }
     }
     setHistoryDownloading(false)
-    message[fail ? 'warning' : 'success'](`批量下载完成：成功 ${ok}，失败 ${fail}。文件在 downloads/短视频/${name}/`)
+    message[fail ? 'warning' : 'success'](`已加入下载队列：${ok} 个，失败 ${fail} 个。完成后文件在 downloads/短视频/${name}/`)
     await fetchStatus()
     await openHistory(historyBlogger)
   }
@@ -661,11 +661,11 @@ export default function App() {
     for (const url of todo) {
       try {
         const r = await window.desktop.cli('download-video', url, name)
-        r.ok ? ok++ : fail++
+        r.ok && r.queued ? ok++ : fail++
       } catch { fail++ }
     }
     setHistoryDownloading(false)
-    message[fail ? 'warning' : 'success'](`全部下载完成：成功 ${ok}，失败 ${fail}。文件在 downloads/短视频/${name}/`)
+    message[fail ? 'warning' : 'success'](`已加入下载队列：${ok} 个，失败 ${fail} 个。完成后文件在 downloads/短视频/${name}/`)
     await fetchStatus()
     await openHistory(historyBlogger)
   }

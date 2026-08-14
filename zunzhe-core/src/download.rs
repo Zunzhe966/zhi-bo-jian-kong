@@ -11,6 +11,19 @@ use crate::bilibili_auth::{browser_cookie_path, ensure_anon_cookie, ensure_user_
 use crate::db;
 use crate::process::{ChildError, ManagedChild};
 
+/// 把一次手动/批量下载请求加入 daemon 下载队列，返回任务 id。
+///
+/// CLI/MCP/桌面端必须走这一个入口，而不是直接调用 `Downloader::download`：
+/// 否则手动请求会绕过队列，与 daemon 下载 worker 并发下载同一个 URL。
+/// `db::enqueue_task` 对同 kind+url 的 pending/processing 任务去重，因此重复
+/// 点击不会重复下载；若 daemon 未运行，调用方应先 `ensure_core` 拉起 worker。
+pub async fn enqueue_download(pool: &SqlitePool, url: &str, name: &str) -> anyhow::Result<i64> {
+    if url.trim().is_empty() {
+        anyhow::bail!("下载地址不能为空");
+    }
+    db::enqueue_task(pool, "download", url, name).await
+}
+
 /// 下载器：优先走平台原生路径（B站浏览器内核提取直链 + ffmpeg 合流），
 /// 失败回退 yt-dlp。下载产物统一落到 downloads/短视频/<name>/。
 pub struct Downloader {
@@ -894,6 +907,40 @@ mod tests {
             err.to_string()
                 .contains("只接受 downloads/ 或 fupan_output/")
         );
+        std::mem::forget(file);
+    }
+
+    #[tokio::test]
+    async fn enqueue_download_deduplicates_and_validates_url() {
+        let file = std::env::temp_dir().join(format!(
+            "zunzhe-dl-enqueue-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pool = crate::db::open_pool(&file).await.unwrap();
+
+        let err = enqueue_download(&pool, "  ", "测试").await.unwrap_err();
+        assert!(err.to_string().contains("不能为空"));
+
+        let id = enqueue_download(&pool, "https://x.test/video", "博主")
+            .await
+            .unwrap();
+        let dup = enqueue_download(&pool, "https://x.test/video", "博主2")
+            .await
+            .unwrap();
+        assert_eq!(id, dup, "同一 URL 未完成任务必须去重，不能并发下载");
+
+        // 失败终态允许手动重试：enqueue_task 会新建任务而不是被旧记录挡死。
+        crate::db::set_task_status(&pool, id, "failed")
+            .await
+            .unwrap();
+        let retry = enqueue_download(&pool, "https://x.test/video", "博主")
+            .await
+            .unwrap();
+        assert_ne!(retry, id, "failed 终态应允许用户再次入队");
         std::mem::forget(file);
     }
 
