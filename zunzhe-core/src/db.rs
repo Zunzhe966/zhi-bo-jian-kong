@@ -1165,6 +1165,19 @@ pub async fn get_videos(
     Ok(out)
 }
 
+/// 只统计视频库总数，不加载记录内容。
+///
+/// `status` 快照只展示 `video_count`，此前却调用 `get_videos` 把全部视频
+/// 记录载入内存再取长度。视频库长期积累后（几千上万条）会让桌面端每次轮询
+/// status 都做一次全量查询，白白拖慢接口；改用 COUNT 后语义不变，负载恒定。
+pub async fn count_videos(pool: &SqlitePool) -> anyhow::Result<i64> {
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM videos")
+        .fetch_one(pool)
+        .await
+        .context("统计视频库数量")?;
+    Ok(count)
+}
+
 #[allow(dead_code)] // 下载队列/界面查重接口
 pub async fn is_downloaded(pool: &SqlitePool, video_id: &str) -> anyhow::Result<bool> {
     let row = sqlx::query("SELECT downloaded FROM videos WHERE id=?")

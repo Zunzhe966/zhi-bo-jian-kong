@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use sqlx::sqlite::SqlitePool;
 
 use crate::config::Config;
-use crate::{db, pipeline_bridge, service, video_library, watchlist};
+use crate::{db, pipeline_bridge, service, watchlist};
 
 /// `file_scan_cache` 的进程内缓存项；字段名即缓存键/载荷，避免用元组表达复杂类型。
 struct FileScanCache {
@@ -33,20 +33,19 @@ pub async fn build(project_dir: &Path, pool: &SqlitePool, cfg: &Config) -> Resul
     let watch = watchlist::Watchlist::new(project_dir.to_path_buf());
     let live = watch.list_live();
     let video_sources = watch.list_video();
-    let library = video_library::VideoLibrary::new(pool.clone(), fupan_dir.clone());
-    let videos = library.list("", "", false).await?;
     let (recent_recordings, notes) = file_scan_cache(&downloads, &fupan_dir, project_dir)?;
     let recording_sessions = db::list_live_sessions(pool, "recording", 100).await?;
     let rust_running = service::rust_daemon_alive(project_dir);
     let heartbeat_ok = service::heartbeat_fresh_public(project_dir);
     let (uptime_secs, uptime_human) = service::daemon_uptime_public(project_dir);
+    let video_count = db::count_videos(pool).await?;
 
     Ok(json!({
         "ok": true,
         "anchors": anchors,
         "live_watchlist": live,
         "video_watchlist": video_sources,
-        "video_count": videos.len(),
+        "video_count": video_count,
         "email": cfg.email_status(),
         "rust_daemon": rust_running,
         "heartbeat_ok": heartbeat_ok,
@@ -174,6 +173,7 @@ fn clear_file_scan_cache_for_tests() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::VideoMeta;
 
     #[test]
     fn recent_recordings_are_sorted_and_relative() {
@@ -249,6 +249,49 @@ mod tests {
         assert!(status["uptime_human"].is_string());
         assert!(status["notes"].as_array().is_some());
         assert_eq!(status["recording_sessions"], serde_json::json!([]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn snapshot_video_count_does_not_load_all_rows() {
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-status-count-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::create_dir_all(dir.join("downloads")).unwrap();
+        std::fs::create_dir_all(dir.join("fupan_output")).unwrap();
+        std::fs::write(dir.join("config").join("config.ini"), "[录制设置]\n").unwrap();
+        std::fs::write(dir.join("config").join("fupan_config.ini"), "[视频监控]\n").unwrap();
+        let cfg = crate::config::Config::load(&dir).unwrap();
+        let pool = crate::db::open_pool(&dir.join("test.db")).await.unwrap();
+
+        for i in 0..3 {
+            crate::db::upsert_video(
+                &pool,
+                &VideoMeta {
+                    id: format!("BVcount{i}"),
+                    platform: "bilibili".into(),
+                    url: format!("https://www.bilibili.com/video/BVcount{i}"),
+                    title: format!("视频 {i}"),
+                    cover: String::new(),
+                    published_at: String::new(),
+                    duration: 0,
+                },
+                "博主",
+                "https://space.bilibili.com/1",
+                "",
+            )
+            .await
+            .unwrap();
+        }
+
+        let status = build(&dir, &pool, &cfg).await.unwrap();
+        assert_eq!(status["video_count"].as_i64(), Some(3));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
