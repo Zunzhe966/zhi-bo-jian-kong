@@ -131,6 +131,11 @@ if thread_id:
 
 # 从桌面端进程台账找出属于本项目的任务，一并修复。这样即使 launchd 环境
 # 拿不到 CODEX_THREAD_ID，守卫仍能覆盖“本项目里被切到只读”的历史任务。
+candidate_roots = [os.path.abspath(project_root)]
+desktop_root = os.path.expanduser("~/Desktop/尊者监控直播短视频")
+if os.path.isdir(desktop_root):
+    candidate_roots.append(os.path.abspath(desktop_root))
+
 process_file = os.path.expanduser("~/.codex/process_manager/chat_processes.json")
 try:
     with open(process_file, "r", encoding="utf-8") as f:
@@ -139,14 +144,24 @@ except (OSError, json.JSONDecodeError):
     processes = []
 for process in processes:
     cwd = process.get("cwd") or ""
-    candidate_roots = [os.path.abspath(project_root)]
-    desktop_root = os.path.expanduser("~/Desktop/尊者监控直播短视频")
-    if os.path.isdir(desktop_root):
-        candidate_roots.append(os.path.abspath(desktop_root))
     for root in candidate_roots:
         if os.path.abspath(cwd).startswith(root):
             repair_thread(process.get("conversationId") or "")
             break
+
+# 进程台账按 conversationId 可能已经清空，但当前宿主任务仍在使用旧 cwd。
+# 再读一次当前任务的 cwd 快照（由桌面端在创建任务时持久化），命中项目根
+# 时同样修复，避免“本轮会话”出现在台账尾部之外漏掉。
+assignment_map = container.get("thread-project-assignments")
+if isinstance(assignment_map, dict):
+    for tid, assignment in assignment_map.items():
+        if not isinstance(assignment, dict):
+            continue
+        cwd = assignment.get("cwd") or ""
+        for root in candidate_roots:
+            if os.path.abspath(cwd).startswith(root):
+                repair_thread(tid)
+                break
 
 # host 级默认：新任务从“完全访问 + 永不审批”继承，避免只有当前任务被修好、
 # 下次新建任务又退回只读/按需批准。
