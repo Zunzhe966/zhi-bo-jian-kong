@@ -77,9 +77,21 @@ pub fn ensure_core(project_dir: &Path) -> Result<serde_json::Value> {
             .map(|s| s.success())
             .unwrap_or(false);
         if ok {
-            return Ok(json!({"ok": true, "rust_daemon": "launchd 已接管", "services": {}}));
+            // launchd 已尝试拉起，但 daemon 写心跳/拿单实例锁需要一点时间；
+            // 给最多 5 秒让它真正健康，避免下面直接 spawn 与 launchd 抢锁。
+            for _ in 0..50 {
+                if rust_daemon_alive(project_dir) {
+                    return Ok(
+                        json!({"ok": true, "rust_daemon": "launchd 已接管", "services": {}}),
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            // launchd 实例没能健康（TCC 拒绝访问项目目录、二进制缺失等）
+            // 不能再静默返回成功；回退由本进程直接启动，保证看门狗能恢复。
+            tracing::warn!("launchctl kickstart 后 daemon 未在 5 秒内健康，回退直接启动");
         }
-        // launchctl 失败（服务未加载等）再走直接 spawn 兜底。
+        // launchctl 本身失败（服务未加载等）也走直接 spawn 兜底。
     }
     let rust = start_rust_daemon(project_dir, 900)?;
     // Rust daemon 已统一接管直播检测/录制和视频监控；不再并行启动 Python
