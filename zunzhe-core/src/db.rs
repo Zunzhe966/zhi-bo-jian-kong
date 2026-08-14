@@ -584,30 +584,7 @@ mod opportunistic_maintenance_tests {
         let _ = std::fs::remove_dir_all(&project);
     }
 
-    #[cfg(unix)]
-    fn set_mtime_days_ago(path: &std::path::Path, days: u64) {
-        use std::os::unix::ffi::OsStrExt;
-        let old_time = SystemTime::now() - std::time::Duration::from_secs(days * 24 * 60 * 60);
-        let secs = old_time
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-        let times = [
-            libc::timespec {
-                tv_sec: secs,
-                tv_nsec: 0,
-            },
-            libc::timespec {
-                tv_sec: secs,
-                tv_nsec: 0,
-            },
-        ];
-        assert_eq!(
-            unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) },
-            0
-        );
-    }
+    use crate::test_support::set_mtime_days_ago;
 }
 
 pub async fn add_anchor(pool: &SqlitePool, url: &str, name: &str) -> anyhow::Result<()> {

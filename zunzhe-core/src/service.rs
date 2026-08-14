@@ -1020,6 +1020,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn ensure_core_does_not_claim_launchd_on_tcc_protected_path() {
         // 项目位于桌面/文稿时，即使本机已安装 com.zunzhe.monitor，ensure
