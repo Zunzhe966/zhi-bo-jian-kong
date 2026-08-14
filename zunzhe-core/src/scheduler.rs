@@ -15,6 +15,14 @@ use crate::platform;
 use crate::video_library::VideoLibrary;
 use crate::watchlist::Watchlist;
 
+/// 每轮从平台列表窗口拉取的视频数量。
+///
+/// 旧实现写死 10，博主同一天连发超过 10 条时，最新视频可能落在第 11+ 位，
+/// 导致明明发布了新内容却一直不通知、不入下载队列。窗口放大到 30 条后，
+/// 与 CLI 浏览历史视频默认 30 条一致，覆盖绝大多数单轮发布量，同时单源
+/// 50 秒护栏仍能兜底网络卡顿。
+const SCHEDULER_VIDEO_WINDOW: u32 = 30;
+
 /// 周期维护时清理 B站 Electron 协议残留文件（payload/stderr/status）。
 ///
 /// 调度轮次不跑 Electron，但旧版本/手动诊断可能留下临时文件；daemon 每 6 小时
@@ -478,7 +486,7 @@ async fn tick(
         // 单源卡住不能拖垮整个 daemon 轮次。
         match tokio::time::timeout(
             Duration::from_secs(50),
-            adapter.list_videos(&source_url, 10),
+            adapter.list_videos(&source_url, SCHEDULER_VIDEO_WINDOW),
         )
         .await
         {
@@ -716,6 +724,14 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn scheduler_video_window_covers_burst_publishes() {
+        // 平台列表按时间倒序返回：一次连发超过 10 条时，窗口必须覆盖第 11+
+        // 条，否则新视频会被误判成“已基线”而永久漏通知。
+        const _: () = assert!(SCHEDULER_VIDEO_WINDOW >= 11, "窗口过小会漏掉爆发式发布");
+        assert_eq!(SCHEDULER_VIDEO_WINDOW, 30);
     }
 
     #[tokio::test]

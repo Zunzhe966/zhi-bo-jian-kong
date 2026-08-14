@@ -3,8 +3,8 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
 use sqlx::Row;
-use sqlx::sqlite::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
+use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 
 use crate::model::{Anchor, LiveSession, NotifyEvent, Task, Video};
 
@@ -175,9 +175,20 @@ pub fn open_options(path: &Path) -> SqliteConnectOptions {
         .foreign_keys(true)
 }
 
+/// 生产池显式连接数上限与等待上限。
+///
+/// 不依赖 sqlx 默认值：显式写死避免依赖升级时默认连接数悄悄变化，也让
+/// daemon 与 CLI/MCP 同时打开时不会无限放大 SQLite 文件句柄。SQLite 单写者
+/// 模型下并发上限收益有限，8 个连接足够覆盖 tick/直播/下载/通知等并发任务。
+pub const POOL_MAX_CONNECTIONS: u32 = 8;
+pub const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// 供测试/调用方直接建立 SQLite 池。
 pub async fn open_pool(path: &Path) -> anyhow::Result<SqlitePool> {
-    let pool = SqlitePool::connect_with(open_options(path))
+    let pool = SqlitePoolOptions::new()
+        .max_connections(POOL_MAX_CONNECTIONS)
+        .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
+        .connect_with(open_options(path))
         .await
         .context("连接 SQLite 数据库")?;
     init_db(&pool).await?;
@@ -1561,6 +1572,48 @@ mod tests {
         assert!(list[0].downloaded);
         let done = get_videos(&pool, "", "", true).await.unwrap();
         assert_eq!(done.len(), 1);
+    }
+
+    #[test]
+    fn production_pool_limits_are_explicit() {
+        // 防止 sqlx 升级时默认值悄悄变化：24×30 需要可预期的并发上限，
+        // 不能因为依赖默认连接数改变而出现文件句柄膨胀或 acquire 超时。
+        assert_eq!(POOL_MAX_CONNECTIONS, 8);
+        assert_eq!(POOL_ACQUIRE_TIMEOUT, Duration::from_secs(15));
+    }
+
+    #[tokio::test]
+    async fn pool_survives_concurrent_read_write_stress() {
+        let pool = test_pool().await;
+        // 36 个并发任务同时读/写同一张表，模拟 daemon tick、直播状态、下载
+        // worker 与通知重试在真实运行中共享一个池；任何写事务失败或 acquire
+        // 超时都会让 24×30 的“状态不丢”承诺失效。
+        let mut handles = Vec::new();
+        for i in 0..36u64 {
+            let pool = pool.clone();
+            handles.push(tokio::spawn(async move {
+                let meta = VideoMeta {
+                    id: format!("BVstress{i}"),
+                    platform: "bilibili".into(),
+                    url: format!("https://www.bilibili.com/video/BVstress{i}"),
+                    title: format!("并发视频 {i}"),
+                    cover: String::new(),
+                    published_at: "2026-08-14".into(),
+                    duration: 60,
+                };
+                upsert_video(&pool, &meta, "并发博主", "https://space.example.com/x", "")
+                    .await
+                    .unwrap();
+                mark_downloaded(&pool, &meta.id, i % 2 == 0).await.unwrap();
+                let seen = is_downloaded(&pool, &meta.id).await.unwrap();
+                assert_eq!(seen, i % 2 == 0);
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        let videos = get_videos(&pool, "", "", false).await.unwrap();
+        assert_eq!(videos.len(), 36);
     }
 
     #[tokio::test]
