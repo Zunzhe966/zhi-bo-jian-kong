@@ -356,7 +356,13 @@ mod tests {
         let id = crate::db::enqueue_task(&pool, "process", "/tmp/不存在.mp4", "测试")
             .await
             .unwrap();
+        // attempts=2 有 5 分钟退避；测试拨旧时间让 worker 立即认领。
         sqlx::query("UPDATE tasks SET attempts=2 WHERE id=?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE tasks SET updated_at=datetime('now','localtime','-1 hour') WHERE id=?")
             .bind(id)
             .execute(&pool)
             .await
@@ -403,6 +409,14 @@ mod tests {
             .await
             .unwrap();
         for _ in 0..3 {
+            // 退避由 db 测试单独覆盖；这里拨旧时间快速验证失败计数终态。
+            sqlx::query(
+                "UPDATE tasks SET updated_at=datetime('now','localtime','-1 hour') WHERE id=?",
+            )
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
             let task = crate::db::claim_pending_task_by_kind(&pool, "process", 1)
                 .await
                 .unwrap()

@@ -999,6 +999,15 @@ mod tests {
             .unwrap();
         let downloader = Downloader::new(std::env::temp_dir().join("zunzhe-nonexistent"));
         for _ in 0..3 {
+            // 退避已由 db 测试单独覆盖；这里把失败任务拨到 1 小时前，
+            // 快速验证“3 次失败后落定 failed”的计数语义，不等待真实退避。
+            sqlx::query(
+                "UPDATE tasks SET updated_at=datetime('now','localtime','-1 hour') WHERE id=?",
+            )
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
             let task = crate::db::claim_pending_task_by_kind(&pool, "download", 1)
                 .await
                 .unwrap()
@@ -1041,6 +1050,12 @@ mod tests {
             .unwrap();
         // 预置两次重试次数：worker 超时一次后 attempts=3，直接标 failed。
         sqlx::query("UPDATE tasks SET attempts=2 WHERE id=?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // attempts=2 有 5 分钟退避；测试把时间拨到 1 小时前，worker 才能立即认领。
+        sqlx::query("UPDATE tasks SET updated_at=datetime('now','localtime','-1 hour') WHERE id=?")
             .bind(id)
             .execute(&pool)
             .await

@@ -1303,21 +1303,49 @@ pub async fn claim_pending_task_by_kind(
             .await
             .context("落定超出重试上限的任务")?;
     }
+    // 失败/超时后回 pending 的任务必须退避，不能立刻被 worker 再次认领。
+    // B站 412、RSSHub 403、SMTP 限流等故障在几秒内不会恢复；通知队列已有
+    // 退避，任务队列也应一致，否则 3 次失败会在 15 秒内连打 3 次，反而加重
+    // 风控。等待时间按 attempts 递增：第 1 次失败后 1 分钟、第 2 次 5 分钟、
+    // 第 3 次 15 分钟；attempts>=3 在进入本函数时已落定 failed，因此实际只会
+    // 遇到 1/2 分钟档。新任务（attempts=0）不等待，坏时间戳按“已到期”处理。
     let mut sql = String::from(
         "SELECT id, kind, url, name, status, attempts, payload, created_at, updated_at
          FROM tasks
          WHERE status = 'pending'",
     );
-    if !kind.is_empty() {
-        sql.push_str(" AND kind = ?");
-    }
+    let backoff_sql = if kind.is_empty() { "" } else { " AND kind = ?" };
+    sql.push_str(backoff_sql);
     sql.push_str(" ORDER BY id LIMIT ?");
     let mut query = sqlx::query(&sql);
     if !kind.is_empty() {
         query = query.bind(kind);
     }
-    query = query.bind(limit);
-    let row = query.fetch_optional(pool).await.context("查询待处理任务")?;
+    // 多取一些候选，在 Rust 里按退避窗口过滤；SQLite 的 strftime/localtime
+    // 组合容易踩时区坑，Rust 侧解析本地时间字符串更可靠。
+    let candidate_limit = limit.saturating_mul(20).max(20);
+    query = query.bind(candidate_limit);
+    let candidates = query.fetch_all(pool).await.context("查询待处理任务")?;
+    let now = chrono::Local::now().naive_local();
+    let row = candidates.into_iter().find(|row| {
+        let attempts: i64 = row.try_get("attempts").unwrap_or(0);
+        if attempts == 0 {
+            return true;
+        }
+        let updated_at: String = row.try_get("updated_at").unwrap_or_default();
+        let Some(updated) =
+            chrono::NaiveDateTime::parse_from_str(&updated_at, "%Y-%m-%d %H:%M:%S").ok()
+        else {
+            // 坏时间戳按“已到期”处理，避免异常数据永久卡队列。
+            return true;
+        };
+        let wait_secs = match attempts {
+            1 => 60,
+            2 => 300,
+            _ => 900,
+        };
+        updated + chrono::Duration::seconds(wait_secs) <= now
+    });
     let Some(row) = row else {
         return Ok(None);
     };
@@ -1744,6 +1772,13 @@ mod tests {
         // 模拟 daemon 在 processing 时崩溃：重启后 recover 把它归还 pending。
         let recovered = recover_processing(&pool).await.unwrap();
         assert_eq!(recovered, 1);
+        // 崩溃恢复的任务 attempts 可能为 1，测试拨旧时间绕过退避窗口，
+        // 快速验证“恢复后能再次认领”的状态机语义。
+        sqlx::query("UPDATE tasks SET updated_at=datetime('now','localtime','-1 hour') WHERE id=?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
         let again = claim_pending_task(&pool, 1).await.unwrap().unwrap();
         assert_eq!(again.id, id);
 
@@ -1753,6 +1788,55 @@ mod tests {
             claim_pending_task(&pool, 1).await.unwrap().is_none(),
             "failed 任务不应被下载 worker 自动重新认领"
         );
+    }
+
+    #[tokio::test]
+    async fn retry_task_waits_backoff_before_reclaim() {
+        let pool = test_pool().await;
+        let id = enqueue_task(&pool, "download", "https://x.test/backoff", "博主")
+            .await
+            .unwrap();
+
+        // 第一次认领并模拟失败：attempts=1，回 pending 后必须等 1 分钟。
+        let claimed = claim_pending_task_by_kind(&pool, "download", 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.id, id);
+        assert_eq!(claimed.attempts, 1);
+        update_task_status(&pool, id, "pending").await.unwrap();
+        assert!(
+            claim_pending_task_by_kind(&pool, "download", 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "失败后 1 分钟内不应再次认领"
+        );
+
+        // 把 updated_at 拨到 2 分钟前，等价于等待期结束，应能再次认领。
+        sqlx::query(
+            "UPDATE tasks SET updated_at=datetime('now','localtime','-2 minutes') WHERE id=?",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let reclaimed = claim_pending_task_by_kind(&pool, "download", 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reclaimed.id, id);
+        assert_eq!(reclaimed.attempts, 2);
+
+        // 新任务（attempts=0）不受退避影响，立即认领。
+        let fresh = enqueue_task(&pool, "download", "https://x.test/fresh", "博主")
+            .await
+            .unwrap();
+        let claimed = claim_pending_task_by_kind(&pool, "download", 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.id, fresh, "新任务应跳过退避立即认领");
     }
 
     #[tokio::test]
