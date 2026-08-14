@@ -82,6 +82,12 @@ impl Downloader {
         if let Err(e) = db::mark_downloaded(pool, &video_id, true).await {
             tracing::warn!("下载成功但标记视频库已下载失败 video_id={video_id}: {e:#}");
         }
+        // 非 B站/RSS/YouTube 等平台没有统一的 URL→id 提取规则，浏览历史里的
+        // id 可能是 GUID 或完整 URL；按 URL 再标记一次，避免同一视频在库里
+        // 同时存在 downloaded=1（id 推导命中）和 downloaded=0（历史浏览记录）。
+        if let Err(e) = db::mark_downloaded_by_url(pool, url, true).await {
+            tracing::warn!("下载成功但按 URL 标记视频库已下载失败 url={url}: {e:#}");
+        }
         // 下载完成后是否入队复盘任务（转写/提炼/切片），由 fupan_config.ini
         // 三个独立开关决定；三项全关时不再入队，避免每次下载都白跑一次
         // Python 流水线。手动 process_media 仍可强制处理。

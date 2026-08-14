@@ -1066,6 +1066,30 @@ pub async fn mark_downloaded(
     Ok(())
 }
 
+/// 按最终下载 URL 标记视频库已下载。
+///
+/// B站视频 id 就是 BV 号，`mark_downloaded` 按 id 就能命中；但 RSS/YouTube/
+/// 抖音等平台没有统一的 `BV` 提取规则，浏览历史入库时 id 可能是 GUID 或
+/// 完整 URL，下载完成后必须按 URL 再更新一次，否则同一视频会留下
+/// `downloaded=0` 的记录，桌面端会反复显示“未下载”并重复下载。
+pub async fn mark_downloaded_by_url(
+    pool: &SqlitePool,
+    url: &str,
+    downloaded: bool,
+) -> anyhow::Result<u64> {
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let result =
+        sqlx::query("UPDATE videos SET downloaded=?, downloaded_at=?, updated_at=? WHERE url=?")
+            .bind(if downloaded { 1 } else { 0 })
+            .bind(if downloaded { now.as_str() } else { "" })
+            .bind(if downloaded { now.as_str() } else { "" })
+            .bind(url)
+            .execute(pool)
+            .await
+            .context("按 URL 标记视频已下载")?;
+    Ok(result.rows_affected())
+}
+
 /// 下载成功但视频库还没有该记录时，先补一行最小记录（不覆盖已有字段）。
 pub async fn ensure_video_row(
     pool: &SqlitePool,
@@ -1914,6 +1938,59 @@ mod tests {
         let new_row = rows.iter().find(|r| r.id == "BVnew-browse").unwrap();
         assert_eq!(new_row.source_url, "https://space.bilibili.com/browsed");
         assert_eq!(new_row.anchor, "");
+    }
+
+    #[tokio::test]
+    async fn mark_downloaded_by_url_updates_all_platform_records() {
+        let pool = test_pool().await;
+        // 非 B站平台：浏览历史入库时 id 使用 GUID，与下载完成后
+        // extract_video_id 推导的完整 URL 不一致。按 id 标记不会命中这条记录。
+        let meta = VideoMeta {
+            id: "yt-guid-abc123".into(),
+            platform: "rss".into(),
+            url: "https://www.youtube.com/watch?v=abc123".into(),
+            title: "油管视频".into(),
+            cover: String::new(),
+            published_at: "2026-08-12".into(),
+            duration: 120,
+        };
+        upsert_video_browse(&pool, &meta, "https://rss.example.com/youtube", "")
+            .await
+            .unwrap();
+
+        // 模拟下载完成：Rust 侧推导出的 id 是完整 URL，与库里的 GUID 不同，
+        // 按 id 标记不命中；随后按 URL 标记必须命中浏览历史记录。
+        mark_downloaded(&pool, "https://www.youtube.com/watch?v=abc123", true)
+            .await
+            .unwrap();
+        assert!(
+            !is_downloaded(&pool, "yt-guid-abc123").await.unwrap(),
+            "按推导 URL 作为 id 标记不应命中 GUID id 的历史记录"
+        );
+        let updated = mark_downloaded_by_url(&pool, "https://www.youtube.com/watch?v=abc123", true)
+            .await
+            .unwrap();
+        assert_eq!(updated, 1, "应按 URL 命中浏览历史记录");
+        assert!(is_downloaded(&pool, "yt-guid-abc123").await.unwrap());
+
+        // 同一 URL 在 B站监控源和 RSS 浏览里各有一条时，按 URL 标记应全部命中。
+        let bili = VideoMeta {
+            id: "BVurl".into(),
+            platform: "bilibili".into(),
+            url: "https://www.bilibili.com/video/BVurl".into(),
+            title: "B站同源".into(),
+            cover: String::new(),
+            published_at: "2026-08-13".into(),
+            duration: 60,
+        };
+        upsert_video(&pool, &bili, "博主", "https://space.bilibili.com/1", "")
+            .await
+            .unwrap();
+        let updated = mark_downloaded_by_url(&pool, "https://www.bilibili.com/video/BVurl", true)
+            .await
+            .unwrap();
+        assert_eq!(updated, 1);
+        assert!(is_downloaded(&pool, "BVurl").await.unwrap());
     }
 
     #[tokio::test]
