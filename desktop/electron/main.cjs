@@ -2,11 +2,14 @@ const { app, BrowserWindow, Tray, Menu, globalShortcut, ipcMain, shell, nativeIm
 const path = require('path')
 const { spawn } = require('child_process')
 const fs = require('fs')
+const { consumeNotifyQueue } = require('./local-notify.cjs')
+const { healthcheckInvocation } = require('./healthcheck.cjs')
 
 // electron/ 在 desktop/ 下，Rust 核心在项目根目录（再上一级）
 const PROJECT_DIR = path.resolve(__dirname, '..', '..')
-const RUST_EXE = path.join(PROJECT_DIR, 'zunzhe-core', 'target', 'release', 'zunzhe-core')
-const RUST_DEBUG_EXE = path.join(PROJECT_DIR, 'zunzhe-core', 'target', 'debug', 'zunzhe-core')
+const CORE_NAME = process.platform === 'win32' ? 'zunzhe-core.exe' : 'zunzhe-core'
+const RUST_EXE = path.join(PROJECT_DIR, 'zunzhe-core', 'target', 'release', CORE_NAME)
+const RUST_DEBUG_EXE = path.join(PROJECT_DIR, 'zunzhe-core', 'target', 'debug', CORE_NAME)
 const DIST_HTML = path.join(__dirname, '..', 'dist', 'index.html')
 const ASSETS = path.join(__dirname, '..', 'assets')
 const ICON_ICO = path.join(ASSETS, 'icon.ico')
@@ -15,12 +18,23 @@ const ICON_TRAY = path.join(ASSETS, 'icon-32.png')
 const APP_NAME = '尊者直播监控'
 const HOTKEY = 'Control+Shift+L'
 const NOTIFY_QUEUE = path.join(PROJECT_DIR, 'fupan_output', 'run', 'pending_notify.json')
+const NOTIFY_SEEN_FILE = path.join(PROJECT_DIR, 'fupan_output', 'run', 'desktop_seen_notify_ids.json')
 
 let mainWindow = null
 let tray = null
 let watchdogTimer = null
 let notifyTimer = null
-const seenNotifyIds = new Set()
+let statusCache = null
+let statusCacheAt = 0
+const STATUS_CACHE_TTL_MS = 60000
+// 这些命令会改变监控状态/文件列表，成功后必须让下次 status 重新全量扫描，
+// 否则界面点“添加/下载/复盘”后可能继续显示旧快照。
+const STATUS_INVALIDATING_COMMANDS = new Set([
+  'add-live', 'remove-live', 'delete-live', 'record-live',
+  'add-video', 'remove-video', 'download-video', 'video-download',
+  'process', 'check-videos', 'ensure-services', 'start', 'stop',
+  'wizard-done', 'set-app-prefs', 'set-config', 'set-config-bulk',
+])
 const isDev = !app.isPackaged && process.env.ELECTRON_DEV === '1'
 
 function loadAppIcon() {
@@ -107,6 +121,26 @@ function runCli(args) {
   })
 }
 
+// 桌面端界面每 30 秒调一次 status，而 status 会递归扫描 downloads /
+// fupan_output。CLI 每次都是新进程，Rust 进程内缓存帮不上忙；这里在主进程
+// 按 60 秒复用完整快照，界面轮询最多每两次共享一次全量扫描，录制/复盘
+// 完成通常远大于 60 秒，最近列表不会长期失真。
+async function runStatusCached() {
+  const now = Date.now()
+  if (statusCache && now - statusCacheAt < STATUS_CACHE_TTL_MS) {
+    return statusCache
+  }
+  const st = await runCli(['status'])
+  statusCache = st
+  statusCacheAt = now
+  return st
+}
+
+function invalidateStatusCache() {
+  statusCache = null
+  statusCacheAt = 0
+}
+
 function showLocalNotification(title, body) {
   if (!Notification.isSupported()) return
   const n = new Notification({
@@ -120,24 +154,16 @@ function showLocalNotification(title, body) {
 
 function pollLocalNotifyQueue() {
   try {
-    if (!fs.existsSync(NOTIFY_QUEUE)) return
-    const raw = fs.readFileSync(NOTIFY_QUEUE, 'utf8')
-    const items = JSON.parse(raw)
-    if (!Array.isArray(items) || !items.length) return
-    const pending = []
-    for (const item of items) {
-      const id = String(item.id || '')
-      if (!id || seenNotifyIds.has(id)) continue
-      seenNotifyIds.add(id)
-      showLocalNotification(item.title, item.body)
-      pending.push(item)
-    }
-    if (seenNotifyIds.size > 200) {
-      seenNotifyIds.clear()
-      for (const item of items.slice(-50)) {
-        if (item.id) seenNotifyIds.add(String(item.id))
-      }
-    }
+    consumeNotifyQueue(
+      NOTIFY_QUEUE,
+      NOTIFY_SEEN_FILE,
+      (title, body) => showLocalNotification(title, body),
+      (e) => {
+        // Rust daemon 可能正在原子替换通知队列文件：短暂读到半截 JSON 时
+        // 跳过本轮，下一轮 4 秒后重新读取，不能把桌面主循环打崩。
+        console.warn('[local-notify] 队列暂不可读，下一轮重试:', e.message)
+      },
+    )
   } catch (e) {
     console.warn('[local-notify]', e.message)
   }
@@ -148,15 +174,17 @@ async function serviceWatchdog() {
     pollLocalNotifyQueue()
     // 每次健康检查都把结果追加到 logs/zunzhe-core.uptime.log，
     // 与 launchd 看门狗共用同一份 24×30 验收记录。
-    const checker = path.join(PROJECT_DIR, 'scripts', 'check-rust-daemon.sh')
-    if (fs.existsSync(checker)) {
+    const hc = healthcheckInvocation(PROJECT_DIR, process.platform)
+    if (hc) {
       const { execFile } = require('child_process')
-      execFile('/bin/bash', [checker], { timeout: 10000 }, () => {})
+      execFile(hc.shell, hc.args, { timeout: 10000 }, () => {})
     }
     const prefRes = await runCli(['get-app-prefs'])
     const prefs = prefRes.prefs || {}
     if (prefs.watchdog === false) return
-    const st = await runCli(['status'])
+    // 健康检查只关心 daemon 是否存活，不加载完整 status 快照（后者会递归
+    // 扫描 downloads / fupan_output，录像和复盘产物多了以后每分钟拖慢看板）。
+    const st = await runCli(['service-status'])
     const rust = st.rust_daemon || st.rust_daemon_running
     if (!rust) {
       const r = await runCli(['ensure-services'])
@@ -289,7 +317,11 @@ app.whenReady().then(async () => {
   createWindow()
   await applyStartupPrefs()
   startBackgroundTasks()
-  ipcMain.handle('cli', (_, cmd, ...args) => runCli([cmd, ...args]))
+  ipcMain.handle('cli', (_, cmd, ...args) => {
+    if (cmd === 'status') return runStatusCached()
+    if (STATUS_INVALIDATING_COMMANDS.has(cmd)) invalidateStatusCache()
+    return runCli([cmd, ...args])
+  })
   ipcMain.handle('reload-ui', () => reloadUiWindow())
   ipcMain.handle('set-login-item', async (_, enabled) => {
     const open = !!enabled

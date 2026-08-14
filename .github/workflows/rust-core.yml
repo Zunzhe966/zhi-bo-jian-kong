@@ -4,10 +4,12 @@ on:
   push:
     paths:
       - 'zunzhe-core/**'
+      - 'desktop/electron/**'
       - '.github/workflows/rust-core.yml'
   pull_request:
     paths:
       - 'zunzhe-core/**'
+      - 'desktop/electron/**'
       - '.github/workflows/rust-core.yml'
   workflow_dispatch:
 
@@ -53,3 +55,14 @@ jobs:
           .\target\release\zunzhe-core.exe --help | Out-Null
           .\target\release\zunzhe-core.exe mcp-info | Select-String mcp_command
         if: runner.os == 'Windows'
+      - name: Electron Bilibili cookie loader contract
+        shell: bash
+        working-directory: desktop/electron
+        run: node bilibili-cookie-loader.test.cjs
+      - name: Electron watchdog and local notify contracts
+        shell: bash
+        working-directory: desktop/electron
+        run: |
+          node healthcheck.test.cjs
+          node local-notify.test.cjs
+          node --check main.cjs

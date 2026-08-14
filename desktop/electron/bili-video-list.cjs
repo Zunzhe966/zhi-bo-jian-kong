@@ -12,10 +12,14 @@ if (!payloadFile || !statusFile) {
   process.exit(2)
 }
 
-const { app, BrowserWindow } = require('electron')
+const { app, BrowserWindow, session } = require('electron')
+const cookieParser = require('./bilibili-cookie-loader.cjs')
+const crypto = require('crypto')
 
 app.disableHardwareAcceleration()
-app.setPath('userData', path.join(app.getPath('temp'), 'fupan-bili-list'))
+// 每次用独立 userData：daemon 并发触发 Electron 时，固定目录会因 Chromium
+// profile 锁/缓存冲突导致整批脚本退出 1。
+app.setPath('userData', path.join(app.getPath('temp'), 'fupan-bili-list-' + crypto.randomBytes(4).toString('hex')))
 
 const finish = (obj, code) => {
   try {
@@ -27,7 +31,7 @@ const finish = (obj, code) => {
   app.exit(code)
 }
 
-const watchdog = setTimeout(() => finish({ ok: false, error: '超时（90秒）' }, 1), 90000)
+let watchdog = setTimeout(() => finish({ ok: false, error: '超时（90秒）' }, 1), 90000)
 
 async function run() {
   const script = fs.readFileSync(payloadFile, 'utf8')
@@ -44,27 +48,37 @@ async function run() {
   })
 
   try {
+    await cookieParser.injectCookies(session.fromPartition('persist:bilibili'))
     await Promise.race([
       win.loadURL(url).catch((e) => {
         // 页面加载可能因重定向/长连接不 resolve；继续尝试执行脚本。
       }),
       new Promise((resolve) => setTimeout(resolve, 18000)),
     ])
-    await new Promise((resolve) => setTimeout(resolve, 1500))
-    const raw = await win.webContents.executeJavaScript(script, true)
-    let value
-    try {
-      value = typeof raw === 'string' ? JSON.parse(raw) : raw
-    } catch (e) {
-      value = { ok: false, error: '页面脚本返回了非 JSON 字符串' }
+    // 空间页是动态加载的：只等 1.5 秒时 body 里常没有视频列表。
+    // 轮询页面直到脚本返回 BV 号或超时，避免稳定复现“Script failed to execute”。
+    let raw = null
+    let value = null
+    for (let i = 0; i < 12; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1500))
+      try {
+        raw = await win.webContents.executeJavaScript(script, true)
+        if (typeof raw === 'string') {
+          try { value = JSON.parse(raw) } catch (e) { value = { ok: false, error: '页面脚本返回了非 JSON 字符串' } }
+        } else {
+          value = raw || { ok: false, error: '页面脚本返回空结果' }
+        }
+        if (value && value.ok) break
+      } catch (e) {
+        value = { ok: false, error: String(e && e.message ? e.message : e) }
+      }
     }
-    finish(value || { ok: false, error: '页面脚本返回空结果' }, 0)
+    return finish(value || { ok: false, error: '页面脚本返回空结果' }, 0)
   } catch (e) {
-    finish({ ok: false, error: String(e && e.message ? e.message : e) }, 1)
+    return finish({ ok: false, error: String(e && e.message ? e.message : e) }, 1)
   } finally {
     if (!win.isDestroyed()) win.destroy()
   }
 }
 
-clearTimeout(watchdog)
 app.whenReady().then(run).catch((e) => finish({ ok: false, error: 'whenReady: ' + e.message }, 1))

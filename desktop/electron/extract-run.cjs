@@ -9,15 +9,22 @@ const outFile = process.env.FUPAN_OUT_FILE || process.argv[3] || path.join(requi
 
 const { app } = require('electron')
 const { extractBilibiliStreams } = require('./bili-cookie.cjs')
+const cookieParser = require('./bilibili-cookie-loader.cjs')
+const crypto = require('crypto')
 
 app.disableHardwareAcceleration()
-app.setPath('userData', path.join(app.getPath('temp'), 'fupan-bili-extract'))
+// 独立 userData，避免多个 Electron 实例并发时 Chromium profile 锁冲突。
+app.setPath('userData', path.join(app.getPath('temp'), 'fupan-bili-extract-' + crypto.randomBytes(4).toString('hex')))
 const finish = (obj, code) => {
   try { fs.mkdirSync(path.dirname(outFile), { recursive: true }); fs.writeFileSync(outFile, JSON.stringify(obj), 'utf-8') } catch { /* ignore */ }
   app.exit(code)
 }
 setTimeout(() => finish({ ok: false, error: '超时（60秒）' }, 1), 60000)
 app.whenReady().then(async () => {
-  try { finish(await extractBilibiliStreams(app, videoUrl), 0) }
+  try {
+    const { session } = require('electron')
+    await cookieParser.injectCookies(session.fromPartition('persist:bilibili'))
+    finish(await extractBilibiliStreams(app, videoUrl), 0)
+  }
   catch (e) { finish({ ok: false, error: String(e.message || e) }, 1) }
 }).catch((e) => finish({ ok: false, error: 'whenReady: ' + e.message }, 1))

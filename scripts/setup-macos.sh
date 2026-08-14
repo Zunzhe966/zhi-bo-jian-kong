@@ -28,4 +28,25 @@ fi
 
 echo "[setup] 构建桌面端界面"
 (cd desktop && npm run build)
+
+echo "[setup] 构建 Rust 核心 release 版本"
+if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/cargo" ]; then
+  echo "[setup] 未找到 Rust 工具链，请先安装 rustup（https://rustup.rs）" >&2
+  exit 1
+fi
+export PATH="$HOME/.cargo/bin:$PATH"
+(cd zunzhe-core && cargo build --release)
+
+# 安装 launchd 守护与健康看门狗（macOS 开机自启 + 崩溃自动拉起）。
+# 项目在 ~/Desktop 下时受 macOS TCC 保护，首次加载可能需要在
+# 系统设置-隐私与安全性-完全磁盘访问 中授权；桌面端自带看门狗作为兜底。
+LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
+mkdir -p "$LAUNCH_AGENTS"
+cp scripts/launchd/com.zunzhe.monitor.plist "$LAUNCH_AGENTS/"
+cp scripts/launchd/com.zunzhe.healthcheck.plist "$LAUNCH_AGENTS/"
+launchctl unload "$LAUNCH_AGENTS/com.zunzhe.monitor.plist" 2>/dev/null || true
+launchctl unload "$LAUNCH_AGENTS/com.zunzhe.healthcheck.plist" 2>/dev/null || true
+launchctl load "$LAUNCH_AGENTS/com.zunzhe.monitor.plist"
+launchctl load "$LAUNCH_AGENTS/com.zunzhe.healthcheck.plist"
+
 echo "[setup] 完成"
