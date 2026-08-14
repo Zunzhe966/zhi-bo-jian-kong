@@ -218,9 +218,7 @@ pub async fn maintenance_if_due(project_dir: &Path, pool: &SqlitePool) -> anyhow
             // daemon 不在场时也要清理运行目录里的协议/原子写残留，否则
             // 长年只跑 CLI/MCP 的机器会让 fupan_output/run 无限增长。
             crate::bilibili_electron::maintain_run_dir(&run_dir);
-            let tmp = run_dir.join("zunzhe-core.maintenance.tmp");
-            std::fs::write(&tmp, chrono::Local::now().to_rfc3339())?;
-            std::fs::rename(&tmp, &marker)?;
+            touch_maintenance_marker(&run_dir)?;
             tracing::debug!("独立入口数据库维护完成");
         }
         Err(e) => tracing::warn!("独立入口数据库维护失败: {e:#}"),
@@ -252,6 +250,15 @@ pub fn maintenance_marker_timestamp(marker: &Path) -> Option<i64> {
     let text = std::fs::read_to_string(marker).ok()?;
     let ts = chrono::DateTime::parse_from_rfc3339(text.trim()).ok()?;
     Some(ts.timestamp())
+}
+
+/// 原子写入维护哨兵，供 daemon 主循环与 CLI/MCP 共用。
+pub fn touch_maintenance_marker(run_dir: &Path) -> anyhow::Result<()> {
+    let marker = run_dir.join("zunzhe-core.maintenance");
+    let tmp = run_dir.join("zunzhe-core.maintenance.tmp");
+    std::fs::write(&tmp, chrono::Local::now().to_rfc3339())?;
+    std::fs::rename(&tmp, &marker)?;
+    Ok(())
 }
 
 /// daemon 主循环与独立入口共用的维护周期（6 小时）。
@@ -479,6 +486,27 @@ mod opportunistic_maintenance_tests {
         assert!(
             now - ts >= 3 * 3600 - 5 && now - ts <= 3 * 3600 + 5,
             "哨兵时间戳应接近写入时刻: now={now} ts={ts}"
+        );
+        let _ = std::fs::remove_dir_all(&project.0);
+    }
+
+    #[test]
+    fn touch_maintenance_marker_persists_for_next_restart() {
+        let project = temp_project("marker-touch");
+        let run_dir = project.0.join("fupan_output").join("run");
+        touch_maintenance_marker(&run_dir).unwrap();
+        let marker = run_dir.join("zunzhe-core.maintenance");
+        assert!(marker.exists(), "维护哨兵应落盘");
+        let ts = maintenance_marker_timestamp(&marker).unwrap();
+        let now = chrono::Local::now().timestamp();
+        assert!(
+            (now - ts).abs() <= 5,
+            "哨兵时间戳应接近写入时刻: now={now} ts={ts}"
+        );
+        // 写入后不应留下原子写临时文件。
+        assert!(
+            !run_dir.join("zunzhe-core.maintenance.tmp").exists(),
+            "哨兵写入不应留下 tmp 残留"
         );
         let _ = std::fs::remove_dir_all(&project.0);
     }

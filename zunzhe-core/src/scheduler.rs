@@ -195,6 +195,12 @@ pub async fn run_daemon(
                     // 或手动诊断可能留下 payload/stderr 残留；一并按“超 7 天删 +
                     // 每类保留 10 个”清理，避免 run 目录无限增长。
                     maintain_run_dir_cleanup(&fupan_dir);
+                    // 持久化维护哨兵：CLI/MCP 的 maintenance_if_due 与 daemon 主
+                    // 循环共用同一哨兵；只更新内存计时的话，重启后又读到旧哨兵，
+                    // 会重复执行维护，也无法证明“维护已完成”。
+                    if let Err(e) = crate::db::touch_maintenance_marker(&fupan_dir.join("run")) {
+                        warn!("维护哨兵持久化失败（不影响本轮维护）: {e:#}");
+                    }
                     info!("SQLite 周期维护完成（WAL checkpoint + optimize + run 残留清理）");
                     last_maintenance = now_ts;
                 }
