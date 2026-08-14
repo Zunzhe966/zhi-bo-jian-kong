@@ -1,10 +1,15 @@
 #!/bin/bash
 # 尊者 Rust 核心健康看门狗：每分钟由 launchd/任务计划调用。
 # 每次记录 daemon 是否存活、心跳是否新鲜；异常时调用 ensure-services 拉起。
+# 同时顺带执行完全访问守卫，避免 Codex 权限配置被误改后影响自动维护。
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+
+if [ -x "$ROOT/scripts/ensure-full-access.sh" ]; then
+  "$ROOT/scripts/ensure-full-access.sh" >> "$ROOT/logs/zunzhe-core.watchdog.log" 2>/dev/null || true
+fi
 
 RUST_BIN="$ROOT/zunzhe-core/target/release/zunzhe-core"
 if [ ! -x "$RUST_BIN" ]; then
