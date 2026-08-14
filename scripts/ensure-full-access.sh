@@ -61,6 +61,10 @@ if [ -d "$PROJECT_ROOT/.codex" ]; then
   ensure_value "$PROJECT_CONFIG" "approval_policy" "never"
 fi
 
+# 不再守护桌面旧副本：launchd 环境没有 Desktop TCC 权限，守卫去读写会每轮
+# 报 Operation not permitted，造成“被改回”的假象。正式项目在 ~/Projects，
+# 桌面副本只由桌面端任务自身继承 host 级完全访问默认。
+
 # 桌面端每个任务的权限由 ~/.codex/.codex-global-state.json 持久化。若任务被
 # 误切到只读/按需批准，配置级守卫修不到这里。这里用原子替换把当前宿主任务、
 # 以及所有工作目录属于本项目的任务固定回完全访问；同时钉死 host 级默认
@@ -102,17 +106,24 @@ def full_access_entry():
 
 def repair_thread(tid):
     global changed
-    key = "heartbeat-thread-permissions-by-id." + tid
-    entry = container.get(key)
-    if not isinstance(entry, dict):
+    if not tid:
         return
-    current = entry.get("sandboxPolicy", {}).get("type")
-    profile = entry.get("activePermissionProfile", {}).get("id")
-    approval = entry.get("approvalPolicy")
-    if current == "dangerFullAccess" and profile == ":danger-full-access" and approval == "never":
-        return
-    container[key] = full_access_entry()
-    changed = True
+    flat_key = "heartbeat-thread-permissions-by-id." + tid
+    nested_map = container.get("heartbeat-thread-permissions-by-id")
+    candidates = []
+    if isinstance(nested_map, dict) and isinstance(nested_map.get(tid), dict):
+        candidates.append((nested_map, tid))
+    if isinstance(container.get(flat_key), dict):
+        candidates.append((container, flat_key))
+    for owner, key in candidates:
+        entry = owner[key]
+        current = entry.get("sandboxPolicy", {}).get("type")
+        profile = entry.get("activePermissionProfile", {}).get("id")
+        approval = entry.get("approvalPolicy")
+        if current == "dangerFullAccess" and profile == ":danger-full-access" and approval == "never":
+            continue
+        owner[key] = full_access_entry()
+        changed = True
 
 
 if thread_id:
@@ -128,8 +139,14 @@ except (OSError, json.JSONDecodeError):
     processes = []
 for process in processes:
     cwd = process.get("cwd") or ""
-    if os.path.abspath(cwd).startswith(os.path.abspath(project_root)):
-        repair_thread(process.get("conversationId") or "")
+    candidate_roots = [os.path.abspath(project_root)]
+    desktop_root = os.path.expanduser("~/Desktop/尊者监控直播短视频")
+    if os.path.isdir(desktop_root):
+        candidate_roots.append(os.path.abspath(desktop_root))
+    for root in candidate_roots:
+        if os.path.abspath(cwd).startswith(root):
+            repair_thread(process.get("conversationId") or "")
+            break
 
 # host 级默认：新任务从“完全访问 + 永不审批”继承，避免只有当前任务被修好、
 # 下次新建任务又退回只读/按需批准。
