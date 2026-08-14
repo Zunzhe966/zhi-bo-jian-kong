@@ -25,6 +25,12 @@ pub async fn run_mcp(pool: SqlitePool, project_dir: &Path, cfg: Arc<Config>) -> 
     let stdout = tokio::io::stdout();
     let mut reader = BufReader::new(stdin).lines();
     let mut writer = stdout;
+    // MCP 请求可能非常频繁；daemon 存活探测要读 pid/心跳文件，不能每条请求
+    // 都做。至少 60 秒才重新探测一次，维护由 6 小时哨兵自身节流。
+    let mut daemon_probe_at = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(61))
+        .unwrap_or_else(std::time::Instant::now);
+    let mut daemon_alive = crate::service::rust_daemon_alive(project_dir);
     let library = Arc::new(VideoLibrary::new(
         pool.clone(),
         project_dir.join("fupan_output"),
@@ -36,18 +42,20 @@ pub async fn run_mcp(pool: SqlitePool, project_dir: &Path, cfg: Arc<Config>) -> 
     if let Err(e) = crate::video_library::migrate_legacy_video_db(&pool, &fupan_dir).await {
         error!("视频库旧库合并失败（MCP 继续运行）: {e:#}");
     }
-    // MCP server 可能长驻而 daemon 未运行：独立入口也要低频收敛数据库。
-    // daemon 已接管时由主循环维护；未接管时这里补位。哨兵与 CLI 共用，
-    // 避免多个进程重复 checkpoint；失败不中断 MCP。
-    if !crate::service::rust_daemon_alive(project_dir)
-        && let Err(e) = db::maintenance_if_due(project_dir, &pool).await
-    {
-        error!("MCP 数据库维护失败（继续运行）: {e:#}");
-    }
-
     while let Ok(Some(line)) = reader.next_line().await {
         if line.trim().is_empty() {
             continue;
+        }
+        // MCP server 可能长驻而 daemon 未运行：独立入口也要低频收敛数据库。
+        // 每次请求前检查哨兵，daemon 已接管时由主循环维护，未接管时这里
+        // 补位；哨兵与 CLI/daemon 共用，避免多个进程重复 checkpoint。
+        // 失败只记日志，不中断当前请求。
+        if daemon_probe_at.elapsed() >= std::time::Duration::from_secs(60) {
+            daemon_alive = crate::service::rust_daemon_alive(project_dir);
+            daemon_probe_at = std::time::Instant::now();
+        }
+        if !daemon_alive && let Err(e) = db::maintenance_if_due(project_dir, &pool).await {
+            error!("MCP 数据库维护失败（继续运行）: {e:#}");
         }
         let request: Value = match serde_json::from_str(&line) {
             Ok(v) => v,
