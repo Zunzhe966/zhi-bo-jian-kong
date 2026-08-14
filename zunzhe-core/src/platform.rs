@@ -540,7 +540,7 @@ impl BilibiliAdapter {
         // B站会间歇性 412：同一 Cookie 文件失败后立即重试一次，再换下一组。
         let candidate = self
             .project_venv_ytdlp()
-            .unwrap_or_else(|| PathBuf::from("yt-dlp"));
+            .unwrap_or_else(ytdlp_path_fallback);
         let user_cookies = self.user_cookie_file();
         let browser_cookies = browser_cookie_path(&self.project_dir);
         let anon = crate::bilibili_auth::ensure_anon_cookie(&self.project_dir).await;
@@ -696,15 +696,36 @@ impl BilibiliAdapter {
     }
 
     fn project_venv_ytdlp(&self) -> Option<PathBuf> {
-        let candidates = [
-            self.project_dir.join(".venv").join("bin").join("yt-dlp"),
-            self.project_dir
-                .join(".venv")
-                .join("Scripts")
-                .join("yt-dlp.exe"),
-        ];
+        // 当前平台优先：Windows venv 是 Scripts/yt-dlp.exe，Unix 是 bin/yt-dlp。
+        // 再回退另一平台路径，兼容镜像/迁移目录；PATH 兜底由调用方拼平台后缀。
+        let candidates = if cfg!(windows) {
+            [
+                self.project_dir
+                    .join(".venv")
+                    .join("Scripts")
+                    .join("yt-dlp.exe"),
+                self.project_dir.join(".venv").join("bin").join("yt-dlp"),
+            ]
+        } else {
+            [
+                self.project_dir.join(".venv").join("bin").join("yt-dlp"),
+                self.project_dir
+                    .join(".venv")
+                    .join("Scripts")
+                    .join("yt-dlp.exe"),
+            ]
+        };
         candidates.into_iter().find(|p| p.exists())
     }
+}
+
+/// 无项目内 yt-dlp 时回退到 PATH：Windows 必须用 `.exe`，Unix 直接裸名。
+pub fn ytdlp_path_fallback() -> PathBuf {
+    PathBuf::from(if cfg!(windows) {
+        "yt-dlp.exe"
+    } else {
+        "yt-dlp"
+    })
 }
 
 /// B站 BV 号是 10 位字母数字且以 BV1 开头；用于过滤 RSS/yt-dlp 输出里的脏文本。
@@ -1201,5 +1222,64 @@ mod tests {
         // 完全无原因：给出通用提示，不崩溃。
         let empty = upload_list_failure_message("", "", "");
         assert!(empty.contains("三个兜底均未返回数据"), "{empty}");
+    }
+
+    #[test]
+    fn venv_ytdlp_prefers_current_platform_and_falls_back() {
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-ytdlp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let unix = dir.join(".venv").join("bin").join("yt-dlp");
+        let windows = dir.join(".venv").join("Scripts").join("yt-dlp.exe");
+        let adapter = BilibiliAdapter::with_cookie_and_project_dir("", dir.clone());
+
+        std::fs::create_dir_all(unix.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(windows.parent().unwrap()).unwrap();
+
+        // 只放本平台文件时，应选中它而不是另一平台路径。
+        if cfg!(windows) {
+            std::fs::write(&windows, "").unwrap();
+        } else {
+            std::fs::write(&unix, "").unwrap();
+        }
+        assert_eq!(
+            adapter.project_venv_ytdlp().unwrap(),
+            if cfg!(windows) {
+                windows.clone()
+            } else {
+                unix.clone()
+            }
+        );
+
+        // 两个都在时仍优先本平台路径。
+        if cfg!(windows) {
+            std::fs::write(&unix, "").unwrap();
+        } else {
+            std::fs::write(&windows, "").unwrap();
+        }
+        assert_eq!(
+            adapter.project_venv_ytdlp().unwrap(),
+            if cfg!(windows) { windows } else { unix }
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ytdlp_path_fallback_uses_platform_suffix() {
+        let fallback = ytdlp_path_fallback();
+        assert_eq!(
+            fallback.to_string_lossy(),
+            if cfg!(windows) {
+                "yt-dlp.exe"
+            } else {
+                "yt-dlp"
+            }
+        );
     }
 }
