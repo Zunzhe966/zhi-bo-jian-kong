@@ -1334,6 +1334,29 @@ pub async fn recover_processing_by_kind(pool: &SqlitePool, kind: &str) -> anyhow
     Ok(result.rows_affected())
 }
 
+/// 运行中自愈：把 attempts 已超过重试上限、却仍卡在 processing 的任务直接
+/// 落定 failed。
+///
+/// 正常路径下 worker 在第三次失败/超时时就会落定 failed；但 DB 更新失败、
+/// 进程被 SIGKILL 后未重启、或看门狗误杀等异常会让任务留在 processing。
+/// 只处理指定 kind，避免把另一个 worker 正在执行的任务误标 failed。
+pub async fn fail_stale_processing_by_kind(
+    pool: &SqlitePool,
+    kind: &str,
+    attempts_limit: i64,
+) -> anyhow::Result<u64> {
+    let result = sqlx::query(
+        "UPDATE tasks SET status='failed', updated_at=datetime('now','localtime')
+         WHERE status='processing' AND kind=? AND attempts >= ?",
+    )
+    .bind(kind)
+    .bind(attempts_limit)
+    .execute(pool)
+    .await
+    .context("自愈超限 processing 任务")?;
+    Ok(result.rows_affected())
+}
+
 pub async fn list_tasks(pool: &SqlitePool, status: &str, limit: i64) -> anyhow::Result<Vec<Task>> {
     let mut sql = String::from(
         "SELECT id, kind, url, name, status, attempts, payload, created_at, updated_at FROM tasks WHERE 1=1",
@@ -1753,6 +1776,58 @@ mod tests {
         assert!(
             pending.iter().any(|t| t.id == process_id),
             "process 任务应保持 pending 等待复盘 worker: {pending:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_processing_with_exhausted_attempts_is_self_healed() {
+        let pool = test_pool().await;
+        let dl_id = enqueue_task(&pool, "download", "https://x.test/stale-proc", "博主")
+            .await
+            .unwrap();
+        let process_id = enqueue_task(&pool, "process", "/tmp/stale-proc.mp4", "博主")
+            .await
+            .unwrap();
+        // 模拟异常退出后留在 processing、attempts 已超上限的两类任务。
+        sqlx::query("UPDATE tasks SET status='processing', attempts=5 WHERE id=?")
+            .bind(dl_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE tasks SET status='processing', attempts=5 WHERE id=?")
+            .bind(process_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let healed = fail_stale_processing_by_kind(&pool, "download", 3)
+            .await
+            .unwrap();
+        assert_eq!(healed, 1);
+        let failed = list_tasks(&pool, "failed", 10).await.unwrap();
+        assert!(
+            failed.iter().any(|t| t.id == dl_id),
+            "超限 download processing 应落定 failed: {failed:?}"
+        );
+        assert!(
+            !failed.iter().any(|t| t.id == process_id),
+            "不能把 process worker 正在执行的任务标 failed: {failed:?}"
+        );
+        // 未超限的 processing 不能误伤；process 任务 attempts=5 由复盘 worker
+        // 自己的自愈处理，这里只验证低 attempts 不被本函数清理。
+        sqlx::query("UPDATE tasks SET status='processing', attempts=1 WHERE id=?")
+            .bind(process_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let healed = fail_stale_processing_by_kind(&pool, "process", 3)
+            .await
+            .unwrap();
+        assert_eq!(healed, 0);
+        let processing = list_tasks(&pool, "processing", 10).await.unwrap();
+        assert!(
+            processing.iter().any(|t| t.id == process_id),
+            "未超限 processing 应继续保留: {processing:?}"
         );
     }
 

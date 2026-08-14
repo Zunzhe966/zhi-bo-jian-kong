@@ -567,6 +567,11 @@ pub async fn run_download_worker(
                     tracing::info!("下载 worker 空闲中，等待下载队列");
                     idle = 0;
                 }
+                // 运行中自愈：正常路径不会留下超限 processing，但 DB 更新失败
+                // 或崩溃恢复异常时不能让任务永久卡死。
+                if let Err(e) = db::fail_stale_processing_by_kind(&pool, "download", 3).await {
+                    tracing::warn!("下载 worker 自愈超限任务失败: {e:#}");
+                }
             }
             Err(e) => {
                 tracing::error!("下载 worker 处理队列失败，稍后重试: {e:#}");

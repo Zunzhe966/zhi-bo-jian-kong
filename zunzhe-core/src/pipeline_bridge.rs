@@ -236,6 +236,12 @@ pub async fn run_pipeline_worker(
                     tracing::info!("复盘 worker 空闲中，等待复盘队列");
                     idle = 0;
                 }
+                // 与下载 worker 一致：异常留下的超限 processing 任务要落定
+                // failed，不能永久卡住复盘队列。
+                if let Err(e) = crate::db::fail_stale_processing_by_kind(&pool, "process", 3).await
+                {
+                    tracing::warn!("复盘 worker 自愈超限任务失败: {e:#}");
+                }
             }
             Err(e) => {
                 tracing::error!("复盘 worker 处理队列失败，稍后重试: {e:#}");

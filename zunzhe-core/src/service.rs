@@ -543,7 +543,7 @@ fn daemon_uptime(project_dir: &Path) -> (u64, String) {
     static UPTIME_TS_RE: OnceLock<regex::Regex> = OnceLock::new();
     let re = UPTIME_TS_RE.get_or_init(|| {
         regex::Regex::new(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{4}")
-            .expect("uptime 时间戳正则应合法")
+            .unwrap_or_else(|_| regex::Regex::new(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}").unwrap())
     });
     let mut started_at: Option<chrono::DateTime<chrono::FixedOffset>> = None;
     for line in text.lines() {
@@ -994,6 +994,33 @@ mod tests {
         let (secs, human) = daemon_uptime(&dir);
         assert!(secs >= 120, "uptime_secs 应接近 125 秒，实际 {secs}");
         assert!(!human.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn daemon_uptime_tolerates_corrupt_log() {
+        // 日志可能被外部工具/磁盘异常写坏；uptime 只是诊断展示，绝不能因为
+        // 正则或时间解析失败让 status/doctor 崩溃。
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-uptime-corrupt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        std::fs::create_dir_all(dir.join("fupan_output").join("run")).unwrap();
+        write_rust_daemon_pid(&dir, 424242);
+        std::fs::write(
+            dir.join("logs").join("zunzhe-core.uptime.log"),
+            "这不是有效时间戳 started pid=424242\nbroken line\n",
+        )
+        .unwrap();
+        let (secs, human) = daemon_uptime(&dir);
+        assert_eq!(secs, 0);
+        assert!(human.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
