@@ -15,6 +15,15 @@ use crate::platform;
 use crate::video_library::VideoLibrary;
 use crate::watchlist::Watchlist;
 
+/// 周期维护时清理 B站 Electron 协议残留文件（payload/stderr/status）。
+///
+/// 调度轮次不跑 Electron，但旧版本/手动诊断可能留下临时文件；daemon 每 6 小时
+/// 维护时调用，避免 `fupan_output/run` 目录无限增长。抽成纯函数便于单测接线。
+fn maintain_run_dir_cleanup(fupan_dir: &Path) {
+    let run_dir = fupan_dir.join("run");
+    crate::bilibili_electron::cleanup_stale_script_files(&run_dir);
+}
+
 /// 24×30 守护调度器：固定间隔跑“检查视频源 + 处理下载队列”。
 /// 任何单个任务失败只记日志，不拖垮主循环。
 pub async fn run_daemon(
@@ -32,13 +41,17 @@ pub async fn run_daemon(
         .ok_or_else(|| anyhow!("已有 Rust daemon 在本项目运行，本实例退出"))?;
     // pid 文件只有锁持有者写入/清理：第二实例拿不到锁时不会误删第一实例的 pid。
     crate::service::write_rust_daemon_pid(project_dir, std::process::id());
-    let _pid_guard = DaemonPidGuard(project_dir);
+    // 清理顺序必须固定为：先删 pid，再释放单实例锁。反向声明保证 drop 顺序，
+    // 否则旧进程释放锁后、删除 pid 前会留出窗口，让新实例写入的 pid 被误删。
     let _lock = lock;
+    let _pid_guard = DaemonPidGuard(project_dir);
     // 启动即写一条 uptime 日志记录：外部 doctor/桌面端据此计算连续运行时长。
     let uptime_log = project_dir.join("logs").join("zunzhe-core.uptime.log");
     if let Some(parent) = uptime_log.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    // uptime 日志只追加不轮转会随 24×30 无限增长；保留最近 3 份滚动历史。
+    crate::service::rotate_log(&uptime_log, 3);
     let now = chrono::Local::now()
         .format("%Y-%m-%d %H:%M:%S %z")
         .to_string();
@@ -66,6 +79,9 @@ pub async fn run_daemon(
         Err(e) => warn!("回收重启前残留录制会话失败，继续调度: {e:#}"),
     }
     let mut stop = tokio::sync::watch::channel(false);
+    // SQLite 维护计数器：每 6 小时 checkpoint/optimize 一次，防长期 WAL 膨胀。
+    let maintenance_interval = 6 * 3600u64;
+    let mut last_maintenance = chrono::Local::now().timestamp();
     // 独立下载队列 worker：不参与 70 秒 tick 护栏，每个任务自身有 600 秒超时。
     // 下载耗时不会阻塞直播/视频检查，也不会被 tick abort 后永远卡 processing。
     let mut download_worker = tokio::spawn(download::run_download_worker(
@@ -87,6 +103,8 @@ pub async fn run_daemon(
     // 不依赖 launchd/桌面端 watchdog；launchd 被 macOS TCC 挡在 ~/Desktop 外时
     // 也能持续留下 24×30 验收记录。
     let uptime_tx = stop.0.clone();
+    // 心跳记录器每 60 秒追加一行，并在每次启动时轮转；此处只是普通追加，
+    // 不再重复轮转，避免启动与心跳写同一个文件时产生竞争。
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         loop {
@@ -125,7 +143,31 @@ pub async fn run_daemon(
         // Rust 直播监控独立于 Python 兼容层运行：检测开播、自动录制、状态持久化。
         // 每轮 tick 前刷新一次心跳，避免上一轮网络卡顿后健康判定陈旧。
         crate::service::touch_heartbeat(project_dir);
-        let tick = run_tick_with_timeout(&pool, project_dir, &fupan_dir, config, &watch);
+        let now_ts = chrono::Local::now().timestamp();
+        if now_ts.saturating_sub(last_maintenance) >= maintenance_interval as i64 {
+            match db::maintenance(&pool).await {
+                Ok(()) => {
+                    // B站 Electron 协议临时文件：调度轮次不跑 Electron，但旧版本
+                    // 或手动诊断可能留下 payload/stderr 残留；一并按“超 7 天删 +
+                    // 每类保留 10 个”清理，避免 run 目录无限增长。
+                    maintain_run_dir_cleanup(&fupan_dir);
+                    info!("SQLite 周期维护完成（WAL checkpoint + optimize + run 残留清理）");
+                    last_maintenance = now_ts;
+                }
+                Err(e) => warn!("SQLite 周期维护失败，下一轮重试: {e:#}"),
+            }
+        }
+        // 配置在 24×30 运行期间可能被桌面端/CLI 热更新（邮箱、转写/提炼/切片、
+        // 自动下载、通知开关等）。每轮 tick 重新加载配置，避免用户保存后必须
+        // 重启服务才生效；加载失败沿用上一轮配置继续调度，不中断 daemon。
+        let current_config = match Config::load(project_dir) {
+            Ok(reloaded) => reloaded,
+            Err(e) => {
+                warn!("配置热重载失败，沿用启动时配置: {e:#}");
+                config.clone()
+            }
+        };
+        let tick = run_tick_with_timeout(&pool, project_dir, &fupan_dir, &current_config, &watch);
         tokio::pin!(tick);
         let mut exited = false;
         tokio::select! {
@@ -225,7 +267,8 @@ struct DaemonPidGuard<'a>(&'a Path);
 
 impl Drop for DaemonPidGuard<'_> {
     fn drop(&mut self) {
-        crate::service::remove_rust_daemon_pid(self.0);
+        // 只删自己的 pid：旧实例退出时若新实例已经写入 pid，不能把新实例删掉。
+        crate::service::remove_rust_daemon_pid_if(self.0, std::process::id());
     }
 }
 
@@ -353,6 +396,8 @@ async fn tick(
     // 2. 对每个视频监控源拉一次最新视频并写入库；新出现的不重复通知。
     // 只检查“视频监控列表.ini”里的源；anchors 里的直播主播不能当成视频源，
     // 否则会把直播间地址误当成 RSS/空间源去拉视频。
+    // 每轮重新读列表：桌面端/CLI 新增或暂停视频源后下一轮立即生效，
+    // 不需要重启 daemon；与直播列表（URL_config.ini）每轮热加载保持一致。
     let watch = Watchlist::new(project_dir.to_path_buf());
     let sources = watch.list_video();
     let library = VideoLibrary::new(pool.clone(), fupan_dir.to_path_buf());
@@ -366,7 +411,26 @@ async fn tick(
     let auto_download = config.is_yes_fupan("视频监控", "自动下载新视频(是/否)", true);
     let notify_enabled = config.is_yes_fupan("复盘邮件", "发现新视频时发送通知(是/否)", true);
     let item_count = items.len();
+    // 所有源共用同一个“已知视频”集合，只在第一个成功源前查询一次；
+    // 后面的源复用这份快照，避免 10 个源每轮全量扫描 10 次 videos 表。
+    let mut known_ids: Option<std::collections::HashSet<String>> = None;
     for (source_url, name, item_download) in items {
+        // B站风控/网络故障不是一次就能恢复；连续失败后给该源冷却时间，
+        // 避免每轮都走完整的官方+RSSHub+yt-dlp 兜底链，既拖慢 daemon 又
+        // 更容易加重 412。连续失败 3 次起冷却 15 分钟，指数增长，上限 2 小时；
+        // 任何一次成功立即清零，不会把刚恢复的源误判成“还在故障”。
+        let (source_fails, last_failed_at) = db::source_failure_state(pool, &source_url).await?;
+        if source_fails >= 3 {
+            let now = chrono::Local::now().timestamp();
+            let cooldown = source_cooldown_secs(source_fails);
+            if source_cooldown_active(now, last_failed_at, cooldown) {
+                info!(
+                    "source {source_url} 连续失败 {source_fails} 次，冷却 {} 分钟",
+                    cooldown / 60
+                );
+                continue;
+            }
+        }
         let adapter = platform::resolve_with_project_dir(&source_url, project_dir);
         // 首次基线未建立时仍然检查；B站空间接口 403 等失败要明确返回错误，
         // 不能把“0 条视频”当成成功，避免用户误以为监控已正常工作。
@@ -380,28 +444,44 @@ async fn tick(
         {
             Ok(Err(e)) => {
                 error!("source {source_url} check failed: {e:#}");
+                let fails = db::bump_source_failures(pool, &source_url)
+                    .await
+                    .unwrap_or(0);
+                info!("source {source_url} 失败冷却计数: {fails}");
                 if item_count == 1 {
                     // 单源且是用户手动 check-videos：把失败直接暴露，便于排查。
                     return Err(anyhow::anyhow!("视频监控源检查失败 {source_url}: {e:#}"));
                 }
             }
             Ok(Ok(videos)) => {
-                let known_ids: Vec<String> = db::get_videos(pool, "", "", false)
-                    .await?
-                    .iter()
-                    .map(|v| v.id.clone())
-                    .collect();
+                // 成功即清零冷却状态；即使本轮返回空，只要平台接口明确成功，
+                // 也说明网络/风控已恢复，不应继续被旧失败计数拖累。
+                let _ = db::reset_source_failures(pool, &source_url).await;
+                if known_ids.is_none() {
+                    let all = db::get_videos(pool, "", "", false).await?;
+                    known_ids = Some(all.iter().map(|v| v.id.clone()).collect());
+                }
                 let first_run = !db::is_source_baselined(pool, &source_url).await?;
-                for v in &videos {
+                // 同源一轮返回的视频里，平台兜底链偶尔会重复同一个 BV/链接。
+                // 每轮每个源只处理一次，避免同轮重复写库、重复通知和重复入队。
+                let mut seen_this_round = std::collections::HashSet::new();
+                for v in videos
+                    .iter()
+                    .filter(|v| seen_this_round.insert(v.id.clone()))
+                {
                     // view 接口失败时只返回占位标题，跳过不写库，避免污染视频库。
                     if v.title == v.id {
                         continue;
                     }
-                    let is_new = !known_ids.contains(&v.id);
+                    let known = known_ids.as_mut().expect("本轮已初始化视频库快照");
+                    let is_new = !known.contains(&v.id);
                     match library.upsert(v, &name, &source_url).await {
                         // 首次监控：只把现有视频写入库作为基线，不通知、不下载。
-                        Ok(_) if is_new && first_run => {}
+                        Ok(_) if is_new && first_run => {
+                            known.insert(v.id.clone());
+                        }
                         Ok(_) if is_new => {
+                            known.insert(v.id.clone());
                             if notify_enabled {
                                 let title = "【尊者直播监控】博主发布新视频".to_string();
                                 let content =
@@ -443,6 +523,10 @@ async fn tick(
             }
             Err(_) => {
                 error!("source {source_url} check timeout (50s)");
+                let fails = db::bump_source_failures(pool, &source_url)
+                    .await
+                    .unwrap_or(0);
+                info!("source {source_url} 失败冷却计数: {fails}");
                 if item_count == 1 {
                     return Err(anyhow::anyhow!("视频监控源检查超时（50 秒）: {source_url}"));
                 }
@@ -485,31 +569,124 @@ pub struct TickStats {
     pub notify_retried: usize,
 }
 
+/// 连续失败次数对应的冷却秒数：3 次起 15 分钟，之后按失败次数线性增加，上限 2 小时。
+fn source_cooldown_secs(fails: u32) -> u64 {
+    if fails <= 2 {
+        return 0;
+    }
+    let base = Duration::from_secs(15 * 60);
+    let level = fails.saturating_sub(2);
+    (base * level)
+        .min(Duration::from_secs(2 * 60 * 60))
+        .as_secs()
+}
+
+/// 冷却是否仍生效：`now >= last_failed_at + cooldown` 时允许重试。
+fn source_cooldown_active(now_secs: i64, last_failed_at: i64, cooldown_secs: u64) -> bool {
+    cooldown_secs > 0 && now_secs.saturating_sub(last_failed_at) < cooldown_secs as i64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maintenance_cleans_stale_electron_files_in_run_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-sched-maint-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let run_dir = dir.join("fupan_output").join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        // 一个 8 天前的旧 payload 残留，一个刚写入的其它状态文件。
+        let old_payload = run_dir.join("bili_script_payload_stale.js");
+        std::fs::write(&old_payload, "old").unwrap();
+        set_mtime_days_ago(&old_payload, 8);
+        let fresh = run_dir.join("bili_script_status_fresh.json");
+        std::fs::write(&fresh, "{}").unwrap();
+
+        maintain_run_dir_cleanup(&dir.join("fupan_output"));
+
+        assert!(!old_payload.exists(), "超龄 payload 残留应被维护清理");
+        assert!(fresh.exists(), "新状态文件不应被误删");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    fn set_mtime_days_ago(path: &std::path::Path, days: u64) {
+        use std::os::unix::ffi::OsStrExt;
+        let old_time =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(days * 24 * 60 * 60);
+        let secs = old_time
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let times = [
+            libc::timespec {
+                tv_sec: secs,
+                tv_nsec: 0,
+            },
+            libc::timespec {
+                tv_sec: secs,
+                tv_nsec: 0,
+            },
+        ];
+        assert_eq!(
+            unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) },
+            0
+        );
+    }
+
     #[tokio::test]
     async fn daemon_once_without_anchors() {
-        let file = std::env::temp_dir().join(format!("zunzhe-daemon-{}", std::process::id()));
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let file =
+            std::env::temp_dir().join(format!("zunzhe-daemon-{}-{nonce}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("zunzhe-daemon-dir-{}-{nonce}", std::process::id()));
         let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
         let pool = crate::db::open_pool(&file).await.unwrap();
         db::init_db(&pool).await.unwrap();
         let cfg = crate::config::Config::load(Path::new(env!("CARGO_MANIFEST_DIR")))
             .unwrap_or_else(|_| crate::config::Config::defaults_for_test());
-        let result = run_daemon(pool, Path::new("."), &cfg, 1, true, None).await;
+        let result = run_daemon(pool, &dir, &cfg, 1, true, None).await;
         assert!(result.is_ok(), "{result:?}");
+        // --once 模式退出后必须清理 pid/锁，不能污染临时目录或真实工作区。
+        assert!(
+            !dir.join("fupan_output")
+                .join("run")
+                .join("zunzhe-core.pid")
+                .exists()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&file);
     }
 
     #[tokio::test]
     async fn daemon_duration_exits_and_cleans_pid() {
-        let file = std::env::temp_dir().join(format!("zunzhe-daemon-dur-{}", std::process::id()));
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let file =
+            std::env::temp_dir().join(format!("zunzhe-daemon-dur-{}-{nonce}", std::process::id()));
         let _ = std::fs::remove_file(&file);
         let pool = crate::db::open_pool(&file).await.unwrap();
         db::init_db(&pool).await.unwrap();
         let cfg = crate::config::Config::load(Path::new(env!("CARGO_MANIFEST_DIR")))
             .unwrap_or_else(|_| crate::config::Config::defaults_for_test());
-        let dir = std::env::temp_dir().join(format!("zunzhe-daemon-dir-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("zunzhe-daemon-dir-{}-{nonce}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         crate::service::write_rust_daemon_pid(&dir, std::process::id());
@@ -527,14 +704,21 @@ mod tests {
 
     #[tokio::test]
     async fn second_daemon_rejected_and_keeps_first_pid() {
-        let file = std::env::temp_dir().join(format!("zunzhe-daemon-dup-{}", std::process::id()));
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let file =
+            std::env::temp_dir().join(format!("zunzhe-daemon-dup-{}-{nonce}", std::process::id()));
         let _ = std::fs::remove_file(&file);
         let pool = crate::db::open_pool(&file).await.unwrap();
         db::init_db(&pool).await.unwrap();
         let cfg = crate::config::Config::load(Path::new(env!("CARGO_MANIFEST_DIR")))
             .unwrap_or_else(|_| crate::config::Config::defaults_for_test());
-        let dir =
-            std::env::temp_dir().join(format!("zunzhe-daemon-dup-dir-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-daemon-dup-dir-{}-{nonce}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -567,5 +751,53 @@ mod tests {
         let _ = tokio::join!(&mut a, &mut b);
         // 两个句柄已完成，超时收尾不能 panic。
         abort_timed_out_tasks(a, b).await;
+    }
+
+    #[test]
+    fn source_cooldown_rules_are_exponential_and_recoverable() {
+        assert_eq!(source_cooldown_secs(0), 0);
+        assert_eq!(source_cooldown_secs(2), 0, "连续失败 2 次不进入冷却");
+        assert_eq!(source_cooldown_secs(3), 15 * 60);
+        assert_eq!(source_cooldown_secs(4), 30 * 60);
+        assert_eq!(source_cooldown_secs(6), 60 * 60);
+        assert_eq!(source_cooldown_secs(100), 2 * 60 * 60, "冷却上限 2 小时");
+
+        let now = 1_000_000;
+        assert!(
+            !source_cooldown_active(now, now - 15 * 60, 15 * 60),
+            "冷却期满应允许重试"
+        );
+        assert!(
+            source_cooldown_active(now, now - 60, 15 * 60),
+            "冷却期内应跳过"
+        );
+        assert!(
+            !source_cooldown_active(now, now - 60, 0),
+            "无冷却时永远允许"
+        );
+    }
+
+    #[tokio::test]
+    async fn maintenance_prunes_notify_and_tasks_to_recent_200() {
+        let file =
+            std::env::temp_dir().join(format!("zunzhe-maintenance-prune-{}", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let pool = crate::db::open_pool(&file).await.unwrap();
+        for i in 0..250 {
+            let nid = db::add_notify(&pool, "video", "博主", "标题", "内容", "邮箱")
+                .await
+                .unwrap();
+            // 终态记录才会被清理；pending 通知无论新旧都必须保留。
+            db::fail_notify(&pool, nid).await.unwrap();
+            let id = db::enqueue_task(&pool, "download", &format!("https://x.test/{i}"), "博主")
+                .await
+                .unwrap();
+            // 终态记录才会被清理；pending 任务无论新旧都必须保留。
+            db::set_task_status(&pool, id, "done").await.unwrap();
+        }
+        crate::db::maintenance(&pool).await.unwrap();
+        assert_eq!(db::list_notify(&pool, "", 1000).await.unwrap().len(), 200);
+        assert_eq!(db::list_tasks(&pool, "", 1000).await.unwrap().len(), 200);
+        let _ = std::fs::remove_file(&file);
     }
 }

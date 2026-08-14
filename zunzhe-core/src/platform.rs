@@ -5,14 +5,14 @@ use std::pin::Pin;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
-use tracing::{debug, warn};
+use tracing::warn;
 
 use crate::bilibili_auth::{
     browser_cookie_path, cookie_header_from_netscape_public, ensure_anon_cookie,
     ensure_user_cookie_file, read_browser_cookie_file,
 };
 use crate::model::VideoMeta;
-use crate::process::{ChildError, ManagedChild};
+use crate::process::ManagedChild;
 
 /// B 站 WBI 固定置换表（公开算法，非密钥）。
 const MIXIN_KEY_TAB: [usize; 64] = [
@@ -36,6 +36,50 @@ fn md5_hex(text: &str) -> String {
     hasher.update(text.as_bytes());
     let bytes = hasher.finalize();
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 汇总三个兜底源的空结果错误，生成给用户的顶层错误说明。
+///
+/// 24×30 审计发现：B站源网络/DNS 故障时，旧实现把底层原因吞成“空列表”，
+/// 顶层永远归因为“412 风控，请配置 cookie”，误导用户去配 Cookie 而不是
+/// 检查网络。这里把每级原因带上来，风控与网络故障分别给出可操作提示。
+fn upload_list_failure_message(official: &str, rsshub: &str, ytdlp: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if !official.is_empty() {
+        parts.push(official);
+    }
+    if !rsshub.is_empty() {
+        parts.push(rsshub);
+    }
+    if !ytdlp.is_empty() {
+        parts.push(ytdlp);
+    }
+    let detail = if parts.is_empty() {
+        "三个兜底均未返回数据".to_string()
+    } else {
+        parts.join("；")
+    };
+    // 网络故障优先判断：即使 detail 里同时带“签名失败/请求失败”和
+    // “解析失败/超时”，根本原因也是网络，不能误导成配置 cookie。
+    let hint = if detail.contains("解析失败")
+        || detail.contains("请求失败")
+        || detail.contains("DNS")
+        || detail.contains("timed out")
+        || detail.contains("Timeout")
+        || detail.contains("超时")
+    {
+        "若为网络/DNS 故障请检查网络后重试".to_string()
+    } else if detail.contains("412")
+        || detail.contains("风控")
+        || detail.contains("403")
+        || detail.contains("wbi")
+        || detail.contains("签名")
+    {
+        "若为 412 风控请配置 B站 cookie".to_string()
+    } else {
+        "可稍后重试或检查 B站 cookie".to_string()
+    };
+    format!("B站投稿列表拉取失败: {detail}（{hint}）")
 }
 
 /// 用 B 站 WBI 公钥和投稿列表参数生成签名查询串。
@@ -97,6 +141,34 @@ impl Default for BilibiliAdapter {
 }
 
 impl BilibiliAdapter {
+    /// 请求一次 B站官方投稿接口并解析 BV 列表；返回空表示需要上层换下一组兜底。
+    async fn request_upload_ids(
+        &self,
+        signed_query: &str,
+        headers: &reqwest::header::HeaderMap,
+        count: u32,
+    ) -> Vec<String> {
+        let signed = format!("https://api.bilibili.com/x/space/wbi/arc/search?{signed_query}");
+        let Ok(resp) = self
+            .client
+            .get(&signed)
+            .headers(headers.clone())
+            .send()
+            .await
+        else {
+            return Vec::new();
+        };
+        // HTTP 层必须是成功状态，B站 412/5xx 时继续走 RSSHub/yt-dlp，
+        // 不能让 HTML 或错误 JSON 被当成“空列表”。
+        if !resp.status().is_success() {
+            return Vec::new();
+        }
+        let Ok(data) = resp.json::<serde_json::Value>().await else {
+            return Vec::new();
+        };
+        parse_official_upload_response(&data, count)
+    }
+
     /// 取 B 站 wbi 图片并生成查询签名（w_rid/wts）。失败返回空串，调用方走无签名兜底。
     async fn wbi_query(&self, mid: &str, count: u32) -> anyhow::Result<String> {
         let client = reqwest::Client::builder()
@@ -338,36 +410,41 @@ impl Platform for BilibiliAdapter {
         Box::pin(async move {
             let mid =
                 Self::mid_from_url(url).with_context(|| format!("不是 B站空间地址: {url}"))?;
-            // 官方 wbi/arc 接口优先（带 cookie），再 Electron 页面提取，
-            // 再 RSSHub，最后 yt-dlp；Electron 只依赖真实浏览器页面，不依赖
-            // 容易受公共出口限制的 RSSHub/匿名 HTTP 请求。
-            let mut bvids = self.upload_ids_official(&mid, count).await;
+            // 官方 wbi/arc 接口优先（带 cookie），再 RSSHub，最后 yt-dlp；
+            // Electron 页面提取从调度轮次移除，因为独立 Electron 冷启动
+            // 需要 20-40 秒，会被 50 秒单源护栏截断；手动 blogger-videos
+            // 场景仍可使用（由调用方决定是否补充）。
+            // 三个兜底都只返回“空列表”，但空的原因可能是 412 风控，也可能是
+            // 网络/DNS 故障。把每级的真实原因带上来，顶层报错才不至于把
+            // “api.bilibili.com 解析失败”误导成“请配置 cookie”。
+            let (mut bvids, official_err) = self.upload_ids_official(&mid, count).await;
+            let mut rsshub_err = String::new();
+            let mut ytdlp_err = String::new();
+            tracing::warn!("B站官方投稿接口返回 {} 条 ({official_err})", bvids.len());
             if bvids.is_empty() {
-                bvids = self.upload_ids_electron(&mid, count).await;
+                let (next, err) = self.upload_ids_rsshub(&mid, count).await;
+                bvids = next;
+                rsshub_err = err.clone();
+                tracing::warn!("B站 RSSHub 投稿列表返回 {} 条 ({err})", bvids.len());
             }
             if bvids.is_empty() {
-                bvids = self.upload_ids_rsshub(&mid, count).await;
+                let (next, err) = self.upload_ids_ytdlp(&mid, count).await;
+                bvids = next;
+                ytdlp_err = err.clone();
+                tracing::warn!("B站 yt-dlp 投稿列表返回 {} 条 ({err})", bvids.len());
             }
             if bvids.is_empty() {
-                bvids = self.upload_ids_ytdlp(&mid, count).await;
-            }
-            if bvids.is_empty() {
-                return Err(anyhow!(
-                    "B站投稿列表拉取失败，可能被 412 风控，请配置 B站 cookie 后重试"
-                ));
+                return Err(anyhow!(upload_list_failure_message(
+                    &official_err,
+                    &rsshub_err,
+                    &ytdlp_err
+                )));
             }
             // view 补全并发执行：B站接口单次 1-3 秒，10 条串行会拖慢监控轮次。
-            let mut tasks = Vec::with_capacity(bvids.len());
-            for bvid in &bvids {
-                tasks.push(self.view(bvid));
-            }
-            let mut out = Vec::with_capacity(tasks.len());
-            for task in tasks {
-                // 占位/补全失败的结果不能进入历史视频库，否则会伪装成“成功但空”。
-                if let Some(meta) = task.await {
-                    out.push(meta);
-                }
-            }
+            let results =
+                futures_util::future::join_all(bvids.iter().map(|bvid| self.view(bvid))).await;
+            // 占位/补全失败的结果不能进入历史视频库，否则会伪装成“成功但空”。
+            let out: Vec<VideoMeta> = results.into_iter().flatten().collect();
             if out.is_empty() {
                 return Err(anyhow!("B站视频信息补全失败，请配置 B站 cookie 或稍后重试"));
             }
@@ -377,7 +454,9 @@ impl Platform for BilibiliAdapter {
 }
 
 impl BilibiliAdapter {
-    async fn upload_ids_official(&self, mid: &str, count: u32) -> Vec<String> {
+    /// 返回 `(bv_ids, 失败原因)`。失败原因用于顶层区分风控与网络故障，
+    /// 空串表示“无具体原因可描述”。
+    async fn upload_ids_official(&self, mid: &str, count: u32) -> (Vec<String>, String) {
         // 旧 Python 的投稿列表接口明确不使用匿名 buvid：那会更容易触发 412。
         // 这里只使用用户配置或浏览器授权 Cookie，不补匿名设备 Cookie。
         let cookie = self.upload_list_cookie();
@@ -395,124 +474,147 @@ impl BilibiliAdapter {
             headers.insert(reqwest::header::COOKIE, v);
         }
 
-        // 官方接口优先使用 WBI 签名。无 Cookie 也可尝试，失败再走匿名/下方兜底。
-        if let Ok(signed_query) = self.wbi_query(mid, count).await {
-            let signed = format!("https://api.bilibili.com/x/space/wbi/arc/search?{signed_query}");
-            let Ok(resp) = self
-                .client
-                .get(&signed)
-                .headers(headers.clone())
-                .send()
-                .await
-            else {
-                return Vec::new();
-            };
-            // HTTP 层必须是成功状态，B站 412/5xx 时继续走 RSSHub/yt-dlp，
-            // 不能让 HTML 或错误 JSON 被当成“空列表”。
-            if !resp.status().is_success() {
-                return Vec::new();
-            }
-            if let Ok(data) = resp.json::<serde_json::Value>().await
-                && data.get("code").and_then(|c| c.as_i64()) == Some(0)
-                && let Some(rows) = data["data"]["list"]["vlist"].as_array()
-            {
-                let ids: Vec<String> = rows
-                    .iter()
-                    .filter_map(|r| {
-                        r.get("bvid")
-                            .and_then(|b| b.as_str())
-                            .map(|s| s.to_string())
-                    })
-                    .take(count as usize)
-                    .collect();
-                if !ids.is_empty() {
-                    return ids;
+        // 官方接口优先使用 WBI 签名。签名（nav）本身也可能被 B站 412/限流，
+        // 一次失败不代表接口不可用：重试一次再回退 RSSHub/yt-dlp，避免
+        // 偶发网络抖动让官方接口被静默跳过。
+        let mut reason = String::new();
+        for attempt in 0..2 {
+            match self.wbi_query(mid, count).await {
+                Ok(signed_query) => {
+                    let ids = self
+                        .request_upload_ids(&signed_query, &headers, count)
+                        .await;
+                    if !ids.is_empty() {
+                        return (ids, reason);
+                    }
+                    if reason.is_empty() {
+                        reason = "官方 wbi 接口未返回 BV（可能是 412 风控或接口变更）".to_string();
+                    }
+                    tracing::warn!(
+                        "B站官方投稿接口第 {} 次尝试未返回 BV，重试一次",
+                        attempt + 1
+                    );
+                }
+                Err(e) => {
+                    if reason.is_empty() {
+                        reason = format!("官方接口签名失败: {e:#}");
+                    }
+                    tracing::warn!("B站官方 wbi 签名第 {} 次失败: {e:#}", attempt + 1);
                 }
             }
         }
-        Vec::new()
+        (Vec::new(), reason)
     }
 
-    async fn upload_ids_rsshub(&self, mid: &str, count: u32) -> Vec<String> {
+    async fn upload_ids_rsshub(&self, mid: &str, count: u32) -> (Vec<String>, String) {
         let rss = format!("https://rsshub.app/bilibili/user/video/{mid}");
-        if let Ok(resp) = self.client.get(&rss).send().await
-            && resp.status().is_success()
-            && let Ok(text) = resp.text().await
-            && text.starts_with('<')
-        {
-            let ids = extract_bvids(&text);
-            if !ids.is_empty() {
-                return ids.into_iter().take(count as usize).collect();
+        match self.client.get(&rss).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if !status.is_success() {
+                    return (Vec::new(), format!("RSSHub 返回 HTTP {status}"));
+                }
+                match resp.text().await {
+                    Ok(text) if text.starts_with('<') => {
+                        let ids = extract_bvids(&text);
+                        if ids.is_empty() {
+                            return (Vec::new(), "RSSHub 返回 HTML 但未解析出 BV 号".to_string());
+                        }
+                        (
+                            ids.into_iter().take(count as usize).collect(),
+                            String::new(),
+                        )
+                    }
+                    Ok(_) => (Vec::new(), "RSSHub 返回非 HTML 内容".to_string()),
+                    Err(e) => (Vec::new(), format!("RSSHub 响应读取失败: {e:#}")),
+                }
             }
+            Err(e) => (Vec::new(), format!("RSSHub 请求失败: {e:#}")),
         }
-        Vec::new()
     }
 
-    async fn upload_ids_ytdlp(&self, mid: &str, count: u32) -> Vec<String> {
-        let cookie = self.effective_cookie().await;
-        // 与旧 Python 一致：用户配置 Cookie 优先转成 `--cookies`；没有账号 Cookie
-        // 才补匿名 buvid 文件，且不把用户 Cookie 写成易被截断的 `--add-header`。
+    async fn upload_ids_ytdlp(&self, mid: &str, count: u32) -> (Vec<String>, String) {
+        // 与旧 Python 一致：优先用户配置 Cookie，其次桌面端浏览器授权 Cookie，
+        // 再补匿名 buvid 文件；全部没有时才裸请求一次。Cookie 一律转成
+        // `yt-dlp --cookies` 文件，不用易被编码/换行截断的 `--add-header`。
+        // B站会间歇性 412：同一 Cookie 文件失败后立即重试一次，再换下一组。
         let candidate = self
             .project_venv_ytdlp()
             .unwrap_or_else(|| PathBuf::from("yt-dlp"));
-        debug!(
-            "yt-dlp fallback: {} (cookie={})",
-            candidate.display(),
-            !cookie.is_empty()
-        );
-        let mut cmd = Command::new(&candidate);
-        cmd.kill_on_drop(true);
-        cmd.args(["--flat-playlist", "--playlist-end"])
-            .arg(count.to_string())
-            .args(["--print", "%(id)s"])
-            .arg(format!("https://space.bilibili.com/{mid}/video"));
         let user_cookies = self.user_cookie_file();
         let browser_cookies = browser_cookie_path(&self.project_dir);
-        if let Some(user_cookies) = user_cookies {
-            cmd.args(["--cookies", user_cookies.display().to_string().as_str()]);
-        } else if browser_cookies.exists() {
-            cmd.args(["--cookies", browser_cookies.display().to_string().as_str()]);
-        } else if cookie.is_empty()
-            && let Some(anon) = crate::bilibili_auth::ensure_anon_cookie(&self.project_dir).await
-        {
-            cmd.args(["--cookies", anon.display().to_string().as_str()]);
+        let anon = crate::bilibili_auth::ensure_anon_cookie(&self.project_dir).await;
+        // 顺序：用户配置 -> 浏览器授权 -> 匿名 buvid；None 表示“该组不存在”。
+        let mut cookie_options: Vec<Option<PathBuf>> = vec![
+            user_cookies,
+            Some(browser_cookies).filter(|p| p.exists()),
+            anon,
+        ];
+        // 无任何 Cookie 文件时也试一次裸请求，避免“配置为空但网络可匿名”时
+        // 明明能取到列表却提前返回失败。
+        if cookie_options.is_empty() {
+            cookie_options.push(None);
         }
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        if let Ok(child) = ManagedChild::spawn(&mut cmd) {
-            match child.wait_with_output(Duration::from_secs(30)).await {
-                Ok(out) => {
-                    let text = String::from_utf8_lossy(&out.stdout);
-                    let ids: Vec<String> = text
-                        .lines()
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| is_plausible_bvid(s))
-                        .take(count as usize)
-                        .collect();
-                    if ids.is_empty() {
-                        let err = String::from_utf8_lossy(&out.stderr);
-                        warn!(
-                            "yt-dlp 未返回 BV 号: {}",
-                            err.chars().take(300).collect::<String>()
-                        );
-                    } else {
-                        debug!("yt-dlp 返回 {} 条", ids.len());
-                    }
-                    return ids;
+        let mut last_error = String::new();
+        // 每个 Cookie 组最多尝试 2 次；单次 yt-dlp 执行 30 秒超时，由
+        // ManagedChild 统一回收进程组，不会让 412/网络卡顿无限拖住监控轮次。
+        // 两次尝试之间加退避，避免风控/限流时立即连打同一出口加重 412。
+        for cookie_file in cookie_options {
+            let label = cookie_file
+                .as_deref()
+                .map(|p| {
+                    p.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string()
+                })
+                .unwrap_or_else(|| "none".to_string());
+            for attempt in 0..2 {
+                let mut cmd = Command::new(&candidate);
+                cmd.kill_on_drop(true);
+                cmd.args(["--flat-playlist", "--playlist-end"])
+                    .arg(count.to_string())
+                    .args(["--print", "%(id)s"])
+                    .arg(format!("https://space.bilibili.com/{mid}/video"));
+                if let Some(cookie_file) = &cookie_file {
+                    cmd.args(["--cookies", cookie_file.display().to_string().as_str()]);
                 }
-                Err(ChildError::Io(e)) => {
-                    warn!("yt-dlp 读取输出失败: {e}");
-                    return Vec::new();
+                cmd.stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                let Ok(child) = ManagedChild::spawn(&mut cmd) else {
+                    break;
+                };
+                let Ok(out) = child.wait_with_output(Duration::from_secs(30)).await else {
+                    last_error = "yt-dlp 兜底超时（30 秒）".to_string();
+                    break;
+                };
+                let text = String::from_utf8_lossy(&out.stdout);
+                let ids: Vec<String> = text
+                    .lines()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| is_plausible_bvid(s))
+                    .take(count as usize)
+                    .collect();
+                if !ids.is_empty() {
+                    return (ids, last_error);
                 }
-                Err(ChildError::Timeout) => {
-                    warn!("yt-dlp 兜底超时（30 秒）");
-                    return Vec::new();
+                last_error = String::from_utf8_lossy(&out.stderr)
+                    .chars()
+                    .take(300)
+                    .collect::<String>();
+                warn!(
+                    "yt-dlp 未返回 BV 号 (cookie={label}, attempt={}): {}",
+                    attempt + 1,
+                    last_error
+                );
+                if attempt == 0 {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             }
         }
-        warn!("yt-dlp 启动失败: {candidate:?}");
-        Vec::new()
+        warn!("yt-dlp 兜底全部失败: {last_error}");
+        (Vec::new(), last_error)
     }
 
     /// 用 Electron 浏览器内核从 B站空间页提取投稿 BV 号。
@@ -520,13 +622,26 @@ impl BilibiliAdapter {
     /// B站 `arc/search` 接口、RSSHub 和 yt-dlp 都可能因为匿名出口/公共实例
     /// 限制而失败；真实 Chromium 页面会跑完前端风控逻辑，是最接近桌面浏览器
     /// 的取数方式。这里只用于“取列表”，不触发下载，因此不会占用带宽写文件。
+    /// 目前调度轮次不调用（冷启动 20-40 秒会撞 50 秒护栏），保留给未来
+    /// 后台任务/手动诊断使用。
+    #[allow(dead_code)]
     async fn upload_ids_electron(&self, mid: &str, count: u32) -> Vec<String> {
-        let Ok(cookie) =
-            std::fs::read_to_string(crate::bilibili_auth::browser_cookie_path(&self.project_dir))
-        else {
-            return Vec::new();
+        let cookie_path = crate::bilibili_auth::browser_cookie_path(&self.project_dir);
+        let cookie = match std::fs::read_to_string(&cookie_path) {
+            Ok(cookie) => cookie,
+            Err(e) => {
+                tracing::warn!(
+                    "跳过 B站 Electron 列表提取：读取 Cookie 失败 path={} err={e:#}",
+                    cookie_path.display()
+                );
+                return Vec::new();
+            }
         };
         if cookie.trim().is_empty() {
+            tracing::warn!(
+                "跳过 B站 Electron 列表提取：Cookie 文件为空 path={}",
+                cookie_path.display()
+            );
             return Vec::new();
         }
         let url = format!("https://space.bilibili.com/{mid}/video");
@@ -596,6 +711,27 @@ fn is_plausible_bvid(text: &str) -> bool {
     bytes.len() == 12
         && text.starts_with("BV1")
         && bytes[3..].iter().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// 从 B站官方 `arc/search` 成功 JSON 中提取 BV 列表。
+///
+/// `code != 0`、缺 `data.list.vlist` 或数组中无 BV 都视为“没有可用结果”，
+/// 由上层继续 RSSHub/yt-dlp 兜底，不把风控/空响应伪装成成功。
+fn parse_official_upload_response(data: &serde_json::Value, count: u32) -> Vec<String> {
+    if data.get("code").and_then(|c| c.as_i64()) != Some(0) {
+        return Vec::new();
+    }
+    let Some(rows) = data["data"]["list"]["vlist"].as_array() else {
+        return Vec::new();
+    };
+    rows.iter()
+        .filter_map(|r| {
+            r.get("bvid")
+                .and_then(|b| b.as_str())
+                .map(|s| s.to_string())
+        })
+        .take(count as usize)
+        .collect()
 }
 
 /// 从 RSS/HTML 文本提取 BV 号（保持顺序、去重）。
@@ -1003,5 +1139,65 @@ mod tests {
             "mid=946974&order=pubdate&platform=web&pn=1&ps=10&web_location=1550101&wts=1786550400&w_rid=1b8f0e19353b02df0a82591de339a31f"
         );
         assert!(query.contains("&w_rid="));
+    }
+
+    #[test]
+    fn official_upload_response_requires_code_zero_and_bvids() {
+        let ok = serde_json::json!({
+            "code": 0,
+            "data": {"list": {"vlist": [
+                {"bvid": "BV1xx411c7mD"},
+                {"bvid": "BV1yy411c7mD"},
+                {"title": "无 bvid 的行应被忽略"}
+            ]}}
+        });
+        assert_eq!(
+            parse_official_upload_response(&ok, 10),
+            vec!["BV1xx411c7mD".to_string(), "BV1yy411c7mD".to_string()]
+        );
+        assert_eq!(
+            parse_official_upload_response(&serde_json::json!({"code": -412}), 10),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            parse_official_upload_response(&serde_json::json!({"code": 0, "data": {}}), 10),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            parse_official_upload_response(
+                &serde_json::json!({"code": 0, "data": {"list": {"vlist": []}}}),
+                10
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn upload_failure_message_distinguishes_network_from_risk_control() {
+        // 网络/DNS 故障：必须提示查网络，不能误导成“请配置 cookie”。
+        let net = upload_list_failure_message(
+            "官方接口签名失败: reqwest error resolving api.bilibili.com: nodename nor servname provided",
+            "RSSHub 请求失败: connection timed out",
+            "yt-dlp 兜底超时（30 秒）",
+        );
+        assert!(
+            net.contains("解析失败") || net.contains("请求失败"),
+            "{net}"
+        );
+        assert!(net.contains("检查网络"), "{net}");
+        assert!(!net.contains("请配置 B站 cookie"), "{net}");
+
+        // 风控：提示配置 cookie。
+        let risk = upload_list_failure_message(
+            "官方 wbi 接口未返回 BV（可能是 412 风控或接口变更）",
+            "RSSHub 返回 HTTP 403",
+            "yt-dlp 未返回 BV 号",
+        );
+        assert!(risk.contains("412"), "{risk}");
+        assert!(risk.contains("请配置 B站 cookie"), "{risk}");
+
+        // 完全无原因：给出通用提示，不崩溃。
+        let empty = upload_list_failure_message("", "", "");
+        assert!(empty.contains("三个兜底均未返回数据"), "{empty}");
     }
 }
