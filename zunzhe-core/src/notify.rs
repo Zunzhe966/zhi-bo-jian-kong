@@ -7,7 +7,10 @@ use lettre::{Message, Transport};
 use serde::Serialize;
 use serde_json::Value;
 use sqlx::sqlite::SqlitePool;
-use std::sync::Mutex;
+use std::sync::{
+    Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::Duration;
 
 use crate::app_prefs;
@@ -24,6 +27,13 @@ const NOTIFY_MAX_ATTEMPTS: i64 = 3;
 /// 并发调用时如果不加锁，后一次写入会基于旧文件覆盖前一次追加的内容，
 /// 直接丢通知。所有线程共用这一把锁即可。
 static NOTIFY_QUEUE_LOCK: Mutex<()> = Mutex::new(());
+
+/// 本地通知 id 的进程内单调计数器。
+///
+/// 旧实现用“毫秒时间戳 + 亚秒随机后缀”，理论上仍可能碰撞（同一进程连续
+/// 调用且系统时钟回拨时）。桌面端按 id 去重，碰撞会让用户漏看通知；这里
+/// 用进程内单调计数消除碰撞，同时保留时间戳便于排序。
+static NOTIFY_ID_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// 通知通道：邮箱 / 微信(Server酱) / PushPlus / Bark / ntfy / 不通知。
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -344,10 +354,7 @@ impl<'a> Notifier<'a> {
             .unwrap_or_default();
         // 同一毫秒可能产生多条通知；只用时间戳做 id 会碰撞，桌面端按 id
         // 去重后只弹一条。追加随机后缀保证每条通知都有唯一 id。
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
+        let nonce = NOTIFY_ID_SEQ.fetch_add(1, Ordering::Relaxed);
         items.push(serde_json::json!({
             "id": format!("{:.3}-{nonce}", std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -771,6 +778,49 @@ mod tests {
         assert_eq!(items.len(), 3, "三条通知都应保留");
         let unique: std::collections::HashSet<_> = ids.iter().collect();
         assert_eq!(unique.len(), 3, "通知 id 必须唯一: {ids:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_notify_ids_use_monotonic_sequence_even_after_reset() {
+        // 进程内计数器不会因系统时钟回拨而回退；连续调用 5 次，id 后缀必须
+        // 严格递增，避免桌面端按 id 去重时把新通知误判成旧通知。
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-notify-seq-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        crate::app_prefs::write_app_prefs(&dir, &serde_json::json!({})).unwrap();
+        for i in 1..=5 {
+            Notifier::queue_local(&dir, &format!("标题{i}"), &format!("内容{i}"));
+        }
+        let path = dir
+            .join("fupan_output")
+            .join("run")
+            .join("pending_notify.json");
+        let items: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let suffixes: Vec<u64> = items
+            .iter()
+            .map(|v| {
+                v["id"]
+                    .as_str()
+                    .unwrap()
+                    .rsplit('-')
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(suffixes.len(), 5);
+        for pair in suffixes.windows(2) {
+            assert!(pair[1] > pair[0], "id 后缀必须严格递增: {suffixes:?}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
