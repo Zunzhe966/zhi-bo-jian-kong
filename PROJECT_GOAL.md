@@ -7,7 +7,8 @@
 ## 一、项目是什么
 
 - GitHub 私有仓库：`Zunzhe966/zun-zhe-zhi-bo-jian-kong`
-- 本地路径：`/Users/zhangxuetao/Desktop/尊者监控直播短视频`
+- 正式本地路径：`/Users/zhangxuetao/Projects/尊者监控直播短视频`
+- 桌面旧副本：`/Users/zhangxuetao/Desktop/尊者监控直播短视频`（仅保留待确认清理）
 - 技术栈（现状）：Python 3.14 + main.py（录制引擎）+ fupan/（复盘层）+ Electron 桌面端 + MCP/CLI
 
 ## 二、最终目标
@@ -50,18 +51,21 @@ Python 工具层  faster-whisper / LLM 提炼 / ffmpeg 切片 / yt-dlp 兜底
 | D | 通知简化（邮箱默认+覆盖+兜底） | ✅ 已完成 |
 | E | Rust 骨架 zunzhe-core（cargo/schema/CLI 对齐/Platform trait/BilibiliAdapter） | ✅ 已完成 |
 | G | QQ 邮箱通知链路：配置助手/状态诊断/老项目迁移/桌面端一键填入 | ✅ 已完成（授权码需用户提供） |
-| F | 交付：git 提交、文档图谱更新、三平台 CI、汇报 | ✅ 已完成 |
+| F | 交付：git 提交、文档图谱更新、三平台 CI、汇报 | 🔄 部分完成（代码与文档已交付；三平台 CI 被 GitHub 账户计费拦截，24×30 长跑未满） |
 
 ### Rust 三平台 CI
 - `.github/workflows/rust-core.yml` 会在 push/PR 时对 `zunzhe-core` 在
   macOS / Windows / Ubuntu 三平台跑 `cargo fmt --check`、`clippy -D warnings`、
   `cargo test --all-targets`、release 构建与 CLI 契约冒烟，作为“三平台可编译运行”
   的自动化证据。
+- 当前真实状态：GitHub Actions 账户计费未恢复，三平台 CI 全部 `not started`；
+  本机 macOS 全量回归已绿（193 lib + 1 ignored + 6 集成契约），Windows/Linux
+  本机交叉 check 因缺 C 交叉编译器无法作为最终证据。
 
 ### Rust 重构（zunzhe-core）已交付能力
 
-- M0-M17 全部完成并通过 `cargo test`（152 个 lib 单测、1 ignored + 5 集成契约测试）
-  + `cargo clippy --all-targets -D warnings` + `cargo fmt --check`
+- M0-M17 全部完成并通过 `cargo test --all-targets`（193 lib + 1 ignored + 6
+  集成契约测试）+ `cargo clippy --all-targets -D warnings` + `cargo fmt --check`
 - M13 组装收尾：macOS 守护脚本、launchd 模板、使用说明、图谱更新
 - CLI/MCP 命令与 Python 版对齐；SQLite 持久化、崩溃可恢复、任务失败只记日志不拖垮 daemon
 - CLI/MCP 已对齐 `delete-live / set-notify / ensure-services / tail-logs /
@@ -94,6 +98,12 @@ Python 工具层  faster-whisper / LLM 提炼 / ffmpeg 切片 / yt-dlp 兜底
   `stop` 不自动拉起 Python 兜底（避免双跑与“停不掉”）
 - 验证环境遗留的 Python `video_monitor` 进程已清理；桌面端若再次出现“双跑”，
   先查 `desktop/electron/main.cjs` 的 `ensure-services` 调用是否命中旧 Python CLI
+- 24×30 长跑：daemon 由 launchd KeepAlive 托管，健康审计每分钟落盘
+  `logs/zunzhe-core.audit.log`；当前 `pid=25141` 持续心跳，但 30 天累计
+  验收尚未完成。最终验收以“同一 pid 连续心跳 + RSS 稳定 + 日志无断档 +
+  三平台 CI 全绿”为准。
+- 数据库单一权威：CLI/daemon/MCP 统一使用 `项目根/zunzhe-core.db`；历史
+  `zunzhe-core/zunzhe-core.db` 已合并归档，不得再作为第二套状态打开。
 
 ## 五、关键约定
 
