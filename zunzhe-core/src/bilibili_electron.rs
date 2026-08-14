@@ -291,6 +291,11 @@ pub(crate) fn cleanup_stale_script_files(run_dir: &Path) {
 /// `fupan_output/run` 无限积累旧版本留下的诊断文件。
 pub(crate) fn maintain_run_dir(run_dir: &Path) {
     cleanup_stale_script_files(run_dir);
+    // daemon 换实例/崩溃后，旧实例会把当前 pid/heartbeat 重命名成
+    // `*.stale-<unix_ts>` 留给诊断；这些文件已无运行价值，长期运行会随重启
+    // 次数无限积累，必须在周期维护里一并清掉。正式 pid/heartbeat 不匹配
+    // `*.stale-` 模式，不会被误删。
+    cleanup_daemon_state_stale_files(run_dir);
     let Ok(entries) = std::fs::read_dir(run_dir) else {
         return;
     };
@@ -318,6 +323,21 @@ pub(crate) fn maintain_run_dir(run_dir: &Path) {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         if now.saturating_sub(modified) >= 7 * 24 * 60 * 60 {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// 清理旧实例留下的 `zunzhe-core.*.stale-*` 状态残留。
+fn cleanup_daemon_state_stale_files(run_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(run_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if name.starts_with("zunzhe-core.") && name.contains(".stale-") {
             let _ = std::fs::remove_file(entry.path());
         }
     }
@@ -486,12 +506,24 @@ mod tests {
         std::fs::write(&fresh_tmp, "fresh").unwrap();
         let live_file = run_dir.join("zunzhe-core.heartbeat");
         std::fs::write(&live_file, "now").unwrap();
+        let stale_heartbeat = run_dir.join("zunzhe-core.heartbeat.stale-1786712453");
+        std::fs::write(&stale_heartbeat, "old").unwrap();
+        let stale_pid = run_dir.join("zunzhe-core.pid.stale-1786712453");
+        std::fs::write(&stale_pid, "424242").unwrap();
+        let fresh_state = run_dir.join("zunzhe-core.pid");
+        std::fs::write(&fresh_state, "424242").unwrap();
 
         maintain_run_dir(&run_dir);
 
         assert!(!stale_tmp.exists(), "超龄原子写残留应被清理");
         assert!(fresh_tmp.exists(), "刚写入的临时文件不应被误删");
         assert!(live_file.exists(), "正式状态文件不应被误删");
+        assert!(
+            !stale_heartbeat.exists(),
+            "旧实例 heartbeat stale 残留应被清理"
+        );
+        assert!(!stale_pid.exists(), "旧实例 pid stale 残留应被清理");
+        assert!(fresh_state.exists(), "正式 pid 文件不应被误删");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
