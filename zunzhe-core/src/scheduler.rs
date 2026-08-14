@@ -21,7 +21,7 @@ use crate::watchlist::Watchlist;
 /// 维护时调用，避免 `fupan_output/run` 目录无限增长。抽成纯函数便于单测接线。
 fn maintain_run_dir_cleanup(fupan_dir: &Path) {
     let run_dir = fupan_dir.join("run");
-    crate::bilibili_electron::cleanup_stale_script_files(&run_dir);
+    crate::bilibili_electron::maintain_run_dir(&run_dir);
 }
 
 /// 24×30 守护调度器：固定间隔跑“检查视频源 + 处理下载队列”。
@@ -650,10 +650,14 @@ mod tests {
         set_mtime_days_ago(&old_payload, 8);
         let fresh = run_dir.join("bili_script_status_fresh.json");
         std::fs::write(&fresh, "{}").unwrap();
+        let stale_tmp = run_dir.join(".zunzhe-core.heartbeat.tmp.123.456.0");
+        std::fs::write(&stale_tmp, "stale").unwrap();
+        set_mtime_days_ago(&stale_tmp, 8);
 
         maintain_run_dir_cleanup(&dir.join("fupan_output"));
 
         assert!(!old_payload.exists(), "超龄 payload 残留应被维护清理");
+        assert!(!stale_tmp.exists(), "超龄原子写残留应被维护清理");
         assert!(fresh.exists(), "新状态文件不应被误删");
         let _ = std::fs::remove_dir_all(&dir);
     }
