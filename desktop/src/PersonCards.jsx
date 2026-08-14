@@ -79,6 +79,9 @@ export function statusFingerprint(data) {
     live: data.live_watchlist,
     video: data.video_watchlist,
     notes: data.notes,
+    recordingSessions: (data.recording_sessions || [])
+      .map((s) => s.url)
+      .sort(),
     recording: (data.recent_recordings || [])
       .filter((r) => r.probably_recording)
       .map((r) => r.file)

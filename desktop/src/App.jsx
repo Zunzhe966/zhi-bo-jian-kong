@@ -124,11 +124,17 @@ function buildRows(status) {
   const activeFiles = (status.recent_recordings || [])
     .filter((r) => r.probably_recording)
     .map((r) => r.file.toLowerCase())
+  const recordingUrls = new Set(
+    (status.recording_sessions || []).map((s) => String(s.url || '').toLowerCase())
+  )
   return (status.live_watchlist || []).map((room, idx) => {
     const platform = detectPlatform(room.url)
     const remark = (room.remark || '').replace(/^主播:\s*/, '')
-    const isRecording = room.enabled && remark &&
-      activeFiles.some((f) => f.includes(remark.toLowerCase()))
+    const roomUrl = room.url.toLowerCase()
+    const isRecording = room.enabled && (
+      recordingUrls.has(roomUrl) ||
+      (remark && activeFiles.some((f) => f.includes(remark.toLowerCase())))
+    )
     let state = 'noting'
     if (!room.enabled) state = 'noting'
     else if (isRecording) state = 'recording'

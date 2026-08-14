@@ -36,6 +36,7 @@ pub async fn build(project_dir: &Path, pool: &SqlitePool, cfg: &Config) -> Resul
     let library = video_library::VideoLibrary::new(pool.clone(), fupan_dir.clone());
     let videos = library.list("", "", false).await?;
     let (recent_recordings, notes) = file_scan_cache(&downloads, &fupan_dir, project_dir)?;
+    let recording_sessions = db::list_live_sessions(pool, "recording", 100).await?;
     let rust_running = service::rust_daemon_alive(project_dir);
     let heartbeat_ok = service::heartbeat_fresh_public(project_dir);
     let (uptime_secs, uptime_human) = service::daemon_uptime_public(project_dir);
@@ -56,6 +57,7 @@ pub async fn build(project_dir: &Path, pool: &SqlitePool, cfg: &Config) -> Resul
             "video_monitor": {"running": rust_running},
         },
         "recent_recordings": recent_recordings,
+        "recording_sessions": recording_sessions,
         "notes": notes,
         "paths": {
             "recordings": downloads.display().to_string(),
@@ -246,6 +248,47 @@ mod tests {
         assert!(status["uptime_secs"].is_number());
         assert!(status["uptime_human"].is_string());
         assert!(status["notes"].as_array().is_some());
+        assert_eq!(status["recording_sessions"], serde_json::json!([]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn snapshot_includes_recording_sessions_from_db() {
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-status-recording-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::create_dir_all(dir.join("downloads")).unwrap();
+        std::fs::write(dir.join("config").join("config.ini"), "[录制设置]\n").unwrap();
+        std::fs::write(dir.join("config").join("fupan_config.ini"), "[视频监控]\n").unwrap();
+        let cfg = crate::config::Config::load(&dir).unwrap();
+        let db_path = dir.join("test.db");
+        let pool = crate::db::open_pool(&db_path).await.unwrap();
+        crate::db::init_db(&pool).await.unwrap();
+        crate::db::start_live_session(
+            &pool,
+            "https://live.bilibili.com/1",
+            "主播甲",
+            "测试直播",
+            "bilibili",
+            "https://example.com/stream",
+            1234,
+            "downloads/B站直播/主播甲/test.ts",
+        )
+        .await
+        .unwrap();
+
+        let status = build(&dir, &pool, &cfg).await.unwrap();
+        let sessions = status["recording_sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["url"], "https://live.bilibili.com/1");
+        assert_eq!(sessions[0]["status"], "recording");
+        assert_eq!(sessions[0]["anchor"], "主播甲");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
