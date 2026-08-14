@@ -20,6 +20,10 @@ use crate::db;
 /// 通知失败后允许的重试上限。SMTP/HTTPS 单次失败通常是临时网络抖动，
 /// 不能一次失败就永久漏通知；超限后才落定 failed 防止配置错误无限重试。
 const NOTIFY_MAX_ATTEMPTS: i64 = 3;
+/// 失败重试的最小等待分钟数：重试间隔 = attempts * 5 分钟，上限 30 分钟。
+/// 防止网络故障/SMTP 被限流时每轮 tick 都立刻连打同一通道，加重风控。
+const NOTIFY_RETRY_BASE_MINUTES: i64 = 5;
+const NOTIFY_RETRY_MAX_MINUTES: i64 = 30;
 
 /// 本地通知队列的进程内互斥锁。
 ///
@@ -241,12 +245,18 @@ impl<'a> Notifier<'a> {
     }
 
     /// 重试通知队列中的 pending 通知：一次最多处理 50 条，失败保留 pending，
-    /// 成功标记 sent。发送失败只记日志，不拖垮 daemon tick。
+    /// 成功标记 sent。发送失败只记日志，不拖垮 daemon tick；带退避的重试在
+    /// `send_record` 内部完成，避免这里需要同时维护两份失败计数。
     pub async fn flush_pending(&self, limit: i64) -> Result<usize> {
         // 最老优先：队列超过单轮上限时老通知不能被新通知永远挤出重试窗口。
         let pending = db::list_pending_notify(self.pool, limit).await?;
         let mut sent_count = 0;
         for item in pending {
+            // 失败重试需要退避：attempts 越多次，间隔越长，避免网络故障时
+            // 每轮 tick 都连打同一通道。首次发送不受限，立即尝试。
+            if item.attempts > 0 && !self.retry_due(&item.created_at, item.attempts) {
+                continue;
+            }
             let channel = Channel::parse(&item.channel);
             match self
                 .send_record(item.id, &item.title, &item.content, &channel)
@@ -258,6 +268,25 @@ impl<'a> Notifier<'a> {
             }
         }
         Ok(sent_count)
+    }
+
+    /// 按创建时间与当前重试次数判断是否已到重试窗口。
+    ///
+    /// 重试间隔按 `attempts` 线性增长（5/10/15/20/25/30 分钟），避免单次
+    /// 网络故障/限流让通知在每轮 tick 中重复发送。时间解析失败时按“已到期”
+    /// 处理，保证异常数据也能收敛到 sent/failed，而不是永远卡在队列里。
+    fn retry_due(&self, created_at: &str, attempts: i64) -> bool {
+        // SQLite `datetime('now','localtime')` 是无时区本地时间；先按 Naive
+        // 解析再与本地时钟比较，避免 parse_from_str 要求时区偏移而全部失败。
+        let Some(created) =
+            chrono::NaiveDateTime::parse_from_str(created_at, "%Y-%m-%d %H:%M:%S").ok()
+        else {
+            return true;
+        };
+        let wait_minutes =
+            (attempts * NOTIFY_RETRY_BASE_MINUTES).clamp(0, NOTIFY_RETRY_MAX_MINUTES);
+        let due = created + chrono::Duration::minutes(wait_minutes);
+        chrono::Local::now().naive_local() >= due
     }
 
     /// 测试所有已配置通知通道；任何一条成功都返回 true。
@@ -1151,6 +1180,15 @@ mod tests {
         let id = db::add_notify(&pool, "live", "主播", "开播", "内容", "微信")
             .await
             .unwrap();
+        // 把 created_at 拨到 1 小时前，让每一次重试都满足退避窗口，
+        // 专注验证 3 次失败后收敛；退避本身由 `retry_due` 单测锁定。
+        sqlx::query(
+            "UPDATE notify SET created_at=datetime('now','localtime','-60 minutes') WHERE id=?",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
 
         // 前两次失败：保留 pending，attempts 递增。
         for expected_attempts in [1, 2] {
@@ -1175,6 +1213,39 @@ mod tests {
         let _ = std::fs::remove_file(&file);
         let _ = std::fs::remove_file(file.with_extension("db-shm"));
         let _ = std::fs::remove_file(file.with_extension("db-wal"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn notify_retry_backoff_scales_with_attempts_and_caps() {
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-notify-backoff-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::write(dir.join("config").join("config.ini"), "[推送配置]\n").unwrap();
+        std::fs::write(dir.join("config").join("fupan_config.ini"), "").unwrap();
+        let cfg = crate::config::Config::load(&dir).unwrap();
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let notifier = Notifier::new(&pool, &cfg);
+
+        let now = chrono::Local::now();
+        let fmt = |dt: chrono::DateTime<chrono::Local>| dt.format("%Y-%m-%d %H:%M:%S").to_string();
+
+        // attempts=1 需要等 5 分钟：4 分钟前创建的记录不到期，6 分钟前到期。
+        assert!(!notifier.retry_due(&fmt(now - chrono::Duration::minutes(4)), 1));
+        assert!(notifier.retry_due(&fmt(now - chrono::Duration::minutes(6)), 1));
+
+        // attempts=6 对应 30 分钟上限：29 分钟前不到期，31 分钟前到期。
+        assert!(!notifier.retry_due(&fmt(now - chrono::Duration::minutes(29)), 6));
+        assert!(notifier.retry_due(&fmt(now - chrono::Duration::minutes(31)), 6));
+
+        // 异常时间戳按“已到期”处理，避免一条坏数据永远卡住重试队列。
+        assert!(notifier.retry_due("not-a-time", 1));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
