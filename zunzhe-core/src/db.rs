@@ -601,6 +601,37 @@ pub async fn add_anchor(pool: &SqlitePool, url: &str, name: &str) -> anyhow::Res
     Ok(())
 }
 
+/// 旧核心 DB 迁移专用：只在主库没有相同 url 时插入，绝不覆盖已有记录。
+///
+/// 返回 `true` 表示本次确实写入，返回 `false` 表示因主库已存在而跳过。
+/// 与 `insert_legacy_video` 一样使用单条 `INSERT OR IGNORE`，幂等且并发安全。
+#[allow(clippy::too_many_arguments)] // 对齐旧库 anchors 字段，逐字段复制
+pub async fn insert_legacy_anchor(
+    tx: &mut sqlx::SqliteConnection,
+    url: &str,
+    name: &str,
+    platform: &str,
+    enabled: bool,
+    live: bool,
+    notify_channel: &str,
+) -> anyhow::Result<bool> {
+    let result = sqlx::query(
+        r#"INSERT OR IGNORE INTO anchors
+           (url, name, platform, enabled, live, notify_channel)
+           VALUES (?,?,?,?,?,?)"#,
+    )
+    .bind(url)
+    .bind(name)
+    .bind(platform)
+    .bind(if enabled { 1i64 } else { 0i64 })
+    .bind(if live { 1i64 } else { 0i64 })
+    .bind(notify_channel)
+    .execute(&mut *tx)
+    .await
+    .context("写入旧核心 DB anchors")?;
+    Ok(result.rows_affected() > 0)
+}
+
 #[allow(dead_code)] // 直播监控注册接口
 pub async fn upsert_anchor(
     pool: &SqlitePool,

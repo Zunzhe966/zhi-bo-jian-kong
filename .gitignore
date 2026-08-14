@@ -185,3 +185,6 @@ desktop/electron-win.zip
 zunzhe-core.db
 zunzhe-core.db-shm
 zunzhe-core.db-wal
+
+# 旧核心 DB 归档（历史数据，不入库）
+zunzhe-core/zunzhe-core.db.legacy-*

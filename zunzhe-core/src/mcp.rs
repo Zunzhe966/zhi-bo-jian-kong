@@ -40,6 +40,9 @@ pub async fn run_mcp(pool: SqlitePool, project_dir: &Path, cfg: Arc<Config>) -> 
     if let Err(e) = crate::video_library::migrate_legacy_video_db(&pool, &fupan_dir).await {
         error!("视频库旧库合并失败（MCP 继续运行）: {e:#}");
     }
+    if let Err(e) = crate::video_library::migrate_legacy_core_db(&pool, project_dir).await {
+        error!("旧核心 DB 合并失败（MCP 继续运行）: {e:#}");
+    }
     while let Ok(Some(line)) = reader.next_line().await {
         if line.trim().is_empty() {
             continue;

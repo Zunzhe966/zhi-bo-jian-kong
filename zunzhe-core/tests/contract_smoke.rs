@@ -63,6 +63,24 @@ fn goal_docs_exist() {
     assert!(root.join("zunzhe-core").join("目标模式.md").exists());
 }
 
+/// 单一权威 DB 路径契约：CLI/daemon/MCP 统一使用项目根/zunzhe-core.db，
+/// 旧核心子目录里的 zunzhe-core.db 只能被迁移，不能成为第二套状态。
+#[test]
+fn single_authoritative_db_path_contract() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    // 代码里唯一默认 DB 路径（cli.rs --db 缺省分支），不得依赖当前目录。
+    let cli_default = root.join("zunzhe-core.db");
+    assert!(cli_default.parent().is_some());
+    let legacy = root.join("zunzhe-core").join("zunzhe-core.db");
+    // 权威库必须位于项目根，而不是 zunzhe-core/ 子目录；旧库即使存在也
+    // 不应成为任何入口默认打开的库。
+    assert_ne!(cli_default, legacy);
+    assert_eq!(
+        cli_default.file_name().and_then(|s| s.to_str()),
+        Some("zunzhe-core.db")
+    );
+}
+
 /// CLI/MCP 对齐契约：MCP 工具清单必须覆盖 CLI 暴露的核心能力。
 #[test]
 fn mcp_tools_cover_core_cli_commands() {

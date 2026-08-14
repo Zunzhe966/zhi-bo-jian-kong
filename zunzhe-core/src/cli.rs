@@ -218,6 +218,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     if let Err(e) = video_library::migrate_legacy_video_db(&pool, &fupan_dir).await {
         eprintln!("视频库旧库合并失败（不影响本次命令）: {e:#}");
     }
+    // 旧核心残留 DB zunzhe-core/zunzhe-core.db 同样以主库为权威安全合并；
+    // 合并成功后归档旧文件，防止后续入口再次打开它继续累积另一套状态。
+    if let Err(e) = video_library::migrate_legacy_core_db(&pool, &project_dir).await {
+        eprintln!("旧核心 DB 合并失败（不影响本次命令）: {e:#}");
+    }
     let watch = watchlist::Watchlist::new(project_dir.clone());
     let api = config_api::ConfigApi::new(project_dir.clone());
 

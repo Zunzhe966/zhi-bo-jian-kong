@@ -77,6 +77,10 @@ pub async fn run_daemon(
     if let Err(e) = crate::video_library::migrate_legacy_video_db(&pool, &fupan_dir).await {
         warn!("旧视频库迁移失败，继续调度: {e:#}");
     }
+    // 旧核心残留 DB 合并：daemon 启动时统一收敛到主库，避免两个库并存。
+    if let Err(e) = crate::video_library::migrate_legacy_core_db(&pool, project_dir).await {
+        warn!("旧核心 DB 迁移失败，继续调度: {e:#}");
+    }
     let watch = Watchlist::new(project_dir.to_path_buf());
     let monitor = LiveMonitor::new(&pool, project_dir, config, &watch);
     // 硬崩溃/断电后，SQLite 仍会留着上一实例的 recording 会话。新实例没有旧
