@@ -278,7 +278,13 @@ fn find_project_root(start: &Path) -> Result<PathBuf> {
         }
         dir = d.parent();
     }
-    Ok(start.to_path_buf())
+    // 找不到配置不能静默把当前目录当项目根：在 zunzhe-core/、桌面旧副本或
+    // 任意子目录跑 doctor 时会把 DB/心跳/日志读错位置，误报 daemon 不健康。
+    // 显式报错让调用方知道需要从项目根（含 config/）运行。
+    bail!(
+        "找不到项目根（需要 config/config.ini 或 config/config.ini.example）：{}",
+        start.display()
+    )
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -841,6 +847,36 @@ SMTP邮件服务器 = smtp.qq.com
             );
         }
         assert!(!status.hint.contains("SMTP服务器"));
+    }
+
+    #[test]
+    fn find_project_root_walks_up_from_nested_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "zunzhe-root-probe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("zunzhe-core").join("src")).unwrap();
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        std::fs::write(
+            root.join("config").join("config.ini.example"),
+            "[推送配置]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("config").join("fupan_config.ini.example"),
+            "[视频监控]\n",
+        )
+        .unwrap();
+
+        // 从任意子目录（如 zunzhe-core/src）调用必须定位到项目根，不能把
+        // 子目录当成项目根，否则 DB/心跳/日志路径全部读错。
+        let cfg = Config::load(&root.join("zunzhe-core").join("src")).unwrap();
+        assert_eq!(cfg.project_dir, root);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
