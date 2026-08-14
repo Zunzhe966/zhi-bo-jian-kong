@@ -34,7 +34,9 @@ sudo -u zunzhe /opt/zunzhe/zunzhe-core/target/release/zunzhe-core doctor
 
 服务复用 `scripts/start-rust-daemon.sh`：每次启动先构建 release，再 `exec`
 daemon，日志进入 journald；Rust 自身仍会把心跳写入
-`logs/zunzhe-core.uptime.log`、把 SQLite/pid 写入 `fupan_output/run/`。
+`logs/zunzhe-core.uptime.log`（daemon 心跳记录器按 10MB 轮转保留 3 份）、
+把 SQLite/pid 写入 `fupan_output/run/`；桌面端/系统健康看门狗记录写入
+`logs/zunzhe-core.watchdog.log`（按 5MB 轮转保留 5 份）。
 注意：systemd 的 `Restart=always` 只负责进程退出后拉起；若心跳超时，
 `doctor` 会把 `heartbeat_ok` 置为 false，可再加一个 cron/systemd timer
 调用 `scripts/check-rust-daemon.sh` 做二级健康看门。
