@@ -9,6 +9,10 @@ set -euo pipefail
 # 优先用仓库绝对路径，避免 launchd 复制脚本后 dirname 解析到错误目录。
 if [ -d "$(dirname "$0")/../zunzhe-core" ]; then
   ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+elif [ -d "$HOME/Projects/尊者监控直播短视频/zunzhe-core" ]; then
+  ROOT="$HOME/Projects/尊者监控直播短视频"
+elif [ -d "$HOME/Documents/尊者监控直播短视频/zunzhe-core" ]; then
+  ROOT="$HOME/Documents/尊者监控直播短视频"
 else
   ROOT="$HOME/Desktop/尊者监控直播短视频"
 fi

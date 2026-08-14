@@ -88,7 +88,7 @@ pub fn ensure_core(project_dir: &Path) -> Result<serde_json::Value> {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
             // launchd 实例没能健康（TCC 拒绝访问项目目录、二进制缺失等）
-            // 不能再静默返回成功；回退由本进程直接启动，保证看门狗能恢复。
+            // 时再回退由本进程直接启动，保证看门狗能恢复。
             tracing::warn!("launchctl kickstart 后 daemon 未在 5 秒内健康，回退直接启动");
         }
         // launchctl 本身失败（服务未加载等）也走直接 spawn 兜底。

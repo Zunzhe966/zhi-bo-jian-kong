@@ -15,7 +15,7 @@
   <key>KeepAlive</key>
   <true/>
   <key>WorkingDirectory</key>
-  <string>/Users/zhangxuetao/Desktop/尊者监控直播短视频</string>
+  <string>__PROJECT_DIR__</string>
   <key>StandardOutPath</key>
   <string>/Users/zhangxuetao/Library/Logs/zunzhe/zunzhe-core.log</string>
   <key>StandardErrorPath</key>

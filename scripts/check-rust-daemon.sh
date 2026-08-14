@@ -53,5 +53,8 @@ printf '%s pid=%s rust_daemon=%s heartbeat_ok=%s\n' \
 
 if [ "$daemon_ok" = "false" ] || [ "$heartbeat_ok" = "false" ]; then
   echo "$now daemon unhealthy, calling ensure-services" >> "$LOG"
+  # 不能在这里无限等：macOS 桌面端看门狗由 launchd 每分钟触发；Windows
+  # 由任务计划触发。ensure-services 自身有有限等待（launchd 接管确认最多
+  # 5 秒 + spawn 健康轮询最多 5 秒），整体最坏约 10 秒。
   "$RUST_BIN" ensure-services >/dev/null 2>&1 || true
 fi

@@ -1,10 +1,30 @@
 #!/bin/bash
 # 尊者 Rust 核心健康看门狗（launchd 专用）。
 # 安装位置：~/Library/LaunchAgents/zunzhe-healthcheck.sh。
-# 放在 LaunchAgents 而不是项目 scripts/ 下，避免 macOS TCC 阻止 launchd
-# 访问 ~/Desktop 目录；Rust 二进制仍指向项目 release。
+# 与 com.zunzhe.monitor 一样，只支持项目位于非 TCC 保护目录（推荐
+# ~/Projects/尊者监控直播短视频）。桌面目录由 launchd 看门狗无法稳定读取。
 set -u
-ROOT="$HOME/Desktop/尊者监控直播短视频"
+
+ROOT="$(pwd)"
+for candidate in "$HOME/Projects/尊者监控直播短视频" "$HOME/Documents/尊者监控直播短视频" "$ROOT" "$HOME/Desktop/尊者监控直播短视频"; do
+  if [ -f "$candidate/config/config.ini.example" ] || [ -f "$candidate/config/config.ini" ]; then
+    ROOT="$candidate"
+    break
+  fi
+done
+
+if [ ! -f "$ROOT/config/config.ini.example" ] && [ ! -f "$ROOT/config/config.ini" ]; then
+  echo "找不到项目根（需要 config/config.ini(.example)）" >&2
+  exit 1
+fi
+
+case "$ROOT" in
+  "$HOME/Desktop/"*)
+    echo "项目在 $ROOT：macOS TCC 会阻止 launchd 稳定运行。请把项目迁移到 ~/Projects 或 ~/Documents 后再注册 launchd。" >&2
+    exit 1
+    ;;
+esac
+
 RUST_BIN="$ROOT/zunzhe-core/target/release/zunzhe-core"
 if [ ! -x "$RUST_BIN" ]; then
   RUST_BIN="$ROOT/zunzhe-core/target/debug/zunzhe-core"
@@ -52,7 +72,7 @@ if [ "$daemon_ok" = "false" ] || [ "$heartbeat_ok" = "false" ]; then
   echo "$now daemon unhealthy, calling ensure-services" >> "$LOG"
   # 不能在这里无限等：launchd 的 StartInterval 不会重叠运行同任务，若
   # ensure-services 卡住会停掉后续健康轮。目前 ensure-services 自身有
-  # 有限等待（launchd 最多 5 秒）+ spawn 健康轮询（最多 5 秒），整体
-  # 最坏约 10 秒，不会拖垮下一分钟。
+  # 有限等待（launchd 接管确认最多 5 秒 + spawn 健康轮询最多 5 秒），
+  # 整体最坏约 10 秒，不会拖垮下一分钟。
   "$RUST_BIN" ensure-services >/dev/null 2>&1 || true
 fi
