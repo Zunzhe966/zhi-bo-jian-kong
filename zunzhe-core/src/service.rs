@@ -63,7 +63,7 @@ pub fn ensure_core(project_dir: &Path) -> Result<serde_json::Value> {
     // 直接 spawn 与 launchd 抢单实例锁；否则 launchd 会不断重试并报
     // “已有 Rust daemon 在本项目运行”。
     #[cfg(target_os = "macos")]
-    if launchd_monitor_installed() {
+    if launchd_can_manage(project_dir) {
         if rust_daemon_alive(project_dir) {
             return Ok(
                 json!({"ok": true, "rust_daemon": "已在运行（launchd 管理）", "services": {}}),
@@ -93,6 +93,17 @@ pub fn ensure_core(project_dir: &Path) -> Result<serde_json::Value> {
         }
         // launchctl 本身失败（服务未加载等）也走直接 spawn 兜底。
     }
+    // 项目仍位于桌面/文稿等 TCC 保护目录时，launchd 无法稳定接管；即使已经
+    // 安装过 com.zunzhe.monitor，也必须由本进程直接拉起，不能继续 kickstart
+    // 一个每次都会失败的 launchd 任务，也不能把手动进程误报成“launchd 管理”。
+    if rust_daemon_alive(project_dir) {
+        return Ok(json!({
+            "ok": true,
+            "rust_daemon": "已在运行",
+            "services": {},
+            "hints": ensure_core_hints(project_dir)
+        }));
+    }
     let rust = start_rust_daemon(project_dir, 900)?;
     // Rust daemon 已统一接管直播检测/录制和视频监控；不再并行启动 Python
     // video_monitor，避免同一批视频源被两套逻辑重复检查/通知/下载。
@@ -100,7 +111,12 @@ pub fn ensure_core(project_dir: &Path) -> Result<serde_json::Value> {
         .get("rust_daemon")
         .cloned()
         .unwrap_or(serde_json::Value::Bool(true));
-    Ok(json!({"ok": true, "rust_daemon": rust_status, "services": {}}))
+    Ok(json!({
+        "ok": true,
+        "rust_daemon": rust_status,
+        "services": {},
+        "hints": ensure_core_hints(project_dir)
+    }))
 }
 
 /// macOS：检查 com.zunzhe.monitor 是否已安装到用户 LaunchAgents。
@@ -111,6 +127,54 @@ fn launchd_monitor_installed() -> bool {
         .join("LaunchAgents")
         .join("com.zunzhe.monitor.plist");
     path.is_file()
+}
+
+/// macOS：launchd 是否真的能管理当前项目。
+///
+/// 即使 plist 已安装，只要项目位于桌面/文稿等 TCC 保护目录，launchd 拉起的
+/// 守护脚本也会被系统策略挡掉并持续失败。此时必须走直接 spawn，不能做
+/// 无效的 `launchctl kickstart`，更不能把直接启动的进程标成“launchd 管理”。
+#[cfg(target_os = "macos")]
+fn launchd_can_manage(project_dir: &Path) -> bool {
+    launchd_monitor_installed() && !is_tcc_protected_path(project_dir)
+}
+
+/// 项目是否位于 macOS TCC 保护目录（桌面/文稿）。
+///
+/// 桌面端/CLI 在启动失败提示、ensure 决策、健康诊断里共用同一判断，
+/// 避免“plist 已装 = launchd 可用”的错误假设。
+pub fn is_tcc_protected_path(project_dir: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let home_value = std::env::var("HOME").unwrap_or_default();
+        let home = std::path::Path::new(&home_value);
+        tcc_protected_with_home(project_dir, home)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = project_dir;
+        false
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn tcc_protected_with_home(project_dir: &Path, home: &Path) -> bool {
+    [home.join("Desktop"), home.join("Documents")]
+        .iter()
+        .any(|protected| project_dir.starts_with(protected))
+}
+
+/// ensure 结果里附带的可操作提示；没有缺口时返回 `[]`。
+fn ensure_core_hints(project_dir: &Path) -> Vec<String> {
+    let mut hints = Vec::new();
+    if is_tcc_protected_path(project_dir) {
+        hints.push(
+            "项目位于桌面/文稿：launchd 无法稳定管理，24×30 自愈请迁移到 \
+             ~/Projects/尊者监控直播短视频 后运行 scripts/setup-macos.sh"
+                .to_string(),
+        );
+    }
+    hints
 }
 
 /// 启动 Rust 核心 daemon 并写入 pid 文件（供桌面端/兼容层调用）。
@@ -766,6 +830,24 @@ mod tests {
         remove_rust_daemon_pid_if(&dir, 888_888);
         assert!(!pid_file(&dir, "zunzhe-core").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_core_does_not_claim_launchd_on_tcc_protected_path() {
+        // 项目位于桌面/文稿时，即使本机已安装 com.zunzhe.monitor，ensure
+        // 也不应走 launchctl kickstart 或把手动进程误报成 launchd 管理。
+        // 这里用注入的 HOME 验证 TCC 判定与提示生成，不依赖/污染真实环境。
+        let home = std::env::temp_dir().join(format!("zunzhe-home-{}", std::process::id()));
+        let desktop = home.join("Desktop").join("尊者监控直播短视频");
+        assert!(
+            tcc_protected_with_home(&desktop, &home),
+            "Desktop 子目录应判定为 TCC 保护路径"
+        );
+        assert!(
+            !tcc_protected_with_home(&home.join("Projects").join("尊者监控直播短视频"), &home),
+            "~/Projects 不应判定为 TCC 保护路径"
+        );
+        let _ = desktop;
     }
 
     #[test]
