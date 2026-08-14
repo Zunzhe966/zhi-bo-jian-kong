@@ -283,7 +283,7 @@ pub fn heartbeat_fresh_public(project_dir: &Path) -> bool {
 }
 
 /// 心跳文件距当前时刻的秒数；文件缺失/损坏返回 None。
-/// 供 daemon 内部看门监督器判断主循环是否僵死。
+/// 调用方应把 None 视为“不新鲜”，不能因为拿不到年龄就当作健康。
 pub fn heartbeat_age_secs(project_dir: &Path) -> Option<u64> {
     let meta = std::fs::metadata(heartbeat_file(project_dir)).ok()?;
     let modified = meta.modified().ok()?;

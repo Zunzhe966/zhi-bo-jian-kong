@@ -149,9 +149,11 @@ pub async fn run_daemon(
             if *watchdog_stop_rx.borrow() {
                 break;
             }
-            let fresh = crate::service::heartbeat_age_secs(&watchdog_project_dir)
-                .is_none_or(|age| age <= watchdog_limit);
-            if !fresh {
+            // 心跳缺失/损坏按“不新鲜”处理：主循环启动前会先写一次，因此
+            // 文件不存在只能说明调度没有真正跑起来，必须让 watchdog 恢复。
+            let heartbeat_ok = crate::service::heartbeat_age_secs(&watchdog_project_dir)
+                .is_some_and(|age| age <= watchdog_limit);
+            if !heartbeat_ok {
                 warn!(
                     "心跳超过 {watchdog_limit}s 未更新（pid={watchdog_pid}），调度疑似僵死，触发优雅退出以便 watchdog 拉起"
                 );
