@@ -27,6 +27,13 @@ impl VideoLibrary {
         Ok(cover_cache)
     }
 
+    /// 浏览博主历史视频专用：只补新记录，已有记录不覆盖 anchor/source_url 归属。
+    pub async fn upsert_browse(&self, meta: &VideoMeta, source_url: &str) -> Result<String> {
+        let cover_cache = cache_cover(&self.fupan_dir, &meta.cover, &meta.id).await?;
+        db::upsert_video_browse(&self.pool, meta, source_url, &cover_cache).await?;
+        Ok(cover_cache)
+    }
+
     #[allow(dead_code)] // 下载完成标记接口
     pub async fn mark_downloaded(&self, video_id: &str, downloaded: bool) -> Result<()> {
         db::mark_downloaded(&self.pool, video_id, downloaded).await

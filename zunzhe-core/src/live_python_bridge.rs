@@ -128,6 +128,15 @@ impl LiveAdapter for PythonLiveAdapter {
 /// 解析桥接脚本输出：未开播时也必须返回成功，只有进程失败或 JSON 非法才是错误。
 pub fn parse_live_json(text: &str) -> Result<LiveStatus> {
     let value: serde_json::Value = serde_json::from_str(text)?;
+    // 旧 Python 桥接把“未开播”和“解析失败/风控失败”都输出 is_live=false，
+    // 但失败时会带 error 字段。Rust 必须把它当成明确检测失败，而不是当成
+    // 一次真实的“已下播”，否则平台接口抖动/风控会让状态机误关正在录制的
+    // ffmpeg，并制造重复的开播/关播通知。
+    if let Some(err) = value.get("error").and_then(|v| v.as_str())
+        && !err.trim().is_empty()
+    {
+        bail!("Python 直播桥接解析失败: {err}");
+    }
     let is_live = value
         .get("is_live")
         .and_then(|v| v.as_bool())
@@ -200,6 +209,13 @@ mod tests {
         let offline = parse_live_json(r#"{"is_live":false,"anchor_name":"a"}"#).unwrap();
         assert!(!offline.is_live);
         assert!(offline.stream_url.is_empty());
+
+        let failed = parse_live_json(r#"{"is_live":false,"error":"Douyin web data fetch error"}"#)
+            .unwrap_err();
+        assert!(
+            failed.to_string().contains("解析失败"),
+            "带 error 的桥接输出必须被识别为检测失败: {failed}"
+        );
     }
 
     #[test]

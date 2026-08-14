@@ -66,6 +66,7 @@ pub struct NotifyEvent {
     pub content: String,
     pub channel: String,
     pub status: String,
+    pub attempts: i64,
     pub created_at: String,
 }
 

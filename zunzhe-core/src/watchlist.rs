@@ -163,13 +163,13 @@ impl Watchlist {
         let line = format_video_line(url, name, download);
         let mut lines = read_lines(&self.video_config());
         let replaced = lines.iter_mut().any(|old| {
-            let old_url = old.trim().split(',').next().unwrap_or("").trim();
+            let old_url = parse_video_line(old).url;
             !old_url.is_empty() && old_url == url.trim()
         });
         if replaced {
             lines.iter_mut().for_each(|old| {
-                let old_url = old.trim().split(',').next().unwrap_or("").trim();
-                if old_url == url.trim() {
+                let old_url = parse_video_line(old).url;
+                if !old_url.is_empty() && old_url == url.trim() {
                     *old = line.clone();
                 }
             });
@@ -187,7 +187,7 @@ impl Watchlist {
         let before = read_lines(&self.video_config());
         let after: Vec<String> = before
             .iter()
-            .filter(|old| old.trim().split(',').next().unwrap_or("").trim() != url.trim())
+            .filter(|old| parse_video_line(old).url != url.trim())
             .cloned()
             .collect();
         if after.len() == before.len() {
@@ -346,26 +346,61 @@ fn parse_live_line(line: &str) -> LiveItem {
 
 fn parse_video_line(line: &str) -> VideoSource {
     let s = line.trim();
-    let parts: Vec<String> = s.split(',').map(|p| p.trim().to_string()).collect();
-    let url = parts.first().cloned().unwrap_or_default();
-    let name = parts.get(1).cloned().unwrap_or_else(|| url.clone());
+    // 配置格式为「地址,名称[,下载=是/否]」。地址是第一个分隔段；名称允许包含
+    // 逗号，因此把剩余段里不是下载开关的部分合并回名称，避免“博主,老师”被切坏。
+    let (url, rest) = split_first_video_field(s);
+    let rest_parts = split_video_rest(rest);
+    let mut name_parts = Vec::new();
     let mut download = None;
-    for extra in parts.iter().skip(2) {
+    for extra in rest_parts {
         if let Some(v) = extra.strip_prefix("下载=") {
-            download = Some(
-                v.trim().eq_ignore_ascii_case("是")
-                    || v.trim() == "yes"
-                    || v.trim() == "true"
-                    || v.trim() == "1",
-            );
+            let v = v.trim().to_ascii_lowercase();
+            download = Some(match v.as_str() {
+                "是" | "yes" | "true" | "1" => true,
+                "否" | "no" | "false" | "0" => false,
+                // 未知值不静默当作“否”，保留 None 让上层跟随全局开关。
+                _ => {
+                    return VideoSource {
+                        url: url.clone(),
+                        name: if name_parts.is_empty() {
+                            url.clone()
+                        } else {
+                            name_parts.join("，")
+                        },
+                        download: None,
+                        notify: String::new(),
+                    };
+                }
+            });
+        } else {
+            name_parts.push(extra);
         }
     }
+    let name = if name_parts.is_empty() {
+        url.clone()
+    } else {
+        name_parts.join("，")
+    };
     VideoSource {
         url,
         name,
         download,
         notify: String::new(),
     }
+}
+
+fn split_first_video_field(line: &str) -> (String, &str) {
+    match line.find([',', '，']) {
+        Some(idx) => (line[..idx].trim().to_string(), &line[idx + 1..]),
+        None => (line.trim().to_string(), ""),
+    }
+}
+
+fn split_video_rest(rest: &str) -> Vec<String> {
+    rest.split([',', '，'])
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect()
 }
 
 fn format_live_line(url: &str, remark: &str, quality: &str) -> String {
@@ -435,6 +470,47 @@ mod tests {
         assert_eq!(item.url, "https://space.bilibili.com/1");
         assert_eq!(item.name, "博主");
         assert_eq!(item.download, Some(false));
+    }
+
+    #[test]
+    fn parses_video_lines_with_comma_in_name_and_unknown_download() {
+        let comma = parse_video_line("https://space.bilibili.com/1,博主,老师,下载=是");
+        assert_eq!(comma.url, "https://space.bilibili.com/1");
+        assert_eq!(comma.name, "博主，老师");
+        assert_eq!(comma.download, Some(true));
+
+        let unknown = parse_video_line("https://space.bilibili.com/2,博主,下载=也许");
+        assert_eq!(unknown.url, "https://space.bilibili.com/2");
+        assert_eq!(unknown.name, "博主");
+        assert_eq!(
+            unknown.download, None,
+            "未知下载值应跟随全局，不能静默当成否"
+        );
+
+        let fullwidth = parse_video_line("https://space.bilibili.com/3,博主，老师，下载=否");
+        assert_eq!(fullwidth.url, "https://space.bilibili.com/3");
+        assert_eq!(fullwidth.name, "博主，老师");
+        assert_eq!(fullwidth.download, Some(false));
+    }
+
+    #[test]
+    fn add_video_replaces_by_url_when_name_contains_comma() {
+        let dir = temp_project("video-comma");
+        let w = Watchlist::new(dir.clone());
+        w.add_video(
+            "https://space.bilibili.com/1",
+            "博主,老师",
+            Some(true),
+            None,
+        )
+        .unwrap();
+        w.add_video("https://space.bilibili.com/1", "新名字", Some(false), None)
+            .unwrap();
+        let items = w.list_video();
+        assert_eq!(items.len(), 1, "同名地址应替换旧行而不是追加重复行");
+        assert_eq!(items[0].name, "新名字");
+        assert_eq!(items[0].download, Some(false));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

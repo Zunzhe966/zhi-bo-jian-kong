@@ -163,7 +163,40 @@ impl Config {
 
     pub fn email_status(&self) -> EmailStatus {
         let cfg = self.email_settings();
-        EmailStatus::from_settings(cfg)
+        let status = EmailStatus::from_settings(cfg.clone());
+        // 只列出真正缺失的项；host 有默认值，不要把“SMTP服务器”误报为缺失。
+        let missing: Vec<String> = ["邮箱登录账号", "发件人密码(授权码)", "收件人邮箱"]
+            .iter()
+            .filter(|name| {
+                let value = match **name {
+                    "邮箱登录账号" => &cfg.login,
+                    "发件人密码(授权码)" => &cfg.auth,
+                    _ => &cfg.to,
+                };
+                value.trim().is_empty()
+            })
+            .map(|name| (*name).to_string())
+            .collect();
+        // 只有 host/登录账号/授权码/收件人四项齐全才算“已配置”；
+        // 单独给一条可操作 hint，避免 `configured=false` 时只看到“缺少授权码”，
+        // 而实际缺的是服务器/账号/收件人。
+        if !status.configured {
+            let hint = if missing.len() == 1 && missing[0] == "发件人密码(授权码)" {
+                "缺少 SMTP 授权码：请在 QQ 邮箱设置-账户-开启 SMTP 后生成授权码，并在桌面端「全局设置」填写".to_string()
+            } else {
+                format!(
+                    "邮箱未配置，缺少: {}. 请在桌面端「全局设置」填写 QQ 邮箱账号、授权码与收件邮箱（服务器默认 smtp.qq.com，端口 465，SSL 开启）",
+                    missing.join("、")
+                )
+            };
+            EmailStatus {
+                missing,
+                hint,
+                ..status
+            }
+        } else {
+            status
+        }
     }
 
     pub fn email_settings(&self) -> EmailSettings {
@@ -603,9 +636,17 @@ pub fn atomic_write(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("config.tmp");
+    // pid + 纳秒时间戳 + 进程内计数，四重保证同目录临时文件不碰撞。不要在这里
+    // 清理“看起来像残留”的旧 tmp：同一目录可能正有另一个进程在原子写同一目标，
+    // 全局清理会误删别人正在写的文件。崩溃残留最多阻塞旧文件名本身，新名字
+    // 永远可用，写操作不会因此永久失败。
     let tmp = parent.join(format!(
-        ".{file_name}.tmp.{}.{}",
+        ".{file_name}.tmp.{}.{}.{}",
         std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
 
@@ -621,7 +662,7 @@ pub fn atomic_write(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<
         if let Some(permissions) = original_permissions {
             fs::set_permissions(&tmp, permissions)?;
         }
-        fs::rename(&tmp, path)?;
+        rename_replace(&tmp, path)?;
         Ok(())
     })();
 
@@ -629,6 +670,47 @@ pub fn atomic_write(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<
         let _ = fs::remove_file(&tmp);
     }
     write_result
+}
+
+/// 用原子替换语义覆盖目标文件。
+///
+/// Unix 的 `rename(2)` 天然覆盖；Windows 的 `MoveFileExW` 默认不能覆盖已存在
+/// 文件，必须显式传 `MOVEFILE_REPLACE_EXISTING`，否则配置/通知队列在 Windows
+/// 上第二次写入会失败并留下旧内容。
+#[cfg(not(windows))]
+fn rename_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::rename(from, to)
+}
+
+#[cfg(windows)]
+fn rename_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let from_wide: Vec<u16> = from
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let to_wide: Vec<u16> = to
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let ok = unsafe {
+        MoveFileExW(
+            from_wide.as_ptr(),
+            to_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -663,6 +745,71 @@ SMTP邮件服务器 = smtp.qq.com
     }
 
     #[test]
+    fn atomic_write_replaces_existing_file_without_leftover_tmp() {
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-atomic-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.ini");
+        atomic_write(&path, "v1").unwrap();
+        atomic_write(&path, "v2").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "v2");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "原子写失败后不应残留临时文件");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_write_survives_stale_tmp_from_other_process() {
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-atomic-stale-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.ini");
+        // 模拟上一次进程在写临时文件时崩溃：残留文件存在且内容陈旧。
+        // 新写入必须选用全新临时名，不能因为同名残留而永久失败，也不能
+        // 为了“清理”误删另一个并发进程正在使用的临时文件。
+        // 使用本测试进程的真实 pid，但文件名只是“看起来属于本进程”的旧残留：
+        // 它不代表当前正在写的临时文件，新写入必须绕开它而不是被它阻塞。
+        let stale = dir.join(format!(".config.ini.tmp.{}.0", std::process::id()));
+        std::fs::write(&stale, "stale").unwrap();
+        atomic_write(&path, "v1").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "v1");
+        assert_eq!(std::fs::read_to_string(&stale).unwrap(), "stale");
+        let current_tmps: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                let stale_name = stale
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                (name.starts_with(".config.ini.tmp.") && name != stale_name).then_some(name)
+            })
+            .collect();
+        assert!(
+            current_tmps.is_empty(),
+            "正常写入不应留下本次临时文件: {current_tmps:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn email_status_missing_hint() {
         let status = EmailStatus::from_settings(EmailSettings {
             host: String::new(),
@@ -675,7 +822,25 @@ SMTP邮件服务器 = smtp.qq.com
             to: String::new(),
         });
         assert!(!status.configured);
-        assert!(status.hint.contains("授权码"));
+        assert!(status.hint.contains("SMTP服务器"));
+    }
+
+    #[test]
+    fn email_status_lists_all_missing_fields() {
+        // 空配置时 hint 必须把登录账号、授权码、收件人都列出来；SMTP 服务器
+        // 有 smtp.qq.com 默认值，不应误报为缺失，但 host 缺失时 email_status
+        // 仍要显示“未配置”。
+        let cfg = Config::defaults_for_test();
+        let status = cfg.email_status();
+        assert!(!status.configured);
+        for field in ["邮箱登录账号", "发件人密码(授权码)", "收件人邮箱"] {
+            assert!(
+                status.hint.contains(field),
+                "hint 应包含 {field}，实际: {}",
+                status.hint
+            );
+        }
+        assert!(!status.hint.contains("SMTP服务器"));
     }
 
     #[test]

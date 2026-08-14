@@ -239,7 +239,16 @@ pub async fn run_pipeline_worker(
             }
             Err(e) => {
                 tracing::error!("复盘 worker 处理队列失败，稍后重试: {e:#}");
-                tokio::time::sleep(Duration::from_secs(10)).await;
+                // 与下载 worker 一致：停止信号应立即打断重试等待，不等满 10 秒。
+                tokio::select! {
+                    _ = stop.changed() => {
+                        if *stop.borrow() {
+                            tracing::info!("复盘 worker 在重试等待中收到停止信号，退出");
+                            return Ok(());
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+                }
             }
         }
     }

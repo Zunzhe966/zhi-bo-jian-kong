@@ -64,11 +64,15 @@ pub async fn run_mcp(pool: SqlitePool, project_dir: &Path, cfg: Arc<Config>) -> 
                     .get("arguments")
                     .cloned()
                     .unwrap_or_else(|| json!({}));
+                // 配置可能在 MCP 进程存活期间被 CLI/桌面端/其它智能体热更新
+                // （邮箱、Cookie、复盘开关、自动下载等）。每轮调用前重载，
+                // 失败沿用上一轮配置，保证“保存即生效”且不中断 MCP。
+                let current = reload_config_for_mcp(project_dir, &cfg);
                 let ctx = ToolContext {
                     library: &library,
                     downloader: &downloader,
                     fupan_dir: &fupan_dir,
-                    cfg: &cfg,
+                    cfg: &current,
                     pool: &pool,
                     watch: &watch,
                     api: &api,
@@ -77,7 +81,17 @@ pub async fn run_mcp(pool: SqlitePool, project_dir: &Path, cfg: Arc<Config>) -> 
                 match call_tool(name, &args, &ctx).await {
                     Ok(out) => json!({"content": [{"type":"text","text":out}], "isError": false}),
                     Err(e) => {
-                        json!({"content": [{"type":"text","text":format!("{{\"ok\":false,\"error\":\"{}\"}}", e.to_string().replace('"', "\\\""))}], "isError": true})
+                        // 错误正文必须是合法 JSON，且不能手拼转义。客户端通常会按
+                        // JSON 解析 `text`，如果错误信息带引号/换行，手拼 `\"` 容易
+                        // 产生非法转义，导致“工具失败但客户端拿不到原因”。
+                        let body = serde_json::json!({
+                            "ok": false,
+                            "error": e.to_string(),
+                        });
+                        json!({
+                            "content": [{"type":"text","text": serde_json::to_string(&body).unwrap_or_else(|_| "{\"ok\":false,\"error\":\"MCP 错误序列化失败\"}".to_string())}],
+                            "isError": true
+                        })
                     }
                 }
             }
@@ -93,6 +107,14 @@ pub async fn run_mcp(pool: SqlitePool, project_dir: &Path, cfg: Arc<Config>) -> 
         }
     }
     Ok(())
+}
+
+/// MCP 每次工具调用前重新读取配置；读取失败沿用启动/上一轮配置。
+fn reload_config_for_mcp(project_dir: &Path, fallback: &Config) -> Config {
+    Config::load(project_dir).unwrap_or_else(|e| {
+        tracing::warn!("MCP 配置热重载失败，沿用上一轮: {e:#}");
+        fallback.clone()
+    })
 }
 
 struct ToolContext<'a> {
@@ -334,7 +356,7 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
             };
             let videos = adapter.list_videos(&url, count).await?;
             for v in &videos {
-                let _ = library.upsert(v, "", &url).await;
+                let _ = library.upsert_browse(v, &url).await;
             }
             let persisted = library.list(&url, "", false).await?;
             Ok(serde_json::to_string(
@@ -450,7 +472,8 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
                 .get("anchor_name")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            let task_id = crate::download::enqueue_process(pool, file_path, anchor_name).await?;
+            let task_id =
+                crate::download::enqueue_process(pool, project_dir, file_path, anchor_name).await?;
             Ok(serde_json::to_string(&json!({
                 "ok": true,
                 "queued": true,
@@ -480,17 +503,14 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
             Ok(serde_json::to_string(&json!({"ok":true,"prefs":prefs}))?)
         }
         "service_status" => {
-            let rust_running = crate::service::rust_daemon_alive(project_dir);
-            let mut result = crate::status_snapshot::build(project_dir, pool, cfg).await?;
+            // 与 CLI `service-status` 共用同一个轻量入口：只读 pid/心跳/uptime，
+            // 不递归扫描 downloads 和 fupan_output。调用方要完整桌面快照应使用 `status`。
+            let mut result = crate::service::status(project_dir)?;
             let sessions = db::list_live_sessions(pool, "recording", 100).await?;
             result
                 .as_object_mut()
                 .unwrap()
                 .insert("live_sessions".to_string(), serde_json::to_value(sessions)?);
-            result
-                .as_object_mut()
-                .unwrap()
-                .insert("rust_daemon".to_string(), json!(rust_running));
             Ok(serde_json::to_string(&result)?)
         }
         "test_email" => {
@@ -584,5 +604,101 @@ mod tests {
         ] {
             assert!(names.contains(expected), "MCP 缺工具: {expected}");
         }
+    }
+
+    #[test]
+    fn mcp_error_text_is_valid_json_with_special_chars() {
+        // 工具失败时错误正文必须是可解析 JSON，且引号/换行不能破坏转义。
+        let mut response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "content": [],
+                "isError": true
+            }
+        });
+        let err = anyhow::anyhow!("模拟错误：包含 \"引号\" 与\n换行");
+        let body = serde_json::json!({"ok": false, "error": err.to_string()});
+        let text = serde_json::to_string(&body).unwrap();
+        response["result"]["content"] = serde_json::json!([{"type": "text", "text": text}]);
+        let serialized = serde_json::to_string(&response).unwrap();
+        let parsed: Value = serde_json::from_str(&serialized).unwrap();
+        let text = parsed["result"]["content"][0]["text"].as_str().unwrap();
+        let inner: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(inner["ok"], false);
+        assert!(inner["error"].as_str().unwrap().contains("引号"));
+    }
+
+    #[test]
+    fn tail_logs_contract_clamps_and_counts() {
+        let dir = std::env::temp_dir().join(format!("zunzhe-tail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        std::fs::write(dir.join("logs").join("live_monitor.log"), "a\nb\nc\nd\ne\n").unwrap();
+        let out = crate::service::tail_logs(&dir, "live_monitor", 3);
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["content"], "c\nd\ne");
+        assert_eq!(out["lines"], 3);
+        let out = crate::service::tail_logs(&dir, "live_monitor", 0);
+        assert_eq!(out["lines"], 1, "0 行应按至少 1 行处理，不能返回空内容");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn mcp_reloads_config_between_tool_calls() {
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-mcp-reload-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::write(
+            dir.join("config").join("config.ini"),
+            "[推送配置]\nSMTP邮件服务器 = smtp.qq.com\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("config").join("fupan_config.ini"), "[视频监控]\n").unwrap();
+        std::fs::write(
+            dir.join("config").join("config.ini.example"),
+            "[推送配置]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("config").join("fupan_config.ini.example"),
+            "[视频监控]\n",
+        )
+        .unwrap();
+
+        let file = std::env::temp_dir().join(format!(
+            "zunzhe-mcp-reload-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pool = crate::db::open_pool(&file).await.unwrap();
+        crate::db::init_db(&pool).await.unwrap();
+        let fallback = Config::load(&dir).unwrap();
+
+        // 第一次重载：配置里没有邮箱，email_status 未配置。
+        let first = reload_config_for_mcp(&dir, &fallback);
+        assert!(!first.email_status().configured);
+
+        // 模拟配置被外部修改：写入完整邮箱，然后下一次重载应读到新配置。
+        crate::config::write_qq_email(&dir, "me@qq.com", "authcode", "you@qq.com").unwrap();
+        let second = reload_config_for_mcp(&dir, &fallback);
+        assert!(
+            second.email_status().configured,
+            "MCP 应读到热更新后的邮箱配置"
+        );
+        assert_eq!(second.email_status().host, "smtp.qq.com");
+
+        std::mem::forget(file);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

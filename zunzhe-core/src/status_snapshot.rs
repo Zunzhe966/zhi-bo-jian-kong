@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -7,6 +7,18 @@ use sqlx::sqlite::SqlitePool;
 
 use crate::config::Config;
 use crate::{db, pipeline_bridge, service, video_library, watchlist};
+
+/// `file_scan_cache` 的进程内缓存项；字段名即缓存键/载荷，避免用元组表达复杂类型。
+struct FileScanCache {
+    downloads: PathBuf,
+    fupan_dir: PathBuf,
+    project_dir: PathBuf,
+    recordings: Vec<Value>,
+    notes: Vec<Value>,
+    scanned_at: Instant,
+}
+
+static FILE_SCAN_CACHE: std::sync::Mutex<Option<FileScanCache>> = std::sync::Mutex::new(None);
 
 /// 组装桌面端 `status` 接口需要的一份完整状态快照。
 ///
@@ -23,9 +35,10 @@ pub async fn build(project_dir: &Path, pool: &SqlitePool, cfg: &Config) -> Resul
     let video_sources = watch.list_video();
     let library = video_library::VideoLibrary::new(pool.clone(), fupan_dir.clone());
     let videos = library.list("", "", false).await?;
-    let recent_recordings = recent_recordings(&downloads, project_dir);
-    let notes = pipeline_bridge::list_notes(&fupan_dir, "")?;
+    let (recent_recordings, notes) = file_scan_cache(&downloads, &fupan_dir, project_dir)?;
     let rust_running = service::rust_daemon_alive(project_dir);
+    let heartbeat_ok = service::heartbeat_fresh_public(project_dir);
+    let (uptime_secs, uptime_human) = service::daemon_uptime_public(project_dir);
 
     Ok(json!({
         "ok": true,
@@ -35,6 +48,9 @@ pub async fn build(project_dir: &Path, pool: &SqlitePool, cfg: &Config) -> Resul
         "video_count": videos.len(),
         "email": cfg.email_status(),
         "rust_daemon": rust_running,
+        "heartbeat_ok": heartbeat_ok,
+        "uptime_secs": uptime_secs,
+        "uptime_human": uptime_human,
         "services": {
             "live_monitor": {"running": rust_running},
             "video_monitor": {"running": rust_running},
@@ -48,6 +64,47 @@ pub async fn build(project_dir: &Path, pool: &SqlitePool, cfg: &Config) -> Resul
         },
         "version": env!("CARGO_PKG_VERSION"),
     }))
+}
+
+/// 短 TTL 的目录扫描缓存。
+///
+/// `status` 由桌面端界面每 30 秒轮询调用；`recent_recordings` 会递归
+/// 扫描整个 downloads，`notes` 会递归扫描 fupan_output。录制/复盘产物积累后，
+/// 每次调用都做全量扫描会白白拖慢接口。缓存有效期 30 秒：与桌面端 30 秒轮询
+/// 对齐，界面每次刷新不会重新全量扫盘；单次录制/复盘完成耗时通常远大于 30 秒，
+/// 因此“最近录制/笔记列表”不会长期失真。daemon 不共享该进程内缓存，
+/// 所以不涉及跨进程一致性问题。
+fn file_scan_cache(
+    downloads: &Path,
+    fupan_dir: &Path,
+    project_dir: &Path,
+) -> Result<(Vec<Value>, Vec<Value>)> {
+    let key_downloads = downloads.to_path_buf();
+    let key_fupan = fupan_dir.to_path_buf();
+    let key_project = project_dir.to_path_buf();
+    {
+        let guard = FILE_SCAN_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(cached) = guard.as_ref()
+            && cached.downloads == key_downloads
+            && cached.fupan_dir == key_fupan
+            && cached.project_dir == key_project
+            && cached.scanned_at.elapsed() < Duration::from_secs(30)
+        {
+            return Ok((cached.recordings.clone(), cached.notes.clone()));
+        }
+    }
+    let recent = recent_recordings(&key_downloads, &key_project);
+    let notes = pipeline_bridge::list_notes(&key_fupan, "")?;
+    let mut guard = FILE_SCAN_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    *guard = Some(FileScanCache {
+        downloads: key_downloads,
+        fupan_dir: key_fupan,
+        project_dir: key_project,
+        recordings: recent.clone(),
+        notes: notes.clone(),
+        scanned_at: Instant::now(),
+    });
+    Ok((recent, notes))
 }
 
 /// 递归扫描 `downloads` 最近媒体文件，格式与旧 Python `fupan/cli.py::status()`
@@ -104,6 +161,12 @@ fn walk_media_files(root: &Path) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+#[cfg(test)]
+fn clear_file_scan_cache_for_tests() {
+    let mut guard = FILE_SCAN_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    *guard = None;
 }
 
 #[cfg(test)]
@@ -179,7 +242,42 @@ mod tests {
             status["paths"]["logs"],
             dir.join("logs").display().to_string()
         );
+        assert!(status["heartbeat_ok"].is_boolean());
+        assert!(status["uptime_secs"].is_number());
+        assert!(status["uptime_human"].is_string());
         assert!(status["notes"].as_array().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_scan_cache_short_ttl_reuses_previous_scan() {
+        clear_file_scan_cache_for_tests();
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-status-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let downloads = dir.join("downloads");
+        let fupan = dir.join("fupan_output");
+        std::fs::create_dir_all(&downloads).unwrap();
+        std::fs::create_dir_all(&fupan).unwrap();
+        std::fs::write(downloads.join("one.mp4"), b"1").unwrap();
+
+        let (first_rec, first_notes) = file_scan_cache(&downloads, &fupan, &dir).unwrap();
+        assert_eq!(first_rec.len(), 1);
+        assert!(first_notes.is_empty());
+
+        // TTL 内新增文件不应触发全量扫描；30 秒窗口与桌面端轮询间隔一致。
+        std::fs::write(downloads.join("two.mkv"), b"2").unwrap();
+        std::fs::create_dir_all(fupan.join("主播甲").join("场次1")).unwrap();
+        let (second_rec, second_notes) = file_scan_cache(&downloads, &fupan, &dir).unwrap();
+        assert_eq!(second_rec.len(), 1, "TTL 内应复用上一次扫描结果");
+        assert_eq!(second_notes.len(), 0);
+
+        clear_file_scan_cache_for_tests();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

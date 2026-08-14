@@ -87,22 +87,37 @@ pub fn process_alive(pid: u32) -> bool {
     }
     #[cfg(not(unix))]
     {
-        std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}")])
-            .output()
-            .map(|o| {
-                String::from_utf8_lossy(&o.stdout).lines().any(|line| {
-                    let mut parts = line.split_whitespace();
-                    let _image = parts.next();
-                    parts
-                        .next()
-                        .and_then(|p| p.parse::<u32>().ok())
-                        .map(|p| p == pid)
-                        .unwrap_or(false)
-                })
-            })
-            .unwrap_or(false)
+        tasklist_has_pid(pid).unwrap_or(false)
     }
+}
+
+/// Windows 下用 tasklist 查询指定 PID 是否存活。
+///
+/// 必须加 `/FO CSV /NH` 强制输出为机器可读的 CSV：tasklist 的默认表格在
+/// 不同语言/区域下列顺序和分隔符都可能变化，按“第二列”解析会在中文等
+/// 环境误判；CSV 输出的第二列固定是 PID。
+#[cfg(not(unix))]
+pub fn tasklist_has_pid(pid: u32) -> std::io::Result<bool> {
+    let output = std::process::Command::new("tasklist")
+        .args(["/FO", "CSV", "/NH", "/FI", &format!("PID eq {pid}")])
+        .output()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(tasklist_csv_has_pid(&text, pid))
+}
+
+/// 从 `tasklist /FO CSV /NH` 输出中判断指定 PID 是否存在。
+///
+/// CSV 每行形如 `"映像名","PID","会话名",...`；PID 是逗号分隔的第二字段，
+/// 不能用引号分段解析（那会把第一字段尾部带引号的内容当成第二字段）。
+/// 无匹配时 tasklist 会输出一行提示文字，字段不是纯数字，自然被过滤。
+pub fn tasklist_csv_has_pid(output: &str, pid: u32) -> bool {
+    output.lines().any(|line| {
+        line.split(',')
+            .nth(1)
+            .and_then(|field| field.trim_matches('"').trim().parse::<u32>().ok())
+            .map(|p| p == pid)
+            .unwrap_or(false)
+    })
 }
 
 /// 终止一个子进程树。Unix 下要求该进程由 `ManagedChild::spawn` 启动并成为独立
@@ -144,6 +159,22 @@ mod tests {
     fn invalid_pid_is_not_alive() {
         assert!(!process_alive(0));
         assert!(!process_alive(u32::MAX));
+    }
+
+    #[test]
+    fn tasklist_csv_parser_reads_second_field() {
+        // 真实 `/FO CSV /NH` 输出：第一字段是带引号的映像名，第二字段才是 PID。
+        // 之前的“引号分段”实现会解析出映像名而不是 PID，这里锁定正确语义。
+        let sample = "\"zunzhe-core.exe\",\"12345\",\"Console\",\"1\",\"1,234 K\"\n\
+             \"zunzhe-core.exe\",\"67890\",\"Console\",\"2\",\"5,678 K\"\n";
+        assert!(tasklist_csv_has_pid(sample, 12345));
+        assert!(tasklist_csv_has_pid(sample, 67890));
+        assert!(!tasklist_csv_has_pid(sample, 1234), "PID 子串不应误匹配");
+        assert!(!tasklist_csv_has_pid(sample, 99999));
+        assert!(!tasklist_csv_has_pid(
+            "INFO: No tasks are running which match the specified criteria.",
+            12345
+        ));
     }
 
     #[tokio::test]

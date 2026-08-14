@@ -28,7 +28,14 @@ impl Downloader {
         name: &str,
         pool: &SqlitePool,
     ) -> Result<DownloadResult> {
-        let dir = self.project_dir.join("downloads").join("短视频").join(name);
+        // 主播名来自外部输入，必须清洗后再拼路径：防止 `../`、`/`、Windows
+        // 保留设备名等把文件写到 downloads/短视频/ 之外或产生非法目录。
+        let safe_name = safe_dir_name(name);
+        let dir = self
+            .project_dir
+            .join("downloads")
+            .join("短视频")
+            .join(&safe_name);
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("创建下载目录失败: {}", dir.display()))?;
 
@@ -36,13 +43,13 @@ impl Downloader {
         if is_bilibili(url) {
             let output = bilibili_browser_download(&self.project_dir, url, &dir).await;
             if let Some(file) = output {
-                return self.finish_download(url, name, pool, file).await;
+                return self.finish_download(url, &safe_name, pool, file).await;
             }
             tracing::warn!("B站浏览器下载兜底失败，回退 yt-dlp: {url}");
         }
 
         let file = self.ytdlp_download(url, &dir).await?;
-        self.finish_download(url, name, pool, file).await
+        self.finish_download(url, &safe_name, pool, file).await
     }
 
     async fn finish_download(
@@ -56,13 +63,21 @@ impl Downloader {
         // 下载成功但视频库还没有该记录时补一行，保证“已下载”有事实源。
         let _ = db::ensure_video_row(pool, &video_id, url, name, name).await;
         let _ = db::mark_downloaded(pool, &video_id, true).await;
-        // 下载完成后入队复盘任务（转写/提炼/切片），不阻塞下载调用方。
-        let _ = enqueue_pipeline_after_download(pool, &file, name).await;
+        // 下载完成后是否入队复盘任务（转写/提炼/切片），由 fupan_config.ini
+        // 三个独立开关决定；三项全关时不再入队，避免每次下载都白跑一次
+        // Python 流水线。手动 process_media 仍可强制处理。
+        let pipeline_enabled = pipeline_enabled(&self.project_dir);
+        let mut pipeline_queued = false;
+        if pipeline_enabled {
+            pipeline_queued = enqueue_pipeline_after_download(pool, &self.project_dir, &file, name)
+                .await
+                .is_ok();
+        }
         Ok(DownloadResult {
             ok: true,
             file,
             name: name.to_string(),
-            pipeline_queued: true,
+            pipeline_queued,
         })
     }
 
@@ -146,6 +161,18 @@ async fn bilibili_browser_download(project_dir: &Path, url: &str, dir: &Path) ->
     let out_file =
         std::env::temp_dir().join(format!("zunzhe_bili_streams_{}.json", std::process::id()));
     let _ = std::fs::remove_file(&out_file);
+    let cookie_files = crate::bilibili_auth::electron_cookie_files(project_dir);
+    let cookie_env: Vec<(&str, &std::path::Path)> = cookie_files
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            if i == 0 {
+                ("FUPAN_COOKIE_FILE", p.as_path())
+            } else {
+                ("FUPAN_USER_COOKIE_FILE", p.as_path())
+            }
+        })
+        .collect();
     let mut cmd = Command::new(&electron);
     cmd.kill_on_drop(true)
         .arg(&extract)
@@ -154,6 +181,9 @@ async fn bilibili_browser_download(project_dir: &Path, url: &str, dir: &Path) ->
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    for (key, value) in &cookie_env {
+        cmd.env(key, value);
+    }
     let child = match ManagedChild::spawn(&mut cmd) {
         Ok(child) => child,
         Err(e) => {
@@ -271,24 +301,7 @@ fn find_electron(project_dir: &Path) -> Option<PathBuf> {
 }
 
 fn find_ffmpeg(project_dir: &Path) -> PathBuf {
-    find_binary(project_dir, "ffmpeg", "ffmpeg.exe")
-}
-
-/// 跨平台查找项目内置二进制：优先本机后缀，再回退另一平台后缀，最后使用 PATH。
-fn find_binary(project_dir: &Path, name: &str, windows_name: &str) -> PathBuf {
-    let unix_name = if cfg!(windows) { windows_name } else { name };
-    let bundled = project_dir.join("ffmpeg").join(unix_name);
-    if bundled.exists() {
-        return bundled;
-    }
-    let cross_bundled =
-        project_dir
-            .join("ffmpeg")
-            .join(if cfg!(windows) { name } else { windows_name });
-    if cross_bundled.exists() {
-        return cross_bundled;
-    }
-    PathBuf::from(name)
+    crate::service::find_binary(project_dir, "ffmpeg", "ffmpeg.exe")
 }
 
 fn is_bilibili(url: &str) -> bool {
@@ -309,6 +322,24 @@ fn clean_name(input: &str) -> String {
         "bilibili".to_string()
     } else {
         trimmed
+    }
+}
+
+/// 下载目录名必须是一个安全的单层目录名：继续复用 `clean_name` 的非法字符清洗，
+/// 并额外处理 Windows 保留设备名，避免 `CON`、`NUL` 等名字在 Windows 上写失败。
+fn safe_dir_name(input: &str) -> String {
+    let cleaned = clean_name(input);
+    if cleaned.is_empty() {
+        return "bilibili".to_string();
+    }
+    const WINDOWS_RESERVED: &[&str] = &[
+        "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+        "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+    ];
+    if WINDOWS_RESERVED.contains(&cleaned.to_ascii_lowercase().as_str()) {
+        format!("{cleaned}_")
+    } else {
+        cleaned
     }
 }
 
@@ -391,10 +422,32 @@ pub async fn process_pending(pool: &SqlitePool, project_dir: &Path) -> Result<us
 /// processing/failed）时不再重复插入，避免同一媒体文件被重复转写/切片；
 /// 已完成的任务保留历史记录，需要重新处理时应让调用方显式创建新任务或未来提供
 /// “重新处理”入口，而不是悄悄覆盖 done。
-pub async fn enqueue_process(pool: &SqlitePool, file: &str, name: &str) -> anyhow::Result<i64> {
-    // 同一媒体文件已经排队或正在处理时不再重复入队。
+pub async fn enqueue_process(
+    pool: &SqlitePool,
+    project_dir: &Path,
+    file: &str,
+    name: &str,
+) -> anyhow::Result<i64> {
+    // 复盘流水线会调用本地 Python 处理该文件；只有项目内可信媒体路径才允许
+    // 入队。绝对路径必须落在 downloads/ 或 fupan_output/，相对路径不能含 `..`，
+    // 防止外部调用者让 daemon 任意处理本机路径（例如读取/转写敏感文件）。
+    let media_path = Path::new(file);
+    let trusted = if media_path.is_absolute() {
+        let downloads = project_dir.join("downloads");
+        let fupan = project_dir.join("fupan_output");
+        media_path.starts_with(&downloads) || media_path.starts_with(&fupan)
+    } else {
+        !media_path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    };
+    if !trusted {
+        anyhow::bail!("复盘任务只接受 downloads/ 或 fupan_output/ 下的媒体路径: {file}");
+    }
+    // 同一媒体文件已经在排队、正在处理或已经完成时不再重复入队，避免重复
+    // 转写/切片；只有 failed 是重试耗尽后的终态，手动重试应创建新任务。
     let existing: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM tasks WHERE kind='process' AND url=? AND status IN ('pending','processing','failed','done') LIMIT 1",
+        "SELECT id FROM tasks WHERE kind='process' AND url=? AND status IN ('pending','processing','done') LIMIT 1",
     )
     .bind(file)
     .fetch_optional(pool)
@@ -409,10 +462,25 @@ pub async fn enqueue_process(pool: &SqlitePool, file: &str, name: &str) -> anyho
 /// 下载完成后立即入队复盘任务，保持旧调用名兼容。
 pub async fn enqueue_pipeline_after_download(
     pool: &SqlitePool,
+    project_dir: &Path,
     file: &str,
     name: &str,
 ) -> anyhow::Result<i64> {
-    enqueue_process(pool, file, name).await
+    enqueue_process(pool, project_dir, file, name).await
+}
+
+/// 复盘流水线是否启用：转写/知识提炼/切片任一开启即认为启用。
+///
+/// 下载完成与直播录制完成共用同一判断，避免两处逻辑漂移；配置读取失败时
+/// 按“启用”处理，保证配置损坏也不会让自动复盘静默关闭。
+pub fn pipeline_enabled(project_dir: &Path) -> bool {
+    crate::config::Config::load(project_dir)
+        .map(|cfg| {
+            cfg.is_yes_fupan("转写", "是否启用转写(是/否)", true)
+                || cfg.is_yes_fupan("知识提炼", "是否启用知识提炼(是/否)", true)
+                || cfg.is_yes_fupan("切片", "是否启用切片(是/否)", true)
+        })
+        .unwrap_or(true)
 }
 
 /// 独立下载队列 worker：不参与 70 秒 tick 护栏，每个任务自身有 600 秒超时，
@@ -459,7 +527,17 @@ pub async fn run_download_worker(
             }
             Err(e) => {
                 tracing::error!("下载 worker 处理队列失败，稍后重试: {e:#}");
-                tokio::time::sleep(Duration::from_secs(10)).await;
+                // 用 select 等待而不是普通 sleep：daemon 收 SIGTERM 时立即退出，
+                // 不会因队列失败重试窗口再拖 10 秒。
+                tokio::select! {
+                    _ = stop.changed() => {
+                        if *stop.borrow() {
+                            tracing::info!("下载 worker 在重试等待中收到停止信号，退出");
+                            return Ok(());
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+                }
             }
         }
     }
@@ -574,6 +652,69 @@ mod tests {
         assert_eq!(clean_name("////"), "bilibili");
     }
 
+    #[test]
+    fn safe_dir_name_never_escapes_download_root() {
+        // clean_name 会把 `.` `/` 一并换成 `_` 并裁掉首尾，因此 ../evil
+        // 最终变成单层 `evil`，不可能形成父目录跳转。
+        assert_eq!(safe_dir_name("../evil"), "evil");
+        assert_eq!(safe_dir_name("a/b\\c"), "a_b_c");
+        assert_eq!(safe_dir_name(".."), "bilibili");
+        assert_eq!(safe_dir_name("."), "bilibili");
+        assert_eq!(safe_dir_name("////"), "bilibili");
+        assert_eq!(safe_dir_name("CON"), "CON_");
+        assert_eq!(safe_dir_name("NUL"), "NUL_");
+        assert_eq!(safe_dir_name(""), "bilibili");
+    }
+
+    #[test]
+    fn pipeline_enabled_respects_three_switches() {
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-pipeline-switch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+
+        // 三项全关：自动复盘不入队。
+        std::fs::write(
+            dir.join("config").join("fupan_config.ini"),
+            "[转写]\n是否启用转写(是/否) = 否\n\
+             [知识提炼]\n是否启用知识提炼(是/否) = 否\n\
+             [切片]\n是否启用切片(是/否) = 否\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("config").join("config.ini"), "[推送配置]\n").unwrap();
+        std::fs::write(
+            dir.join("config").join("fupan_config.ini.example"),
+            "[转写]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("config").join("config.ini.example"),
+            "[推送配置]\n",
+        )
+        .unwrap();
+        assert!(!pipeline_enabled(&dir), "三项全关时不应启用自动复盘");
+
+        // 任一开启：自动复盘启用。
+        std::fs::write(
+            dir.join("config").join("fupan_config.ini"),
+            "[转写]\n是否启用转写(是/否) = 否\n\
+             [知识提炼]\n是否启用知识提炼(是/否) = 否\n\
+             [切片]\n是否启用切片(是/否) = 是\n",
+        )
+        .unwrap();
+        assert!(pipeline_enabled(&dir), "切片开启时应启用自动复盘");
+
+        // 配置读取失败：按启用处理，不静默关闭自动复盘。
+        std::fs::remove_file(dir.join("config").join("fupan_config.ini")).unwrap();
+        assert!(pipeline_enabled(&dir), "配置缺失时应按启用处理");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn write_log_roundtrip() {
         use tokio::io::AsyncWriteExt;
@@ -599,10 +740,18 @@ mod tests {
                 .as_nanos()
         ));
         let pool = crate::db::open_pool(&file).await.unwrap();
-        let media = "/tmp/same-media.mp4";
 
-        let pending_id = enqueue_process(&pool, media, "主播甲").await.unwrap();
-        let duplicate_pending = enqueue_process(&pool, media, "主播乙").await.unwrap();
+        let project_dir = std::env::temp_dir().join("zunzhe-enqueue-project");
+        let media_dir = project_dir.join("downloads/短视频/主播甲");
+        std::fs::create_dir_all(&media_dir).unwrap();
+        let media = media_dir.join("same-media.mp4");
+        let media = media.display().to_string();
+        let pending_id = enqueue_process(&pool, &project_dir, &media, "主播甲")
+            .await
+            .unwrap();
+        let duplicate_pending = enqueue_process(&pool, &project_dir, &media, "主播乙")
+            .await
+            .unwrap();
         assert_eq!(
             pending_id, duplicate_pending,
             "同一媒体文件在 pending 时不应重复入队"
@@ -611,7 +760,9 @@ mod tests {
         crate::db::update_task_status(&pool, pending_id, "done")
             .await
             .unwrap();
-        let after_done = enqueue_process(&pool, media, "主播丙").await.unwrap();
+        let after_done = enqueue_process(&pool, &project_dir, &media, "主播丙")
+            .await
+            .unwrap();
         assert_eq!(
             after_done, pending_id,
             "同一媒体文件已完成时不应再创建重复 process 任务"
@@ -620,10 +771,59 @@ mod tests {
         crate::db::set_task_status(&pool, pending_id, "failed")
             .await
             .unwrap();
-        let after_failed = enqueue_process(&pool, media, "主播丁").await.unwrap();
+        let after_failed = enqueue_process(&pool, &project_dir, &media, "主播丁")
+            .await
+            .unwrap();
+        assert_ne!(after_failed, pending_id, "失败后手动重试应创建新任务");
         assert_eq!(
-            after_failed, pending_id,
-            "同一媒体文件失败后应复用任务，而不是重复生成"
+            crate::db::list_tasks(&pool, "pending", 10)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "失败后重新入队应创建新的 pending 任务，而不是返回旧 failed id"
+        );
+        let dup_retry = enqueue_process(&pool, &project_dir, &media, "主播戊")
+            .await
+            .unwrap();
+        assert_eq!(dup_retry, after_failed, "pending 中再次入队应去重");
+        std::mem::forget(file);
+    }
+
+    #[tokio::test]
+    async fn enqueue_process_rejects_paths_outside_project() {
+        let file = std::env::temp_dir().join(format!(
+            "zunzhe-process-reject-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pool = crate::db::open_pool(&file).await.unwrap();
+        let project_dir = std::env::temp_dir().join("zunzhe-enqueue-project-reject");
+
+        let outside = std::env::temp_dir().join("untrusted-media.mp4");
+        let err = enqueue_process(
+            &pool,
+            &project_dir,
+            outside.display().to_string().as_str(),
+            "外部",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("只接受 downloads/ 或 fupan_output/")
+        );
+
+        let traversal = "../etc/passwd";
+        let err = enqueue_process(&pool, &project_dir, traversal, "穿越")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("只接受 downloads/ 或 fupan_output/")
         );
         std::mem::forget(file);
     }

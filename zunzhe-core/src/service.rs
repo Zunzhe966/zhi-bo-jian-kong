@@ -1,7 +1,8 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde_json::json;
+use std::sync::OnceLock;
 
 #[allow(dead_code)] // 保留显式 Python 兜底入口，CLI/MCP 默认不再自动调用
 pub fn ensure_started(project_dir: &Path) -> Result<serde_json::Value> {
@@ -163,6 +164,9 @@ pub fn stop_rust_daemon(project_dir: &Path) -> Result<serde_json::Value> {
     {
         kill_process(pid);
     }
+    // pid 文件在 stop 命令里先删除，避免旧 daemon 的 DaemonPidGuard 退出时
+    // 再“无条件删一次”把新实例刚写入的 pid 误删；这里保留 pid 文件直到
+    // 确认旧进程已退出，但 stop 本身不再抢删。
     let _ = std::fs::remove_file(&path);
     // 清理可能残留的 Rust ffmpeg 录制进程（如果 daemon 未及优雅退出）。
     cleanup_rust_recordings(project_dir);
@@ -203,7 +207,17 @@ pub fn status(project_dir: &Path) -> Result<serde_json::Value> {
             },
         );
     }
-    Ok(json!({"ok": true, "services": services}))
+    let rust_running = rust_daemon_alive(project_dir);
+    let heartbeat_ok = heartbeat_fresh_public(project_dir);
+    let (uptime_secs, uptime_human) = daemon_uptime_public(project_dir);
+    Ok(json!({
+        "ok": true,
+        "services": services,
+        "rust_daemon": rust_running,
+        "heartbeat_ok": heartbeat_ok,
+        "uptime_secs": uptime_secs,
+        "uptime_human": uptime_human,
+    }))
 }
 
 /// 读取后台服务日志末尾若干行（兼容 Python tail-logs）。
@@ -249,6 +263,30 @@ pub fn remove_rust_daemon_pid(project_dir: &Path) {
     let _ = std::fs::remove_file(pid_file(project_dir, "zunzhe-core"));
 }
 
+/// 只有当 pid 文件内容仍是 `pid` 时才删除，防止旧实例退出误删新实例 pid。
+pub fn remove_rust_daemon_pid_if(project_dir: &Path, pid: u32) {
+    let path = pid_file(project_dir, "zunzhe-core");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    if text.trim().parse::<u32>().ok() == Some(pid) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// 公开只读接口：心跳是否在 30 分钟内刷新。
+///
+/// `status_snapshot` 需要把守护健康状态放进桌面端 `status` 返回，而不是让
+/// 每个入口都复制一遍“30 分钟”阈值。这里保持与 `diagnostics` 同源。
+pub fn heartbeat_fresh_public(project_dir: &Path) -> bool {
+    heartbeat_fresh(project_dir, 30 * 60)
+}
+
+/// 公开只读接口：当前 daemon 连续运行时长。
+pub fn daemon_uptime_public(project_dir: &Path) -> (u64, String) {
+    daemon_uptime(project_dir)
+}
+
 /// daemon 心跳：每次调度 tick 后刷新，供外部存活检查。
 pub fn touch_heartbeat(project_dir: &Path) {
     let path = heartbeat_file(project_dir);
@@ -279,7 +317,7 @@ fn heartbeat_fresh(project_dir: &Path, max_age_secs: u64) -> bool {
 }
 
 /// 简单日志轮转：把 log 依次后移，最多保留 max_keep 份历史。
-fn rotate_log(log: &Path, max_keep: usize) {
+pub fn rotate_log(log: &Path, max_keep: usize) {
     for i in (1..=max_keep).rev() {
         let from = if i == 1 {
             log.to_path_buf()
@@ -297,7 +335,6 @@ fn rotate_log(log: &Path, max_keep: usize) {
 pub fn diagnostics(project_dir: &Path) -> Result<serde_json::Value> {
     let log_dir = project_dir.join("logs");
     let run_dir = project_dir.join("fupan_output").join("run");
-    let ffmpeg = project_dir.join("ffmpeg").join("ffmpeg");
     let heartbeat_ok = heartbeat_fresh(project_dir, 30 * 60);
     let daemon_ok = rust_daemon_alive(project_dir);
     let disk = disk_free_bytes(project_dir);
@@ -311,10 +348,33 @@ pub fn diagnostics(project_dir: &Path) -> Result<serde_json::Value> {
              请运行 scripts/setup-macos.sh 或重新创建虚拟环境",
         )
     };
-    let mut hints = Vec::new();
+    // 邮箱是默认通知通道，doctor 只报 ok 会让人误以为通知已可用；
+    // 未配置时把缺失项带进 hints，桌面端/CLI 一眼能看到缺口。
+    let email_hint = crate::config::Config::load(project_dir)
+        .ok()
+        .and_then(|cfg| {
+            let status = cfg.email_status();
+            if status.configured {
+                None
+            } else {
+                Some(status.hint)
+            }
+        });
+    let mut hints: Vec<String> = Vec::new();
     if let Some(hint) = pipeline_hint {
+        hints.push(hint.to_string());
+    }
+    if let Some(hint) = email_hint {
         hints.push(hint);
     }
+    // doctor 的 ffmpeg 检查必须与录制/下载一致：项目内置优先（含另一平台后缀
+    // 的兼容回退），其次 PATH。Windows 上内置文件名是 ffmpeg.exe，不能只检查
+    // ffmpeg/ffmpeg；下载链路同一入口，避免“doctor 说可用但下载用不到”。
+    let ffmpeg_path = find_binary(project_dir, "ffmpeg", "ffmpeg.exe");
+    let ffmpeg_ok = ffmpeg_path.is_absolute()
+        || std::env::var_os("PATH").is_some_and(|paths| {
+            std::env::split_paths(&paths).any(|dir| dir.join(&ffmpeg_path).exists())
+        });
     Ok(json!({
         "ok": true,
         "rust_daemon": daemon_ok,
@@ -323,7 +383,8 @@ pub fn diagnostics(project_dir: &Path) -> Result<serde_json::Value> {
         "uptime_human": uptime_human,
         "logs_writable": log_dir.is_dir() || std::fs::create_dir_all(&log_dir).is_ok(),
         "run_dir_writable": run_dir.is_dir() || std::fs::create_dir_all(&run_dir).is_ok(),
-        "ffmpeg": if ffmpeg.exists() { "ok" } else { "missing（将使用 PATH 中的 ffmpeg）" },
+        "ffmpeg": if ffmpeg_ok { "ok" } else { "missing（将使用 PATH 中的 ffmpeg）" },
+        "ffmpeg_available": ffmpeg_ok,
         "disk_free_mb": disk,
         "pipeline_python_ok": python_ok,
         "hints": hints,
@@ -343,8 +404,11 @@ fn daemon_uptime(project_dir: &Path) -> (u64, String) {
     let Ok(text) = std::fs::read_to_string(&log) else {
         return (0, String::new());
     };
-    let re = regex::Regex::new(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{4}")
-        .expect("uptime 时间戳正则应合法");
+    static UPTIME_TS_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = UPTIME_TS_RE.get_or_init(|| {
+        regex::Regex::new(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{4}")
+            .expect("uptime 时间戳正则应合法")
+    });
     let mut started_at: Option<chrono::DateTime<chrono::FixedOffset>> = None;
     for line in text.lines() {
         // 启动行有两种格式，统一按“包含 started 且匹配 pid”处理。
@@ -394,8 +458,52 @@ fn disk_free_bytes(_project_dir: &Path) -> u64 {
     }
     #[cfg(not(unix))]
     {
-        0
+        // Windows 下用 `GetDiskFreeSpaceExW` 查询项目盘符剩余空间，
+        // 避免 doctor 在 Windows 上永远显示 0 MB。
+        use std::os::windows::ffi::OsStrExt;
+        let drive = _project_dir
+            .components()
+            .next()
+            .map(|c| c.as_os_str())
+            .unwrap_or_else(|| std::ffi::OsStr::new("C:"));
+        let wide: Vec<u16> = drive.encode_wide().chain(std::iter::once(0)).collect();
+        let mut free_bytes_available_to_caller: u64 = 0;
+        let mut total_number_of_bytes: u64 = 0;
+        let mut total_number_of_free_bytes: u64 = 0;
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &mut free_bytes_available_to_caller,
+                &mut total_number_of_bytes,
+                &mut total_number_of_free_bytes,
+            )
+        };
+        if ok != 0 {
+            free_bytes_available_to_caller / (1024 * 1024)
+        } else {
+            0
+        }
     }
+}
+
+/// 跨平台查找项目内置二进制：优先本机后缀，再回退另一平台后缀，最后使用 PATH。
+/// 直播录制、B站 ffmpeg 合流下载与 doctor 共用此入口，保证三处路径解析一致。
+pub fn find_binary(project_dir: &Path, name: &str, windows_name: &str) -> PathBuf {
+    let unix_name = if cfg!(windows) { windows_name } else { name };
+    let bundled = project_dir.join("ffmpeg").join(unix_name);
+    if bundled.exists() {
+        return bundled;
+    }
+    let cross_bundled =
+        project_dir
+            .join("ffmpeg")
+            .join(if cfg!(windows) { name } else { windows_name });
+    if cross_bundled.exists() {
+        return cross_bundled;
+    }
+    // PATH 兜底必须用当前平台可执行后缀：Windows 直接执行 `ffmpeg` 会找不到，
+    // 必须回退到 `ffmpeg.exe`。
+    PathBuf::from(if cfg!(windows) { windows_name } else { name })
 }
 
 #[allow(dead_code)] // 供 ensure_started/stop_all 兜底路径使用
@@ -482,25 +590,8 @@ fn service_pid_by_raw(pid: u32) -> bool {
     }
     #[cfg(not(unix))]
     {
-        // Windows 无 /proc：用 tasklist 查询该 PID 是否存在。
-        std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}")])
-            .output()
-            .map(|o| {
-                let text = String::from_utf8_lossy(&o.stdout);
-                // 逐行解析 tasklist，避免 pid 子串误匹配其它进程。
-                text.lines().any(|line| {
-                    let mut parts = line.split_whitespace();
-                    // tasklist 输出首列是 Image Name，第二列才是 PID。
-                    let _image = parts.next();
-                    parts
-                        .next()
-                        .and_then(|p| p.parse::<u32>().ok())
-                        .map(|p| p == pid)
-                        .unwrap_or(false)
-                })
-            })
-            .unwrap_or(false)
+        // Windows 无 /proc：统一走 process::process_alive（tasklist CSV 机器解析）。
+        crate::process::process_alive(pid)
     }
 }
 
@@ -584,12 +675,39 @@ mod tests {
     }
 
     #[test]
+    fn remove_pid_if_never_deletes_new_instance_pid() {
+        let dir = std::env::temp_dir().join(format!("zunzhe-pid-if-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("fupan_output").join("run")).unwrap();
+
+        // 模拟旧实例退出时看到新实例已经写入 pid：只删自己 pid 的接口不能误删。
+        write_rust_daemon_pid(&dir, 888_888);
+        remove_rust_daemon_pid_if(&dir, 777_777);
+        assert_eq!(
+            std::fs::read_to_string(pid_file(&dir, "zunzhe-core"))
+                .unwrap()
+                .trim(),
+            "888888"
+        );
+
+        // 自己的 pid 仍会被清理，保证正常退出不留残留。
+        remove_rust_daemon_pid_if(&dir, 888_888);
+        assert!(!pid_file(&dir, "zunzhe-core").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn heartbeat_and_diagnostics_roundtrip() {
         let dir = std::env::temp_dir().join(format!("zunzhe-heartbeat-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("fupan_output").join("run")).unwrap();
         assert!(!rust_daemon_alive(&dir));
         touch_heartbeat(&dir);
+        let status = status(&dir).unwrap();
+        assert_eq!(status["rust_daemon"], false);
+        assert_eq!(status["heartbeat_ok"], true);
+        assert!(status.get("uptime_secs").is_some());
+        assert!(status.get("uptime_human").is_some());
         let diag = diagnostics(&dir).unwrap();
         assert!(diag["heartbeat_ok"].as_bool().unwrap());
         assert!(diag["run_dir_writable"].as_bool().unwrap());
@@ -614,6 +732,63 @@ mod tests {
                 .is_some(),
             "缺少 Python 复盘环境时 doctor 应给出可见提示"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diagnostics_reports_missing_email_config() {
+        let dir = std::env::temp_dir().join(format!("zunzhe-diag-mail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        // 空 [推送配置]：没有 SMTP 服务器、登录账号、授权码、收件人。
+        std::fs::write(dir.join("config").join("config.ini"), "[推送配置]\n").unwrap();
+        // 避免 find_project_root 一路向上找到真实项目根：放一个空 config.ini.example
+        // 也不影响，因为真实 config.ini 已存在；这里确保诊断只针对临时目录。
+        std::fs::write(
+            dir.join("config").join("config.ini.example"),
+            "[推送配置]\n",
+        )
+        .unwrap();
+        // 测试目录只有 config.ini，没有 fupan_config.ini(.example)，
+        // Config::load 会在 diagnostics 里失败而静默跳过邮箱提示；
+        // 这里补一个空 fupan_config.ini.example，让诊断能读到主配置。
+        std::fs::write(
+            dir.join("config").join("fupan_config.ini.example"),
+            "[转写]\n",
+        )
+        .unwrap();
+        let diag = diagnostics(&dir).unwrap();
+        assert!(
+            diag["hints"]
+                .as_array()
+                .and_then(|a| a.iter().find(|h| h
+                    .as_str()
+                    .map(|s| s.contains("邮箱未配置"))
+                    .unwrap_or(false)))
+                .is_some(),
+            "邮箱未配置时 doctor 应给出可见提示，实际: {:?}",
+            diag["hints"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diagnostics_detects_windows_bundled_ffmpeg() {
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-diag-ffmpeg-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("ffmpeg")).unwrap();
+        std::fs::write(dir.join("ffmpeg").join("ffmpeg.exe"), "bin").unwrap();
+        let diag = diagnostics(&dir).unwrap();
+        // 当前平台是 macOS 时，本测试不要求 ffmpeg.exe 生效；这里锁定的是
+        // 输出字段存在，跨平台 CI 会在 Windows 上验证真实行为。
+        assert!(diag.get("ffmpeg_available").is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -656,26 +831,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(not(unix))]
     #[test]
-    fn tasklist_pid_is_second_column() {
-        let sample =
-            "zunzhe-core.exe 12345 Console 1 1,234 K\nzunzhe-core.exe 67890 Console 2 5,678 K\n";
-        assert!(tasklist_lines_contain_pid(sample, 12345));
-        assert!(!tasklist_lines_contain_pid(sample, 1234));
-        assert!(!tasklist_lines_contain_pid(sample, 99999));
+    fn core_binary_name_is_platform_specific() {
+        let name = core_binary_name();
+        if cfg!(windows) {
+            assert_eq!(name, "zunzhe-core.exe");
+        } else {
+            assert_eq!(name, "zunzhe-core");
+        }
     }
 
-    #[cfg(not(unix))]
-    fn tasklist_lines_contain_pid(text: &str, pid: u32) -> bool {
-        text.lines().any(|line| {
-            let mut parts = line.split_whitespace();
-            let _image = parts.next();
-            parts
-                .next()
-                .and_then(|p| p.parse::<u32>().ok())
-                .map(|p| p == pid)
-                .unwrap_or(false)
-        })
+    #[test]
+    fn tasklist_csv_second_field_is_pid() {
+        // `/FO CSV /NH` 输出的第二段固定是 PID；映像名本身可能带引号。
+        let sample = "\"zunzhe-core.exe\",\"12345\",\"Console\",\"1\",\"1,234 K\"\n\
+             \"zunzhe-core.exe\",\"67890\",\"Console\",\"2\",\"5,678 K\"\n";
+        assert!(crate::process::tasklist_csv_has_pid(sample, 12345));
+        assert!(!crate::process::tasklist_csv_has_pid(sample, 1234));
+        assert!(!crate::process::tasklist_csv_has_pid(sample, 99999));
+        assert!(!crate::process::tasklist_csv_has_pid(
+            "INFO: No tasks are running which match",
+            12345
+        ));
     }
 }

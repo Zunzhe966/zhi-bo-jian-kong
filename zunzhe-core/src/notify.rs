@@ -7,11 +7,23 @@ use lettre::{Message, Transport};
 use serde::Serialize;
 use serde_json::Value;
 use sqlx::sqlite::SqlitePool;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::app_prefs;
 use crate::config::{Config, EmailSettings};
 use crate::db;
+
+/// 通知失败后允许的重试上限。SMTP/HTTPS 单次失败通常是临时网络抖动，
+/// 不能一次失败就永久漏通知；超限后才落定 failed 防止配置错误无限重试。
+const NOTIFY_MAX_ATTEMPTS: i64 = 3;
+
+/// 本地通知队列的进程内互斥锁。
+///
+/// `queue_local` 是“读整个 JSON → 追加 → 原子写”三段操作；同一进程内
+/// 并发调用时如果不加锁，后一次写入会基于旧文件覆盖前一次追加的内容，
+/// 直接丢通知。所有线程共用这一把锁即可。
+static NOTIFY_QUEUE_LOCK: Mutex<()> = Mutex::new(());
 
 /// 通知通道：邮箱 / 微信(Server酱) / PushPlus / Bark / ntfy / 不通知。
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -208,9 +220,12 @@ impl<'a> Notifier<'a> {
         if sent {
             db::mark_notify_done(self.pool, id).await?;
         } else {
-            // SMTP/HTTPS 明确失败或超时后不留在 pending，避免配置错误时每轮重试
-            // 并无限膨胀通知队列；临时网络抖动可由用户重试或重新触发。
-            db::fail_notify(self.pool, id).await?;
+            // 失败/超时后先重试，只有达到上限才落定 failed；临时网络抖动
+            // 会在后续 tick 中继续尝试，不会一次失败就漏通知。
+            let attempts = db::bump_notify_attempts(self.pool, id).await?;
+            if attempts >= NOTIFY_MAX_ATTEMPTS {
+                db::fail_notify(self.pool, id).await?;
+            }
         }
         Ok(sent)
     }
@@ -218,7 +233,8 @@ impl<'a> Notifier<'a> {
     /// 重试通知队列中的 pending 通知：一次最多处理 50 条，失败保留 pending，
     /// 成功标记 sent。发送失败只记日志，不拖垮 daemon tick。
     pub async fn flush_pending(&self, limit: i64) -> Result<usize> {
-        let pending = db::list_notify(self.pool, "pending", limit).await?;
+        // 最老优先：队列超过单轮上限时老通知不能被新通知永远挤出重试窗口。
+        let pending = db::list_pending_notify(self.pool, limit).await?;
         let mut sent_count = 0;
         for item in pending {
             let channel = Channel::parse(&item.channel);
@@ -306,6 +322,7 @@ impl<'a> Notifier<'a> {
             // `for_project`。这里直接返回，避免测试污染源码目录。
             return;
         }
+        let _guard = NOTIFY_QUEUE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         if app_prefs::read_app_prefs(project_dir)
             .get("localNotify")
             .and_then(Value::as_bool)
@@ -325,8 +342,14 @@ impl<'a> Notifier<'a> {
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or_default();
+        // 同一毫秒可能产生多条通知；只用时间戳做 id 会碰撞，桌面端按 id
+        // 去重后只弹一条。追加随机后缀保证每条通知都有唯一 id。
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
         items.push(serde_json::json!({
-            "id": format!("{:.3}", std::time::SystemTime::now()
+            "id": format!("{:.3}-{nonce}", std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs_f64())
                 .unwrap_or_default()),
@@ -719,6 +742,72 @@ mod tests {
     }
 
     #[test]
+    fn local_notify_ids_are_unique_within_same_millisecond() {
+        // 桌面端按 id 去重；同一毫秒多条通知若 id 碰撞，用户只会看到一条。
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-notify-id-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        crate::app_prefs::write_app_prefs(&dir, &serde_json::json!({})).unwrap();
+        Notifier::queue_local(&dir, "标题1", "内容1");
+        Notifier::queue_local(&dir, "标题2", "内容2");
+        Notifier::queue_local(&dir, "标题3", "内容3");
+
+        let path = dir
+            .join("fupan_output")
+            .join("run")
+            .join("pending_notify.json");
+        let items: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let ids: Vec<String> = items
+            .iter()
+            .map(|v| v["id"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(items.len(), 3, "三条通知都应保留");
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), 3, "通知 id 必须唯一: {ids:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_notify_queue_survives_read_while_atomic_replace() {
+        // Rust 写队列使用“同目录临时文件 + rename”原子替换；桌面端读文件时
+        // 可能正好看到旧文件或新文件，绝不能看到半截 JSON。此契约测试模拟
+        // 一个陈旧残留临时文件与一次正常追加，最终 JSON 必须是合法数组且
+        // 包含全部通知。
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-notify-atomic-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        crate::app_prefs::write_app_prefs(&dir, &serde_json::json!({})).unwrap();
+        let run = dir.join("fupan_output").join("run");
+        std::fs::create_dir_all(&run).unwrap();
+        let queue = run.join("pending_notify.json");
+        Notifier::queue_local(&dir, "标题1", "内容1");
+        Notifier::queue_local(&dir, "标题2", "内容2");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&queue).unwrap()).unwrap();
+        assert_eq!(parsed.as_array().map(Vec::len), Some(2));
+        assert!(
+            std::fs::read_dir(&run)
+                .unwrap()
+                .flatten()
+                .all(|e| { !e.file_name().to_string_lossy().contains(".tmp.") })
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn resolves_pref_to_configured_channels() {
         let push = crate::config::PushChannels {
             serverchan: "SCT-real".to_string(),
@@ -770,12 +859,14 @@ mod tests {
             .await
             .unwrap();
         assert!(!sent);
-        let rows = db::list_notify(&pool, "failed", 10).await.unwrap();
-        assert_eq!(rows.len(), 1, "微信未配置应标记 failed");
+        let rows = db::list_notify(&pool, "pending", 10).await.unwrap();
+        assert_eq!(rows.len(), 1, "首次发送失败应保留 pending 等待重试");
         assert_eq!(rows[0].channel, "微信");
+        assert_eq!(rows[0].attempts, 1);
         assert_eq!(
-            db::list_notify(&pool, "pending", 10).await.unwrap().len(),
-            0
+            db::list_notify(&pool, "failed", 10).await.unwrap().len(),
+            0,
+            "未达重试上限不应标记 failed"
         );
         let _ = std::fs::remove_file(&file);
         let _ = std::fs::remove_file(file.with_extension("db-shm"));
@@ -926,6 +1017,110 @@ mod tests {
         assert_eq!(all.len(), 1, "重试不应插入新通知记录");
         assert_eq!(all[0].id, original);
         assert_eq!(all[0].status, "failed", "未配置邮箱应把原记录收敛为 failed");
+        assert_eq!(all[0].attempts, 0, "未配置邮箱直接收敛，不消耗重试计数");
+
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_file(file.with_extension("db-shm"));
+        let _ = std::fs::remove_file(file.with_extension("db-wal"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn flush_pending_retries_oldest_first() {
+        // 重试队列超过单轮上限时，必须优先处理最早产生的 pending，否则新通知
+        // 会持续把老通知挤出重试窗口，24×30 长跑下通知延迟/滞留无限放大。
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-notify-oldest-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::write(dir.join("config").join("config.ini"), "[推送配置]\n").unwrap();
+        std::fs::write(dir.join("config").join("fupan_config.ini"), "").unwrap();
+        let file = std::env::temp_dir().join(format!(
+            "zunzhe-notify-oldest-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pool = db::open_pool(&file).await.unwrap();
+        let cfg = crate::config::Config::load(&dir).unwrap();
+        let notifier = Notifier::new(&pool, &cfg);
+        let oldest = db::add_notify(&pool, "live", "主播A", "开播", "内容", "邮箱")
+            .await
+            .unwrap();
+        let newest = db::add_notify(&pool, "live", "主播B", "开播", "内容", "邮箱")
+            .await
+            .unwrap();
+        assert!(oldest < newest);
+
+        // 未配置邮箱时发送直接收敛为 failed；limit=1 时应处理最老的那条。
+        notifier.flush_pending(1).await.unwrap();
+        let failed = db::list_notify(&pool, "failed", 10).await.unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].id, oldest, "单轮上限内应先重试最老的通知");
+        let pending = db::list_pending_notify(&pool, 10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, newest);
+
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_file(file.with_extension("db-shm"));
+        let _ = std::fs::remove_file(file.with_extension("db-wal"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn pending_notify_converges_to_failed_after_three_attempts() {
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-notify-retry-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::write(dir.join("config").join("config.ini"), "[推送配置]\n").unwrap();
+        std::fs::write(dir.join("config").join("fupan_config.ini"), "").unwrap();
+        let file = std::env::temp_dir().join(format!(
+            "zunzhe-notify-retry-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pool = db::open_pool(&file).await.unwrap();
+        let cfg = crate::config::Config::load(&dir).unwrap();
+        let notifier = Notifier::new(&pool, &cfg);
+        let id = db::add_notify(&pool, "live", "主播", "开播", "内容", "微信")
+            .await
+            .unwrap();
+
+        // 前两次失败：保留 pending，attempts 递增。
+        for expected_attempts in [1, 2] {
+            notifier.flush_pending(10).await.unwrap();
+            let pending = db::list_notify(&pool, "pending", 10).await.unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].id, id);
+            assert_eq!(pending[0].attempts, expected_attempts);
+            assert_eq!(db::list_notify(&pool, "failed", 10).await.unwrap().len(), 0);
+        }
+        // 第三次失败：达到上限后收敛为 failed，不再留在 pending。
+        notifier.flush_pending(10).await.unwrap();
+        let failed = db::list_notify(&pool, "failed", 10).await.unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].id, id);
+        assert_eq!(failed[0].attempts, 3);
+        assert_eq!(
+            db::list_notify(&pool, "pending", 10).await.unwrap().len(),
+            0
+        );
 
         let _ = std::fs::remove_file(&file);
         let _ = std::fs::remove_file(file.with_extension("db-shm"));
@@ -962,11 +1157,14 @@ mod tests {
             .await
             .unwrap();
         assert!(!sent);
-        let rows = db::list_notify(&pool, "failed", 10).await.unwrap();
-        assert_eq!(rows.len(), 1, "微信未接入应标记 failed");
+        let rows = db::list_notify(&pool, "pending", 10).await.unwrap();
+        assert_eq!(rows.len(), 1, "首次发送失败应保留 pending 等待重试");
+        assert_eq!(rows[0].channel, "微信");
+        assert_eq!(rows[0].attempts, 1);
         assert_eq!(
-            db::list_notify(&pool, "pending", 10).await.unwrap().len(),
-            0
+            db::list_notify(&pool, "failed", 10).await.unwrap().len(),
+            0,
+            "未达重试上限不应标记 failed"
         );
         let _ = std::fs::remove_file(&file);
         let _ = std::fs::remove_file(file.with_extension("db-shm"));

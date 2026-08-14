@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS notify (
     content    TEXT NOT NULL DEFAULT '',
     channel    TEXT NOT NULL DEFAULT '邮箱',
     status     TEXT NOT NULL DEFAULT 'pending',
+    attempts   INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
 
@@ -62,9 +63,11 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 
 CREATE TABLE IF NOT EXISTS monitor_baseline (
-    source_url TEXT PRIMARY KEY,
-    baseline_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
-    updated_at  TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+    source_url       TEXT PRIMARY KEY,
+    baseline_at      TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    updated_at       TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    consecutive_fails INTEGER NOT NULL DEFAULT 0,
+    last_failed_at    TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS live_sessions (
@@ -85,9 +88,10 @@ CREATE TABLE IF NOT EXISTS live_sessions (
 CREATE INDEX IF NOT EXISTS idx_live_sessions_url ON live_sessions(url);
 
 CREATE TABLE IF NOT EXISTS live_states (
-    url        TEXT PRIMARY KEY,
-    is_live    INTEGER NOT NULL DEFAULT 0,
-    updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+    url               TEXT PRIMARY KEY,
+    is_live           INTEGER NOT NULL DEFAULT 0,
+    consecutive_fails INTEGER NOT NULL DEFAULT 0,
+    updated_at        TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
 "#;
 
@@ -96,6 +100,65 @@ pub async fn init_db(pool: &SqlitePool) -> anyhow::Result<()> {
         .execute(pool)
         .await
         .context("初始化 SQLite schema")?;
+    // 旧版本 live_states 没有 consecutive_fails 列：CREATE TABLE IF NOT EXISTS
+    // 不会给已存在的表补列，必须先迁移，否则失败计数读写会直接报错。
+    let has_failures = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM pragma_table_info('live_states') WHERE name='consecutive_fails'",
+    )
+    .fetch_one(pool)
+    .await
+    .context("检查 live_states 失败计数字段")?;
+    if has_failures == 0 {
+        sqlx::query(
+            "ALTER TABLE live_states ADD COLUMN consecutive_fails INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(pool)
+        .await
+        .context("迁移 live_states 失败计数字段")?;
+    }
+    // 旧版本 notify 没有 attempts 列：通知失败重试需要计数上限，缺列时补上。
+    let has_notify_attempts = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM pragma_table_info('notify') WHERE name='attempts'",
+    )
+    .fetch_one(pool)
+    .await
+    .context("检查 notify 重试计数字段")?;
+    if has_notify_attempts == 0 {
+        sqlx::query("ALTER TABLE notify ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+            .execute(pool)
+            .await
+            .context("迁移 notify 重试计数字段")?;
+    }
+    // 旧版本 monitor_baseline 没有失败计数/冷却时间：CREATE TABLE IF NOT EXISTS
+    // 不会给已存在的表补列，必须先迁移，否则视频源冷却读写会直接报错。
+    let has_source_fails = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM pragma_table_info('monitor_baseline') WHERE name='consecutive_fails'",
+    )
+    .fetch_one(pool)
+    .await
+    .context("检查监控源失败计数字段")?;
+    if has_source_fails == 0 {
+        sqlx::query(
+            "ALTER TABLE monitor_baseline ADD COLUMN consecutive_fails INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(pool)
+        .await
+        .context("迁移监控源失败计数字段")?;
+    }
+    let has_source_failed_at = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM pragma_table_info('monitor_baseline') WHERE name='last_failed_at'",
+    )
+    .fetch_one(pool)
+    .await
+    .context("检查监控源失败时间字段")?;
+    if has_source_failed_at == 0 {
+        sqlx::query(
+            "ALTER TABLE monitor_baseline ADD COLUMN last_failed_at TEXT NOT NULL DEFAULT ''",
+        )
+        .execute(pool)
+        .await
+        .context("迁移监控源失败时间字段")?;
+    }
     Ok(())
 }
 
@@ -118,6 +181,123 @@ pub async fn open_pool(path: &Path) -> anyhow::Result<SqlitePool> {
         .context("连接 SQLite 数据库")?;
     init_db(&pool).await?;
     Ok(pool)
+}
+
+/// 周期性 SQLite 维护：WAL checkpoint 把 wal 落回主库并截断，`PRAGMA optimize`
+/// 让 SQLite 根据查询使用情况维护统计信息。24×30 运行中每 6 小时调用一次，
+/// 防止 WAL/查询计划长期膨胀；失败只记日志，不阻塞主循环。
+pub async fn maintenance(pool: &SqlitePool) -> anyhow::Result<()> {
+    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .execute(pool)
+        .await
+        .context("WAL checkpoint 失败")?;
+    sqlx::query("PRAGMA optimize")
+        .execute(pool)
+        .await
+        .context("SQLite optimize 失败")?;
+    // 24×30 长跑审计：通知表/任务表只保留最近 200 条。旧 Python 桌面端本地
+    // 队列只保留 30 条，SQLite 审计行也应有限额；失败/历史通知不再需要时
+    // 不应让数据库和界面列表无限膨胀。保留值取大一些，避免用户刚好需要
+    // 查更早失败原因时被过早清理。
+    // 注意：pending/processing 是还没执行完的工作，无论 id 多旧都不能删，
+    // 否则维护后队列会静默丢任务，用户以为会下载/复盘却永远不做。
+    sqlx::query(
+        "DELETE FROM notify WHERE status IN ('sent','failed') AND id NOT IN
+         (SELECT id FROM notify WHERE status IN ('sent','failed') ORDER BY id DESC LIMIT 200)",
+    )
+    .execute(pool)
+    .await
+    .context("清理通知表")?;
+    sqlx::query(
+        "DELETE FROM tasks WHERE status IN ('done','failed') AND id NOT IN
+         (SELECT id FROM tasks WHERE status IN ('done','failed') ORDER BY id DESC LIMIT 200)",
+    )
+    .execute(pool)
+    .await
+    .context("清理任务表")?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod maintenance_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn maintenance_checkpoints_wal_and_optimize() {
+        let file = std::env::temp_dir().join(format!(
+            "zunzhe-maintenance-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pool = open_pool(&file).await.unwrap();
+        enqueue_task(&pool, "download", "https://x.test/maint", "博主")
+            .await
+            .unwrap();
+        maintenance(&pool).await.unwrap();
+        // maintenance 是幂等操作：重复执行不应报错，且不会破坏已入库数据。
+        maintenance(&pool).await.unwrap();
+        let tasks = list_tasks(&pool, "pending", 10).await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        std::mem::forget(file);
+    }
+
+    #[tokio::test]
+    async fn maintenance_keeps_pending_tasks_and_notify() {
+        let file = std::env::temp_dir().join(format!(
+            "zunzhe-maintenance-pending-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pool = open_pool(&file).await.unwrap();
+        // 先写 3 条终态任务/通知再写 1 条 pending：清理后 pending 必须保留。
+        for i in 0..3 {
+            let id = enqueue_task(
+                &pool,
+                "download",
+                &format!("https://x.test/done/{i}"),
+                "博主",
+            )
+            .await
+            .unwrap();
+            set_task_status(&pool, id, "done").await.unwrap();
+            let nid = add_notify(&pool, "video", "博主", "标题", "内容", "邮箱")
+                .await
+                .unwrap();
+            fail_notify(&pool, nid).await.unwrap();
+        }
+        let pending = enqueue_task(&pool, "download", "https://x.test/pending", "博主")
+            .await
+            .unwrap();
+        let pending_notify = add_notify(&pool, "live", "博主", "开播", "内容", "邮箱")
+            .await
+            .unwrap();
+
+        maintenance(&pool).await.unwrap();
+
+        assert!(
+            list_tasks(&pool, "pending", 10)
+                .await
+                .unwrap()
+                .iter()
+                .any(|t| t.id == pending),
+            "维护不能删除待处理任务"
+        );
+        assert!(
+            list_notify(&pool, "pending", 10)
+                .await
+                .unwrap()
+                .iter()
+                .any(|n| n.id == pending_notify),
+            "维护不能删除待发送通知"
+        );
+        std::mem::forget(file);
+    }
 }
 
 pub async fn add_anchor(pool: &SqlitePool, url: &str, name: &str) -> anyhow::Result<()> {
@@ -198,15 +378,93 @@ pub async fn is_source_baselined(pool: &SqlitePool, source_url: &str) -> anyhow:
 
 pub async fn mark_source_baselined(pool: &SqlitePool, source_url: &str) -> anyhow::Result<()> {
     sqlx::query(
-        r#"INSERT INTO monitor_baseline (source_url) VALUES (?)
+        r#"INSERT INTO monitor_baseline (source_url, consecutive_fails, last_failed_at)
+           VALUES (?, 0, '')
            ON CONFLICT(source_url) DO UPDATE SET
-             updated_at=datetime('now','localtime')"#,
+             updated_at=datetime('now','localtime'),
+             consecutive_fails=0,
+             last_failed_at=''"#,
     )
     .bind(source_url)
     .execute(pool)
     .await
     .context("记录监控源基线")?;
     Ok(())
+}
+
+/// 记录一次监控源检查成功：失败计数清零并标记当前已成功时间。
+///
+/// 成功是风控/网络恢复的明确信号，必须清掉冷却状态，否则一次正常恢复后
+/// 还要被旧失败计数再拖几轮。
+pub async fn reset_source_failures(pool: &SqlitePool, source_url: &str) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"UPDATE monitor_baseline SET consecutive_fails=0,
+           last_failed_at='',
+           updated_at=datetime('now','localtime')
+           WHERE source_url=?"#,
+    )
+    .bind(source_url)
+    .execute(pool)
+    .await
+    .context("清零监控源失败次数")?;
+    Ok(())
+}
+
+/// 记录一次监控源检查失败/超时，返回当前连续失败次数。
+pub async fn bump_source_failures(pool: &SqlitePool, source_url: &str) -> anyhow::Result<u32> {
+    sqlx::query(
+        r#"INSERT INTO monitor_baseline (source_url, consecutive_fails, last_failed_at)
+           VALUES (?, 1, datetime('now','localtime'))
+           ON CONFLICT(source_url) DO UPDATE SET
+             consecutive_fails = consecutive_fails + 1,
+             last_failed_at = datetime('now','localtime'),
+             updated_at = datetime('now','localtime')"#,
+    )
+    .bind(source_url)
+    .execute(pool)
+    .await
+    .context("累计监控源失败次数")?;
+    let row: Option<i64> =
+        sqlx::query_scalar("SELECT consecutive_fails FROM monitor_baseline WHERE source_url=?")
+            .bind(source_url)
+            .fetch_optional(pool)
+            .await
+            .context("查询监控源失败次数")?;
+    Ok(row.unwrap_or(0).clamp(0, i64::from(u32::MAX)) as u32)
+}
+
+/// 返回 `(连续失败次数, 上次失败 Unix 秒)`；无记录时视为 `(0, 0)`。
+pub async fn source_failure_state(
+    pool: &SqlitePool,
+    source_url: &str,
+) -> anyhow::Result<(u32, i64)> {
+    let row = sqlx::query(
+        "SELECT consecutive_fails, last_failed_at FROM monitor_baseline WHERE source_url=?",
+    )
+    .bind(source_url)
+    .fetch_optional(pool)
+    .await
+    .context("查询监控源失败状态")?;
+    let Some(row) = row else {
+        return Ok((0, 0));
+    };
+    let fails: i64 = row.try_get("consecutive_fails")?;
+    let last: String = row.try_get("last_failed_at")?;
+    let ts = parse_local_datetime(&last).unwrap_or(0);
+    Ok((fails.clamp(0, i64::from(u32::MAX)) as u32, ts))
+}
+
+/// 把 SQLite `YYYY-MM-DD HH:MM:SS` 本地时间解析成 Unix 秒。
+fn parse_local_datetime(text: &str) -> Option<i64> {
+    chrono::NaiveDateTime::parse_from_str(text.trim(), "%Y-%m-%d %H:%M:%S")
+        .ok()
+        .and_then(|dt| {
+            use chrono::TimeZone;
+            chrono::Local
+                .from_local_datetime(&dt)
+                .single()
+                .map(|d| d.timestamp())
+        })
 }
 
 #[allow(clippy::too_many_arguments)] // 会话字段均为 SQLite 持久化必需
@@ -357,11 +615,14 @@ pub async fn get_live_state(pool: &SqlitePool, url: &str) -> anyhow::Result<bool
 
 /// 记录某主播当前直播状态；即使「只推送不录制」也能正确触发关播通知。
 pub async fn set_live_state(pool: &SqlitePool, url: &str, is_live: bool) -> anyhow::Result<()> {
+    // 明确拿到开播/未开播结论时，连续失败计数必须一并清零；否则恢复后的
+    // 正常轮次会被历史失败叠加，下一次抖动会提前触发“疑似下播”误判。
     sqlx::query(
-        r#"INSERT INTO live_states (url, is_live, updated_at)
-           VALUES (?, ?, datetime('now','localtime'))
+        r#"INSERT INTO live_states (url, is_live, consecutive_fails, updated_at)
+           VALUES (?, ?, 0, datetime('now','localtime'))
            ON CONFLICT(url) DO UPDATE SET
              is_live = excluded.is_live,
+             consecutive_fails = 0,
              updated_at = excluded.updated_at"#,
     )
     .bind(url)
@@ -369,6 +630,46 @@ pub async fn set_live_state(pool: &SqlitePool, url: &str, is_live: bool) -> anyh
     .execute(pool)
     .await
     .context("记录直播状态")?;
+    Ok(())
+}
+
+/// 某直播源连续检测失败/超时的次数，达到阈值后才按疑似下播收敛。
+pub async fn get_live_failures(pool: &SqlitePool, url: &str) -> anyhow::Result<u32> {
+    let row: Option<i64> =
+        sqlx::query_scalar("SELECT consecutive_fails FROM live_states WHERE url=?")
+            .bind(url)
+            .fetch_optional(pool)
+            .await
+            .context("查询直播检测失败次数")?;
+    Ok(row.unwrap_or(0).clamp(0, i64::from(u32::MAX)) as u32)
+}
+
+/// 检测失败/超时时累计连续失败次数；数据库已有旧表时用迁移补齐字段。
+pub async fn bump_live_failures(pool: &SqlitePool, url: &str) -> anyhow::Result<u32> {
+    sqlx::query(
+        r#"INSERT INTO live_states (url, is_live, consecutive_fails, updated_at)
+           VALUES (?, 0, 1, datetime('now','localtime'))
+           ON CONFLICT(url) DO UPDATE SET
+             consecutive_fails = consecutive_fails + 1,
+             updated_at = datetime('now','localtime')"#,
+    )
+    .bind(url)
+    .execute(pool)
+    .await
+    .context("累计直播检测失败次数")?;
+    get_live_failures(pool, url).await
+}
+
+/// 明确拿到开播/未开播结论后清零连续失败计数。
+pub async fn reset_live_failures(pool: &SqlitePool, url: &str) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"UPDATE live_states SET consecutive_fails=0, updated_at=datetime('now','localtime')
+           WHERE url=?"#,
+    )
+    .bind(url)
+    .execute(pool)
+    .await
+    .context("清零直播检测失败次数")?;
     Ok(())
 }
 
@@ -415,6 +716,42 @@ pub async fn upsert_video(
     .execute(pool)
     .await
     .context("写入 videos")?;
+    Ok(())
+}
+
+/// 浏览博主历史视频时的“只补不抢”写入：新记录按当前来源入库；已有记录只
+/// 刷新平台元数据（标题/封面/时长/日期），绝不覆盖已有的 `anchor/source_url`
+/// 归属，避免浏览一次就把视频从监控源名下“改嫁”到临时浏览地址。
+pub async fn upsert_video_browse(
+    pool: &SqlitePool,
+    video: &crate::model::VideoMeta,
+    source_url: &str,
+    cover_cache: &str,
+) -> anyhow::Result<()> {
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    sqlx::query(
+        r#"INSERT INTO videos
+           (id, platform, url, title, cover, cover_cache, published_at, duration, source_url, updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(id) DO UPDATE SET
+             platform=excluded.platform, url=excluded.url, title=excluded.title,
+             cover=excluded.cover, cover_cache=excluded.cover_cache,
+             published_at=excluded.published_at, duration=excluded.duration,
+             updated_at=excluded.updated_at"#,
+    )
+    .bind(&video.id)
+    .bind(&video.platform)
+    .bind(&video.url)
+    .bind(&video.title)
+    .bind(&video.cover)
+    .bind(cover_cache)
+    .bind(&video.published_at)
+    .bind(video.duration)
+    .bind(source_url)
+    .bind(now)
+    .execute(pool)
+    .await
+    .context("浏览式写入 videos")?;
     Ok(())
 }
 
@@ -625,10 +962,11 @@ pub async fn enqueue_task(
     url: &str,
     name: &str,
 ) -> anyhow::Result<i64> {
-    // 同一 kind+url 已有未完成（pending/failed 也会重试）任务时不再重复入队，
-    // 避免 daemon 并发/重复下载同一资源。
+    // 同一 kind+url 已有未完成任务时不再重复入队，避免并发/重复执行同一资源。
+    // 这里只认 pending/processing：failed 是“重试已耗尽”的终态，用户再次
+    // 触发下载/复盘时应允许重新入队，否则旧失败记录会永久挡住新请求。
     let existing: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM tasks WHERE kind=? AND url=? AND status = 'pending' LIMIT 1",
+        "SELECT id FROM tasks WHERE kind=? AND url=? AND status IN ('pending','processing') LIMIT 1",
     )
     .bind(kind)
     .bind(url)
@@ -663,6 +1001,23 @@ pub async fn claim_pending_task_by_kind(
     kind: &str,
     limit: i64,
 ) -> anyhow::Result<Option<Task>> {
+    // 历史/异常数据自愈：attempts 已超过重试上限的 pending 任务直接落定 failed，
+    // 避免旧计数（如旧版无限重试留下的 692）或反复崩溃恢复后继续无限重试。
+    // 正常路径下 worker 在第三次失败/超时时就会落定 failed，这里只是兜底。
+    // 必须同时限定 kind：下载 worker 只自愈自己的任务，不能把另一个 worker
+    // 正在处理的 process 任务标 failed，也不能在运行中把 processing 恢复。
+    if kind.is_empty() {
+        sqlx::query("UPDATE tasks SET status='failed', updated_at=datetime('now','localtime') WHERE status='pending' AND attempts >= 3")
+            .execute(pool)
+            .await
+            .context("落定超出重试上限的任务")?;
+    } else {
+        sqlx::query("UPDATE tasks SET status='failed', updated_at=datetime('now','localtime') WHERE status='pending' AND kind=? AND attempts >= 3")
+            .bind(kind)
+            .execute(pool)
+            .await
+            .context("落定超出重试上限的任务")?;
+    }
     let mut sql = String::from(
         "SELECT id, kind, url, name, status, attempts, payload, created_at, updated_at
          FROM tasks
@@ -794,7 +1149,7 @@ pub async fn add_notify(
     channel: &str,
 ) -> anyhow::Result<i64> {
     let result = sqlx::query(
-        "INSERT INTO notify (event, anchor, title, content, channel, status) VALUES (?,?,?,?,?,'pending')",
+        "INSERT INTO notify (event, anchor, title, content, channel, status, attempts) VALUES (?,?,?,?,?,'pending',0)",
     )
     .bind(event)
     .bind(anchor)
@@ -814,11 +1169,12 @@ pub async fn list_notify(
     limit: i64,
 ) -> anyhow::Result<Vec<NotifyEvent>> {
     let mut sql = String::from(
-        "SELECT id, event, anchor, title, content, channel, status, created_at FROM notify WHERE 1=1",
+        "SELECT id, event, anchor, title, content, channel, status, attempts, created_at FROM notify WHERE 1=1",
     );
     if !status.is_empty() {
         sql.push_str(" AND status = ?");
     }
+    // 通知审计/界面默认最新在前；重试队列单独走 `list_pending_notify`。
     sql.push_str(" ORDER BY id DESC LIMIT ?");
     let mut query = sqlx::query(&sql);
     if !status.is_empty() {
@@ -836,6 +1192,41 @@ pub async fn list_notify(
             content: row.try_get("content")?,
             channel: row.try_get("channel")?,
             status: row.try_get("status")?,
+            attempts: row.try_get("attempts")?,
+            created_at: row.try_get("created_at")?,
+        });
+    }
+    Ok(out)
+}
+
+/// 列出待重试通知，最老优先。
+///
+/// 单轮 `flush_pending` 只处理前 N 条，若用最新优先，队列超过单轮上限时
+/// 老通知会被持续产生的新通知永远挤出重试窗口；最老优先保证每条通知
+/// 都能在后续轮次被处理并收敛到 sent/failed。
+pub async fn list_pending_notify(
+    pool: &SqlitePool,
+    limit: i64,
+) -> anyhow::Result<Vec<NotifyEvent>> {
+    let rows = sqlx::query(
+        "SELECT id, event, anchor, title, content, channel, status, attempts, created_at
+         FROM notify WHERE status = 'pending' ORDER BY id ASC LIMIT ?",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .context("查询待重试通知")?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(NotifyEvent {
+            id: row.try_get("id")?,
+            event: row.try_get("event")?,
+            anchor: row.try_get("anchor")?,
+            title: row.try_get("title")?,
+            content: row.try_get("content")?,
+            channel: row.try_get("channel")?,
+            status: row.try_get("status")?,
+            attempts: row.try_get("attempts")?,
             created_at: row.try_get("created_at")?,
         });
     }
@@ -843,7 +1234,7 @@ pub async fn list_notify(
 }
 
 pub async fn mark_notify_done(pool: &SqlitePool, id: i64) -> anyhow::Result<()> {
-    sqlx::query("UPDATE notify SET status='sent' WHERE id=?")
+    sqlx::query("UPDATE notify SET status='sent', attempts=attempts+1 WHERE id=?")
         .bind(id)
         .execute(pool)
         .await
@@ -859,6 +1250,21 @@ pub async fn fail_notify(pool: &SqlitePool, id: i64) -> anyhow::Result<()> {
         .await
         .context("更新通知状态")?;
     Ok(())
+}
+
+/// 增加通知重试计数并返回最新值；由调用方决定是否达到上限后落定 failed。
+pub async fn bump_notify_attempts(pool: &SqlitePool, id: i64) -> anyhow::Result<i64> {
+    sqlx::query("UPDATE notify SET attempts=attempts+1 WHERE id=?")
+        .bind(id)
+        .execute(pool)
+        .await
+        .context("更新通知重试计数")?;
+    let attempts: i64 = sqlx::query_scalar("SELECT attempts FROM notify WHERE id=?")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .context("查询通知重试计数")?;
+    Ok(attempts)
 }
 
 #[cfg(test)]
@@ -939,9 +1345,37 @@ mod tests {
         let nid = add_notify(&pool, "live", "博主", "开播", "内容", "邮箱")
             .await
             .unwrap();
-        assert_eq!(list_notify(&pool, "pending", 10).await.unwrap().len(), 1);
+        let pending = list_notify(&pool, "pending", 10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].attempts, 0);
         mark_notify_done(&pool, nid).await.unwrap();
         assert_eq!(list_notify(&pool, "pending", 10).await.unwrap().len(), 0);
+        assert_eq!(list_notify(&pool, "sent", 10).await.unwrap()[0].attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn failed_task_can_be_re_enqueued_for_manual_retry() {
+        let pool = test_pool().await;
+        let id = enqueue_task(&pool, "download", "https://x.test/retry", "博主")
+            .await
+            .unwrap();
+        set_task_status(&pool, id, "failed").await.unwrap();
+        // failed 是重试耗尽后的终态：手动再次入队应得到一条新的可执行任务，
+        // 而不是被旧失败记录永久挡在队列外。
+        let new_id = enqueue_task(&pool, "download", "https://x.test/retry", "博主")
+            .await
+            .unwrap();
+        assert_ne!(new_id, id, "failed 任务应允许重新入队");
+        let pending = list_tasks(&pool, "pending", 10).await.unwrap();
+        assert!(
+            pending.iter().any(|t| t.id == new_id),
+            "重新入队的任务应回到 pending 可被 worker 认领"
+        );
+        // pending 状态下再去重仍返回同一条，不能无限堆积。
+        let dup = enqueue_task(&pool, "download", "https://x.test/retry", "博主")
+            .await
+            .unwrap();
+        assert_eq!(dup, new_id, "pending 中再次入队应去重");
     }
 
     #[tokio::test]
@@ -968,6 +1402,67 @@ mod tests {
         assert!(
             claim_pending_task(&pool, 1).await.unwrap().is_none(),
             "failed 任务不应被下载 worker 自动重新认领"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_task_with_exhausted_attempts_is_self_healed() {
+        let pool = test_pool().await;
+        let id = enqueue_task(&pool, "download", "https://x.test/stale", "博主")
+            .await
+            .unwrap();
+        // 模拟旧版无限重试或崩溃恢复后留下的异常计数：attempts 已超上限但仍 pending。
+        sqlx::query("UPDATE tasks SET attempts=5 WHERE id=?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let claimed = claim_pending_task_by_kind(&pool, "download", 1)
+            .await
+            .unwrap();
+        assert!(claimed.is_none(), "超上限任务不应再被认领");
+        let rows = list_tasks(&pool, "failed", 10).await.unwrap();
+        assert!(
+            rows.iter().any(|t| t.id == id),
+            "超上限的 pending 任务应自愈为 failed: {rows:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kind_scoped_self_heal_does_not_touch_other_worker_tasks() {
+        let pool = test_pool().await;
+        let dl_id = enqueue_task(&pool, "download", "https://x.test/stale-dl", "博主")
+            .await
+            .unwrap();
+        let process_id = enqueue_task(&pool, "process", "/tmp/stale-process.mp4", "博主")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE tasks SET attempts=5 WHERE id IN (?, ?)")
+            .bind(dl_id)
+            .bind(process_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // 下载 worker 自愈只能把自己的 download 任务标 failed，
+        // 不能把另一个 worker 的 process 任务一起标 failed。
+        let claimed = claim_pending_task_by_kind(&pool, "download", 1)
+            .await
+            .unwrap();
+        assert!(claimed.is_none(), "超上限的 download 任务不应被认领");
+        let failed = list_tasks(&pool, "failed", 10).await.unwrap();
+        assert!(
+            failed.iter().any(|t| t.id == dl_id),
+            "download 超上限任务应自愈为 failed: {failed:?}"
+        );
+        assert!(
+            !failed.iter().any(|t| t.id == process_id),
+            "下载 worker 自愈不能误伤 process 任务: {failed:?}"
+        );
+        let pending = list_tasks(&pool, "pending", 10).await.unwrap();
+        assert!(
+            pending.iter().any(|t| t.id == process_id),
+            "process 任务应保持 pending 等待复盘 worker: {pending:?}"
         );
     }
 
@@ -1005,12 +1500,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn browse_upsert_does_not_steal_existing_ownership() {
+        let pool = test_pool().await;
+        let meta = VideoMeta {
+            id: "BVowner".into(),
+            platform: "bilibili".into(),
+            url: "https://www.bilibili.com/video/BVowner".into(),
+            title: "原标题".into(),
+            cover: "https://example.com/owner.jpg".into(),
+            published_at: "2026-08-12".into(),
+            duration: 60,
+        };
+        // 监控调度器先按真实博主和来源写入。
+        upsert_video(
+            &pool,
+            &meta,
+            "真实博主",
+            "https://space.bilibili.com/monitored",
+            "",
+        )
+        .await
+        .unwrap();
+
+        // 用户只是浏览另一位博主的历史视频，已有记录归属不能被抢走。
+        upsert_video_browse(&pool, &meta, "https://space.bilibili.com/browsed", "")
+            .await
+            .unwrap();
+        let rows = get_videos(&pool, "", "", false).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].anchor, "真实博主");
+        assert_eq!(rows[0].source_url, "https://space.bilibili.com/monitored");
+
+        // 全新视频浏览时补一条，source_url 指向浏览来源，anchor 保持空。
+        let new_meta = VideoMeta {
+            id: "BVnew-browse".into(),
+            platform: "bilibili".into(),
+            url: "https://www.bilibili.com/video/BVnew-browse".into(),
+            title: "新视频".into(),
+            cover: String::new(),
+            published_at: "2026-08-14".into(),
+            duration: 10,
+        };
+        upsert_video_browse(&pool, &new_meta, "https://space.bilibili.com/browsed", "")
+            .await
+            .unwrap();
+        let rows = get_videos(&pool, "", "", false).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        let new_row = rows.iter().find(|r| r.id == "BVnew-browse").unwrap();
+        assert_eq!(new_row.source_url, "https://space.bilibili.com/browsed");
+        assert_eq!(new_row.anchor, "");
+    }
+
+    #[tokio::test]
     async fn monitor_baseline_persists() {
         let pool = test_pool().await;
         let url = "https://space.bilibili.com/946974";
         assert!(!is_source_baselined(&pool, url).await.unwrap());
         mark_source_baselined(&pool, url).await.unwrap();
         assert!(is_source_baselined(&pool, url).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn source_failure_cooldown_bumps_and_resets() {
+        let pool = test_pool().await;
+        let url = "https://space.bilibili.com/cooldown";
+        assert_eq!(
+            source_failure_state(&pool, url).await.unwrap(),
+            (0, 0),
+            "未失败的源应无冷却状态"
+        );
+        assert_eq!(bump_source_failures(&pool, url).await.unwrap(), 1);
+        assert_eq!(bump_source_failures(&pool, url).await.unwrap(), 2);
+        let (fails, last) = source_failure_state(&pool, url).await.unwrap();
+        assert_eq!(fails, 2);
+        assert!(last > 0, "失败时间应写入: {last}");
+        reset_source_failures(&pool, url).await.unwrap();
+        assert_eq!(
+            source_failure_state(&pool, url).await.unwrap(),
+            (0, 0),
+            "成功后失败计数与时间都应清零"
+        );
     }
 
     #[tokio::test]
@@ -1087,6 +1656,50 @@ mod tests {
         set_live_state(&pool, url, true).await.unwrap();
         assert!(get_live_state(&pool, url).await.unwrap());
         set_live_state(&pool, url, false).await.unwrap();
+        assert!(!get_live_state(&pool, url).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn set_live_state_clears_failure_counter() {
+        let pool = test_pool().await;
+        let url = "https://live.example.test/state-clears-fail";
+        bump_live_failures(&pool, url).await.unwrap();
+        bump_live_failures(&pool, url).await.unwrap();
+        assert_eq!(get_live_failures(&pool, url).await.unwrap(), 2);
+        set_live_state(&pool, url, true).await.unwrap();
+        assert_eq!(
+            get_live_failures(&pool, url).await.unwrap(),
+            0,
+            "拿到明确开播结论后失败计数必须清零"
+        );
+        assert!(get_live_state(&pool, url).await.unwrap());
+        set_live_state(&pool, url, false).await.unwrap();
+        assert_eq!(
+            get_live_failures(&pool, url).await.unwrap(),
+            0,
+            "拿到明确未开播结论后失败计数也必须清零"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_failure_counter_bumps_and_resets() {
+        let pool = test_pool().await;
+        let url = "https://live.example.test/failure-counter";
+        let other = "https://live.example.test/other-failure";
+        assert_eq!(get_live_failures(&pool, url).await.unwrap(), 0);
+        assert_eq!(bump_live_failures(&pool, url).await.unwrap(), 1);
+        assert_eq!(bump_live_failures(&pool, url).await.unwrap(), 2);
+        assert_eq!(get_live_failures(&pool, other).await.unwrap(), 0);
+        bump_live_failures(&pool, other).await.unwrap();
+        assert_eq!(
+            get_live_failures(&pool, url).await.unwrap(),
+            2,
+            "不同直播源的失败计数必须互不影响"
+        );
+        assert_eq!(get_live_failures(&pool, url).await.unwrap(), 2);
+        reset_live_failures(&pool, url).await.unwrap();
+        assert_eq!(get_live_failures(&pool, url).await.unwrap(), 0);
+        assert_eq!(get_live_failures(&pool, other).await.unwrap(), 1);
         assert!(!get_live_state(&pool, url).await.unwrap());
     }
 }

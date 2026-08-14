@@ -60,6 +60,24 @@ pub fn anon_cookie_path(project_dir: &Path) -> PathBuf {
         .join("bilibili_anon_cookies.txt")
 }
 
+/// 可注入 Electron 会话的 B站 Cookie 文件，按优先级排序：浏览器授权 > 用户配置。
+///
+/// Rust 会把它们通过 `FUPAN_COOKIE_FILE` / `FUPAN_USER_COOKIE_FILE` 传给独立的
+/// Electron 进程，让页面脚本/直链提取在真实 Chromium 会话里带上已授权登录态，
+/// 而不是让每次独立启动的 Electron 用空的临时 userData 去访问 B站。
+pub fn electron_cookie_files(project_dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for path in [
+        browser_cookie_path(project_dir),
+        user_cookie_path(project_dir),
+    ] {
+        if path.is_file() {
+            files.push(path);
+        }
+    }
+    files
+}
+
 /// 从 B站 finger/spi 返回的数据生成 Netscape Cookie 文本。
 ///
 /// `b_3`/`b_4` 是公开接口返回的匿名设备 ID，不包含账号凭据。
@@ -237,5 +255,30 @@ mod tests {
         assert!(text.contains(".bilibili.com\tTRUE\t/\tFALSE\t1800000\tSESSDATA\tabc"));
         assert!(text.contains(".bilibili.com\tTRUE\t/\tFALSE\t1800000\tbili_jct\txyz"));
         assert!(!text.contains("empty="));
+    }
+
+    #[test]
+    fn electron_cookie_files_only_include_existing_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-electron-cookies-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("fupan_output").join("run")).unwrap();
+        assert!(electron_cookie_files(&dir).is_empty());
+
+        let browser = browser_cookie_path(&dir);
+        std::fs::write(&browser, "# Netscape HTTP Cookie File\n").unwrap();
+        let files = electron_cookie_files(&dir);
+        assert_eq!(files, vec![browser.clone()]);
+
+        let user = user_cookie_path(&dir);
+        std::fs::write(&user, "# Netscape HTTP Cookie File\n").unwrap();
+        let files = electron_cookie_files(&dir);
+        assert_eq!(files, vec![browser, user]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

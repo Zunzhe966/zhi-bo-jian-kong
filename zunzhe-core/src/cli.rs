@@ -381,7 +381,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             let videos = adapter.list_videos(&url, count).await?;
             let library = video_library::VideoLibrary::new(pool.clone(), fupan_dir.clone());
             for v in &videos {
-                let _ = library.upsert(v, "", &url).await;
+                let _ = library.upsert_browse(v, &url).await;
             }
             // 返回已入库的视频，让前端拿到封面缓存、日期、时长与已下载标记，
             // 而不是只有平台适配器返回的原始 VideoMeta。
@@ -564,7 +564,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             // 与 daemon 的 process 队列走同一条路径：只入队，不在这里直接跑 Python。
             // 这样手动 process、下载后自动复盘、录制结束自动复盘都不会重复执行，
             // 且失败/重试/超时状态由复盘 worker 统一维护。
-            let task_id = download::enqueue_process(&pool, &file_path, &anchor_name).await?;
+            let task_id =
+                download::enqueue_process(&pool, &project_dir, &file_path, &anchor_name).await?;
             println!(
                 "{}",
                 serde_json::to_string(&json!({
