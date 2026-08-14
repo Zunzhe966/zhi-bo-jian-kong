@@ -16,7 +16,7 @@ cd "$ROOT"
 
 export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
-if ! command -v cargo >/dev/null 2>&1; then
+if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/cargo" ]; then
   echo "未找到 Rust 工具链，请先安装 rustup（https://rustup.rs）" >&2
   exit 1
 fi
