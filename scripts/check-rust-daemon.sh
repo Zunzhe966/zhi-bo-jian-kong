@@ -11,7 +11,7 @@ if [ ! -x "$RUST_BIN" ]; then
   RUST_BIN="$ROOT/zunzhe-core/target/debug/zunzhe-core"
 fi
 
-LOG="$ROOT/logs/zunzhe-core.uptime.log"
+LOG="$ROOT/logs/zunzhe-core.watchdog.log"
 mkdir -p "$(dirname "$LOG")"
 
 now="$(date '+%Y-%m-%d %H:%M:%S %z')"

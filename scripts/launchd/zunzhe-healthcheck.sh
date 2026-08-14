@@ -34,7 +34,11 @@ rotate_if_large "$LOG_DIR/zunzhe-core.log"
 rotate_if_large "$LOG_DIR/zunzhe-core.err.log"
 
 now="$(date '+%Y-%m-%d %H:%M:%S %z')"
+# watchdog 日志独立成文件，避免与 daemon 心跳日志混写；pid 读取失败只
+# 影响诊断显示，不影响健康判定（doctor 以进程/心跳为准）。
 pid="$(cat "$ROOT/fupan_output/run/zunzhe-core.pid" 2>/dev/null || true)"
+# doctor 本身有超时；这里不用 GNU timeout（macOS 默认没有），避免看门狗
+# 因为命令不存在而永远误判。
 status="$(cd "$ROOT" && "$RUST_BIN" doctor 2>/dev/null || true)"
 daemon_ok=false
 heartbeat_ok=false
@@ -44,5 +48,9 @@ printf '%s pid=%s rust_daemon=%s heartbeat_ok=%s\n' \
   "$now" "${pid:-none}" "$daemon_ok" "$heartbeat_ok" >> "$LOG"
 if [ "$daemon_ok" = "false" ] || [ "$heartbeat_ok" = "false" ]; then
   echo "$now daemon unhealthy, calling ensure-services" >> "$LOG"
+  # 不能在这里无限等：launchd 的 StartInterval 不会重叠运行同任务，若
+  # ensure-services 卡住会停掉后续健康轮。目前 ensure-services 自身有
+  # 有限等待（launchd 最多 5 秒）+ spawn 健康轮询（最多 5 秒），整体
+  # 最坏约 10 秒，不会拖垮下一分钟。
   "$RUST_BIN" ensure-services >/dev/null 2>&1 || true
 fi
