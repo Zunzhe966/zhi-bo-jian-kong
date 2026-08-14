@@ -204,6 +204,9 @@ pub async fn maintenance_if_due(project_dir: &Path, pool: &SqlitePool) -> anyhow
     let result = maintenance(pool).await;
     match &result {
         Ok(()) => {
+            // daemon 不在场时也要清理运行目录里的协议/原子写残留，否则
+            // 长年只跑 CLI/MCP 的机器会让 fupan_output/run 无限增长。
+            crate::bilibili_electron::maintain_run_dir(&run_dir);
             let tmp = run_dir.join("zunzhe-core.maintenance.tmp");
             std::fs::write(&tmp, chrono::Local::now().to_rfc3339())?;
             std::fs::rename(&tmp, &marker)?;
@@ -485,6 +488,52 @@ mod opportunistic_maintenance_tests {
         assert!(ran, "第一次调用无哨兵时应执行维护");
         std::mem::forget(db);
         let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[tokio::test]
+    async fn maintenance_if_due_cleans_run_dir_residue() {
+        let (project, db) = temp_project("residue");
+        let run_dir = project.join("fupan_output").join("run");
+        // 模拟旧版本 Electron 中断残留 + 原子写硬崩溃残留。
+        let old_payload = run_dir.join("bili_script_payload_stale.js");
+        std::fs::write(&old_payload, "old").unwrap();
+        set_mtime_days_ago(&old_payload, 8);
+        let old_tmp = run_dir.join(".zunzhe-core.heartbeat.tmp.123.456.0");
+        std::fs::write(&old_tmp, "stale").unwrap();
+        set_mtime_days_ago(&old_tmp, 8);
+
+        let pool = open_pool(&db).await.unwrap();
+        let ran = maintenance_if_due(&project, &pool).await.unwrap();
+        assert!(ran);
+        assert!(!old_payload.exists(), "超龄 Electron payload 应被维护清理");
+        assert!(!old_tmp.exists(), "超龄原子写残留应被维护清理");
+        std::mem::forget(db);
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[cfg(unix)]
+    fn set_mtime_days_ago(path: &std::path::Path, days: u64) {
+        use std::os::unix::ffi::OsStrExt;
+        let old_time = SystemTime::now() - std::time::Duration::from_secs(days * 24 * 60 * 60);
+        let secs = old_time
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let times = [
+            libc::timespec {
+                tv_sec: secs,
+                tv_nsec: 0,
+            },
+            libc::timespec {
+                tv_sec: secs,
+                tv_nsec: 0,
+            },
+        ];
+        assert_eq!(
+            unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) },
+            0
+        );
     }
 }
 

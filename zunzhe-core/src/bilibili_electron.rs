@@ -285,6 +285,44 @@ pub(crate) fn cleanup_stale_script_files(run_dir: &Path) {
     }
 }
 
+/// 运行目录统一维护：清理 Electron 协议残留和原子写崩溃残留的临时文件。
+///
+/// CLI/MCP 在 daemon 未接管时也会低频维护，不能只收敛数据库而让
+/// `fupan_output/run` 无限积累旧版本留下的诊断文件。
+pub(crate) fn maintain_run_dir(run_dir: &Path) {
+    cleanup_stale_script_files(run_dir);
+    let Ok(entries) = std::fs::read_dir(run_dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let name = match file_name.to_str() {
+            Some(name) => name,
+            None => continue,
+        };
+        // atomic_write 的临时文件命名：`.{target}.tmp.{pid}.{nanos}.{counter}`。
+        // 正常写入会在错误路径清理自身，残留只来自进程硬崩溃；只有达到“超过
+        // 7 天”才删除，避免误删另一个进程正在写入的新临时文件。
+        if !name.contains(".tmp.") {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        if now.saturating_sub(modified) >= 7 * 24 * 60 * 60 {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 fn find_electron(project_dir: &Path) -> Option<PathBuf> {
     let base = project_dir
         .join("desktop")
@@ -425,6 +463,35 @@ mod tests {
             );
         }
         assert!(!old.exists(), "超龄 payload 应被清理");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn maintain_run_dir_removes_stale_atomic_write_tmp_only() {
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-run-maintain-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let run_dir = dir.join("fupan_output").join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+
+        let stale_tmp = run_dir.join(".zunzhe-core.heartbeat.tmp.123.456.0");
+        std::fs::write(&stale_tmp, "stale").unwrap();
+        set_mtime_days_ago(&stale_tmp, 8);
+        let fresh_tmp = run_dir.join(".zunzhe-core.heartbeat.tmp.999.888.0");
+        std::fs::write(&fresh_tmp, "fresh").unwrap();
+        let live_file = run_dir.join("zunzhe-core.heartbeat");
+        std::fs::write(&live_file, "now").unwrap();
+
+        maintain_run_dir(&run_dir);
+
+        assert!(!stale_tmp.exists(), "超龄原子写残留应被清理");
+        assert!(fresh_tmp.exists(), "刚写入的临时文件不应被误删");
+        assert!(live_file.exists(), "正式状态文件不应被误删");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
