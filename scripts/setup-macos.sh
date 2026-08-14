@@ -42,6 +42,11 @@ export PATH="$HOME/.cargo/bin:$PATH"
 # 系统设置-隐私与安全性-完全磁盘访问 中授权；桌面端自带看门狗作为兜底。
 LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
 mkdir -p "$LAUNCH_AGENTS"
+# 启动/健康脚本复制到 LaunchAgents：launchd 访问 ~/Desktop 会被 TCC 拒绝，
+# 必须让 launchd 直接执行 LaunchAgents 下的脚本，再由脚本访问项目 release。
+cp scripts/launchd/zunzhe-daemon.sh "$LAUNCH_AGENTS/zunzhe-daemon.sh"
+cp scripts/launchd/zunzhe-healthcheck.sh "$LAUNCH_AGENTS/zunzhe-healthcheck.sh"
+chmod +x "$LAUNCH_AGENTS/zunzhe-daemon.sh" "$LAUNCH_AGENTS/zunzhe-healthcheck.sh"
 cp scripts/launchd/com.zunzhe.monitor.plist "$LAUNCH_AGENTS/"
 cp scripts/launchd/com.zunzhe.healthcheck.plist "$LAUNCH_AGENTS/"
 launchctl unload "$LAUNCH_AGENTS/com.zunzhe.monitor.plist" 2>/dev/null || true
