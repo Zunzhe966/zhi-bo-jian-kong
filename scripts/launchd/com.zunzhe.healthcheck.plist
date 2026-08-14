@@ -8,14 +8,12 @@
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>/Users/zhangxuetao/Desktop/尊者监控直播短视频/scripts/check-rust-daemon.sh</string>
+    <string>/Users/zhangxuetao/Library/LaunchAgents/zunzhe-healthcheck.sh</string>
   </array>
   <key>StartInterval</key>
   <integer>60</integer>
   <key>RunAtLoad</key>
   <true/>
-  <key>WorkingDirectory</key>
-  <string>/Users/zhangxuetao/Desktop/尊者监控直播短视频</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
