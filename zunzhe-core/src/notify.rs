@@ -377,10 +377,24 @@ impl<'a> Notifier<'a> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let mut items: Vec<Value> = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default();
+        // 队列文件不存在时从空队列开始；文件存在但读失败/解析失败时保留原
+        // 文件并跳过本轮，绝不能把已有通知重置为空（会静默丢状态）。原子写
+        // 保证桌面端要么看到旧数组要么看到新数组；外部截断/权限异常属于
+        // 罕见故障，宁可下一轮再试也不要覆盖丢数据。
+        let mut items: Vec<Value> = match std::fs::read_to_string(&path) {
+            Ok(text) => match serde_json::from_str(&text) {
+                Ok(items) => items,
+                Err(e) => {
+                    tracing::warn!("本地通知队列 JSON 损坏，保留原文件等待恢复: {e:#}");
+                    return;
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => {
+                tracing::warn!("本地通知队列读取失败，保留原文件等待恢复: {e:#}");
+                return;
+            }
+        };
         // 同一毫秒可能产生多条通知；只用时间戳做 id 会碰撞，桌面端按 id
         // 去重后只弹一条。追加随机后缀保证每条通知都有唯一 id。
         let nonce = NOTIFY_ID_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -882,6 +896,39 @@ mod tests {
                 .unwrap()
                 .flatten()
                 .all(|e| { !e.file_name().to_string_lossy().contains(".tmp.") })
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_notify_corrupt_queue_is_preserved_not_wiped() {
+        // 队列文件被外部截断/损坏时，追加新通知绝不能把已有内容重置为空；
+        // 否则用户会永久丢掉之前排队但尚未弹出的系统通知。
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-notify-corrupt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        crate::app_prefs::write_app_prefs(&dir, &serde_json::json!({})).unwrap();
+        let run = dir.join("fupan_output").join("run");
+        std::fs::create_dir_all(&run).unwrap();
+        let queue = run.join("pending_notify.json");
+        std::fs::write(&queue, "[{\"id\":\"1\",\"title\":\"旧\",\"body\":\"旧\"}").unwrap();
+
+        Notifier::queue_local(&dir, "新标题", "新内容");
+
+        let text = std::fs::read_to_string(&queue).unwrap();
+        assert!(
+            text.starts_with("[{\"id\":\"1\""),
+            "损坏队列不能被覆盖成空/新数组: {text:?}"
+        );
+        assert!(
+            !text.contains("新标题"),
+            "本轮不应追加到损坏队列（等待恢复后再追加）: {text:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
