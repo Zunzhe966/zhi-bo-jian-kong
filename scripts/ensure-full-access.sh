@@ -5,7 +5,14 @@
 set -u
 
 GLOBAL_CONFIG="$HOME/.codex/config.toml"
-PROJECT_CONFIG="$(cd "$(dirname "$0")/.." && pwd)/.codex/config.toml"
+# 项目根优先取显式环境变量；没有时按仓库内位置（scripts/..）探测。
+# 独立副本装在 ~/Library/LaunchAgents 时不能按 dirname 反推项目根，否则会
+# 把 ~/Library/.codex 误当成项目配置目录。
+PROJECT_ROOT="${ZUNZHE_PROJECT_ROOT:-}"
+if [ -z "$PROJECT_ROOT" ]; then
+  PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+fi
+PROJECT_CONFIG="$PROJECT_ROOT/.codex/config.toml"
 CHANGED=0
 
 backup() {
@@ -54,7 +61,6 @@ ensure_value "$PROJECT_CONFIG" "approval_policy" "never"
 # “完全访问 + 永不审批”，保证新任务默认继承，而不是每次新建都回到只读。
 GLOBAL_STATE="$HOME/.codex/.codex-global-state.json"
 THREAD_ID="${CODEX_THREAD_ID:-}"
-PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 if [ -f "$GLOBAL_STATE" ]; then
   TMP_STATE="$(mktemp "$HOME/.codex/.codex-global-state.json.XXXXXX")"
   if python3 - "$GLOBAL_STATE" "$TMP_STATE" "$THREAD_ID" "$PROJECT_ROOT" <<'PY' 2>/dev/null

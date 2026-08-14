@@ -5,15 +5,17 @@
 # ~/Projects/尊者监控直播短视频）。桌面目录由 launchd 看门狗无法稳定读取。
 set -u
 
-ROOT="$(pwd)"
-for candidate in "$HOME/Projects/尊者监控直播短视频" "$HOME/Documents/尊者监控直播短视频" "$ROOT" "$HOME/Desktop/尊者监控直播短视频"; do
+# 不依赖 launchd 的 WorkingDirectory：TCC 场景下 pwd 可能返回损坏字节，
+# 也会被 set -u 当成未定义变量引用。统一从候选路径显式探测项目根。
+ROOT=""
+for candidate in "$HOME/Projects/尊者监控直播短视频" "$HOME/Documents/尊者监控直播短视频" "$HOME/Desktop/尊者监控直播短视频"; do
   if [ -f "$candidate/config/config.ini.example" ] || [ -f "$candidate/config/config.ini" ]; then
     ROOT="$candidate"
     break
   fi
 done
 
-if [ ! -f "$ROOT/config/config.ini.example" ] && [ ! -f "$ROOT/config/config.ini" ]; then
+if [ -z "$ROOT" ] || { [ ! -f "$ROOT/config/config.ini.example" ] && [ ! -f "$ROOT/config/config.ini" ]; }; then
   echo "找不到项目根（需要 config/config.ini(.example)）" >&2
   exit 1
 fi
@@ -27,7 +29,7 @@ if [ ! -x "$GUARD" ]; then
   GUARD="$ROOT/scripts/ensure-full-access.sh"
 fi
 if [ -x "$GUARD" ]; then
-  "$GUARD" >> "$HOME/Library/Logs/zunzhe/zunzhe-healthcheck.log" 2>/dev/null || true
+  ZUNZHE_PROJECT_ROOT="$ROOT" "$GUARD" >> "$HOME/Library/Logs/zunzhe/zunzhe-healthcheck.log" 2>/dev/null || true
 fi
 
 case "$ROOT" in
