@@ -1054,6 +1054,55 @@ mod segment_tests {
         assert_eq!(code, 0);
         assert!(log.contains('\n'), "应收集到 stderr 内容");
     }
+
+    #[tokio::test]
+    async fn wait_child_keeps_consuming_after_capture_limit() {
+        // 回归隐患：旧实现只读到最后 512KB 就停止读取，子进程继续写 stderr
+        // 时管道会写满并阻塞，录制永远不会退出，状态也无法回收。修复后必须
+        // 持续消费管道、只保留最近 512KB，不能因为日志量大而卡住等待。
+        let mut child = Command::new("sh")
+            .args(["-c", "for i in $(seq 1 200000); do printf 'x'; done"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (code, log) = tokio::time::timeout(Duration::from_secs(10), wait_child(&mut child))
+            .await
+            .expect("日志超过 512KB 后 wait_child 不应卡死");
+        assert_eq!(code, 0);
+        assert!(
+            log.chars().count() <= 512 * 1024 + 64,
+            "内存中只应保留最近日志: {}",
+            log.chars().count()
+        );
+    }
+}
+
+/// 单路子进程输出流的“持续消费 + 环形保留”读取器。
+///
+/// 记录最近 `limit` 字节（保留到行边界），但一直把管道读到 EOF，防止日志
+/// 超过上限后写满管道、把 ffmpeg 卡住；长时间录制也不会无限占内存。
+async fn drain_capture_limited(reader: impl tokio::io::AsyncRead + Unpin, limit: usize) -> String {
+    let mut reader = BufReader::new(reader);
+    let mut line = Vec::new();
+    let mut captured: Vec<u8> = Vec::new();
+    loop {
+        line.clear();
+        let n = reader.read_until(b'\n', &mut line).await.unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        captured.extend_from_slice(&line);
+        if captured.len() > limit {
+            let excess = captured.len() - limit;
+            captured.drain(0..excess);
+            // 尽量从行首开始保留，避免诊断日志中间被截断成半行。
+            if let Some(pos) = captured.iter().position(|b| *b == b'\n') {
+                captured.drain(0..pos + 1);
+            }
+        }
+    }
+    String::from_utf8_lossy(&captured).into_owned()
 }
 
 async fn wait_child(child: &mut Child) -> (i32, String) {
@@ -1064,34 +1113,16 @@ async fn wait_child(child: &mut Child) -> (i32, String) {
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
     let drain_stdout = async move {
-        let mut captured = String::new();
-        if let Some(out) = stdout_pipe {
-            let mut out = BufReader::new(out);
-            let mut line = Vec::new();
-            while out.read_until(b'\n', &mut line).await.unwrap_or(0) != 0 {
-                if captured.len() + line.len() > 512 * 1024 {
-                    break;
-                }
-                captured.push_str(&String::from_utf8_lossy(&line));
-                line.clear();
-            }
+        match stdout_pipe {
+            Some(out) => drain_capture_limited(out, 512 * 1024).await,
+            None => String::new(),
         }
-        captured
     };
     let drain_stderr = async move {
-        let mut captured = String::new();
-        if let Some(err) = stderr_pipe {
-            let mut err = BufReader::new(err);
-            let mut line = Vec::new();
-            while err.read_until(b'\n', &mut line).await.unwrap_or(0) != 0 {
-                if captured.len() + line.len() > 512 * 1024 {
-                    break;
-                }
-                captured.push_str(&String::from_utf8_lossy(&line));
-                line.clear();
-            }
+        match stderr_pipe {
+            Some(err) => drain_capture_limited(err, 512 * 1024).await,
+            None => String::new(),
         }
-        captured
     };
     let (stdout, stderr) = tokio::join!(drain_stdout, drain_stderr);
     let status = child.wait().await;
