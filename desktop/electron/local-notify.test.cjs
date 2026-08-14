@@ -49,6 +49,20 @@ const corrupt = consumeNotifyQueue(queueFile, seenFile, (t, b) => shown.push(t +
 })
 assert.strictEqual(corrupt, 0, '半截 JSON 不应弹出通知')
 assert.ok(readError, '应把读失败交给调用方诊断')
+
+// 队列被外部写成合法 JSON 但不是数组（例如对象或字符串）时，同样只读
+// 跳过并保留现场，不能把坏文件清空/覆盖；恢复成数组后旧内容仍可消费。
+for (const bad of ['{}', '"not-an-array"', 'null', '42']) {
+  fs.writeFileSync(queueFile, bad, 'utf8')
+  readError = null
+  const skipped = consumeNotifyQueue(queueFile, seenFile, (t, b) => shown.push(t + b), (e) => {
+    readError = e
+  })
+  assert.strictEqual(skipped, 0, `非数组 JSON 不应弹出通知: ${bad}`)
+  assert.ok(readError, `非数组 JSON 应交给调用方诊断: ${bad}`)
+  assert.strictEqual(fs.readFileSync(queueFile, 'utf8'), bad, '非数组队列文件必须原样保留')
+}
+
 // 下一轮读取前，Rust daemon 已用原子替换恢复成合法数组；旧半截内容不复存在。
 // 原子替换不会恢复“读取时那半截内容”，而是把整个文件替换为完整合法数组。
 const recovered = [

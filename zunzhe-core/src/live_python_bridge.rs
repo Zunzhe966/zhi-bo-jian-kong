@@ -1,5 +1,5 @@
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::time::Duration;
@@ -33,11 +33,7 @@ pub struct PythonLiveAdapter {
 
 impl PythonLiveAdapter {
     pub fn new(project_dir: PathBuf) -> Self {
-        let python = if cfg!(windows) {
-            project_dir.join(".venv").join("Scripts").join("python.exe")
-        } else {
-            project_dir.join(".venv").join("bin").join("python")
-        };
+        let python = crate::service::python_bin(&project_dir);
         Self {
             python,
             project_dir,
@@ -61,8 +57,11 @@ impl PythonLiveAdapter {
     fn command(&self, url: &str) -> Result<Command> {
         let platform = Self::platform_for_url(url)
             .ok_or_else(|| anyhow!("不支持的直播平台，暂不能通过 Python 桥接解析: {url}"))?;
-        if !self.python.exists() {
-            bail!("找不到 Python 虚拟环境: {}", self.python.display());
+        if !crate::service::python_binary_available(&self.python) {
+            bail!(
+                "找不到可用的 Python 环境: {}（需 .venv 或系统 PATH 中的 python3）",
+                self.python.display()
+            );
         }
         let mut cmd = Command::new(&self.python);
         cmd.kill_on_drop(true)
@@ -163,14 +162,6 @@ pub fn parse_live_json(text: &str) -> Result<LiveStatus> {
             .to_string(),
         stream_url,
     })
-}
-
-pub fn python_binary(project_dir: &Path) -> PathBuf {
-    if cfg!(windows) {
-        project_dir.join(".venv").join("Scripts").join("python.exe")
-    } else {
-        project_dir.join(".venv").join("bin").join("python")
-    }
 }
 
 #[cfg(test)]

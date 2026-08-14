@@ -153,8 +153,11 @@ pub fn process_rss_kib(pid: u32) -> Option<u64> {
 #[allow(dead_code)] // 保留显式 Python 兜底入口，CLI/MCP 默认不再自动调用
 pub fn ensure_started(project_dir: &Path) -> Result<serde_json::Value> {
     let python = python_bin(project_dir);
-    if !python.exists() {
-        bail!("找不到 Python 虚拟环境，请先运行 scripts/setup-macos.sh");
+    if !python_available(project_dir) {
+        bail!(
+            "找不到可用的 Python 环境: {}（需 .venv 或系统 PATH 中的 python3）",
+            python.display()
+        );
     }
     let mut services = serde_json::Map::new();
     for (name, args) in [
@@ -617,7 +620,7 @@ pub fn diagnostics(project_dir: &Path) -> Result<serde_json::Value> {
     let daemon_ok = rust_daemon_alive(project_dir);
     let disk = disk_free_bytes(project_dir);
     let (uptime_secs, uptime_human) = daemon_uptime(project_dir);
-    let python_ok = python_bin(project_dir).is_file();
+    let python_ok = python_available(project_dir);
     let pipeline_hint = if python_ok {
         None
     } else {
@@ -794,13 +797,46 @@ pub fn find_binary(project_dir: &Path, name: &str, windows_name: &str) -> PathBu
     PathBuf::from(if cfg!(windows) { windows_name } else { name })
 }
 
+/// 返回项目可用的 Python 解释器。
+///
+/// 优先项目内 `.venv`，缺失时回退到系统 PATH 中的 `python3` / `python.exe`。
+/// 返回值可能只是相对命令名，不代表可执行：调用方必须用 [`python_available`]
+/// 探测真实可启动性，不能用 `Path::is_file()` 判断。
 #[allow(dead_code)] // 供 ensure_started/stop_all 兜底路径使用
-fn python_bin(project_dir: &Path) -> std::path::PathBuf {
+pub fn python_bin(project_dir: &Path) -> PathBuf {
     if cfg!(windows) {
-        project_dir.join(".venv").join("Scripts").join("python.exe")
+        let venv = project_dir.join(".venv").join("Scripts").join("python.exe");
+        if venv.exists() {
+            venv
+        } else {
+            PathBuf::from("python.exe")
+        }
     } else {
-        project_dir.join(".venv").join("bin").join("python")
+        let venv = project_dir.join(".venv").join("bin").join("python");
+        if venv.exists() {
+            venv
+        } else {
+            PathBuf::from("python3")
+        }
     }
+}
+
+/// 探测 Python 是否真实可用：无论 venv 绝对路径还是 PATH 回退名，都必须能
+/// 启动并输出版本。仅检查 `is_file()` 会漏掉 PATH 兜底，也会把空文件误判为
+/// 可用；容器/云服务器里没有项目内 .venv 但系统 python3 可用时应如实报告。
+pub fn python_available(project_dir: &Path) -> bool {
+    python_binary_available(&python_bin(project_dir))
+}
+
+/// 探测单个 Python 解释器能否启动并输出版本，不关心它来自 .venv 还是 PATH。
+pub fn python_binary_available(python: &Path) -> bool {
+    std::process::Command::new(python)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 fn pid_file(project_dir: &Path, name: &str) -> std::path::PathBuf {
@@ -1027,16 +1063,76 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("zunzhe-diag-py-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("fupan_output").join("run")).unwrap();
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::write(
+            dir.join("config").join("config.ini.example"),
+            "[推送配置]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("config").join("fupan_config.ini.example"),
+            "[视频监控]\n",
+        )
+        .unwrap();
         let diag = diagnostics(&dir).unwrap();
-        assert_eq!(diag["pipeline_python_ok"], false);
+        // 本机可能装了 python3，也可能没装；断言必须与真实探测一致，不能
+        // 假定“没有 .venv 就不可用”。容器/云服务器无 venv 时系统 python3
+        // 是合法回退，doctor 应如实报告可用。
+        assert_eq!(
+            diag["pipeline_python_ok"],
+            python_available(&dir),
+            "doctor 的 pipeline_python_ok 必须与真实 Python 可启动性一致"
+        );
+        if !python_available(&dir) {
+            assert!(
+                diag["hints"]
+                    .as_array()
+                    .and_then(|a| a.iter().find(|h| {
+                        h.as_str().map(|s| s.contains("复盘桥接")).unwrap_or(false)
+                    }))
+                    .is_some(),
+                "缺少 Python 复盘环境时 doctor 应给出可见提示"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn python_available_detects_path_fallback() {
+        // 无 venv 时返回 PATH 中的 python3；测试只验证与真实探测一致，
+        // 不依赖本机是否安装。
+        let dir = std::env::temp_dir().join(format!("zunzhe-py-fallback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let expected = std::process::Command::new(if cfg!(windows) {
+            "python.exe"
+        } else {
+            "python3"
+        })
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+        assert_eq!(python_available(&dir), expected);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn python_available_rejects_fake_venv_file() {
+        let dir = std::env::temp_dir().join(format!("zunzhe-py-fake-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let venv = if cfg!(windows) {
+            dir.join(".venv").join("Scripts").join("python.exe")
+        } else {
+            dir.join(".venv").join("bin").join("python")
+        };
+        std::fs::create_dir_all(venv.parent().unwrap()).unwrap();
+        std::fs::write(&venv, "").unwrap();
         assert!(
-            diag["hints"]
-                .as_array()
-                .and_then(|a| a
-                    .iter()
-                    .find(|h| { h.as_str().map(|s| s.contains("复盘桥接")).unwrap_or(false) }))
-                .is_some(),
-            "缺少 Python 复盘环境时 doctor 应给出可见提示"
+            !python_available(&dir),
+            "假 venv 文件不能算可用（当前机器无 .venv/bin/python 可执行程序）"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -44,7 +44,11 @@ function consumeNotifyQueue(queueFile, seenFile, showFn, onReadError) {
     if (onReadError) onReadError(e)
     return 0
   }
-  if (!Array.isArray(items) || !items.length) return 0
+  if (!Array.isArray(items)) {
+    if (onReadError) onReadError(new Error('队列不是 JSON 数组，本轮跳过并保留现场'))
+    return 0
+  }
+  if (!items.length) return 0
   const seen = loadSeenNotifyIds(seenFile)
   let shown = 0
   for (const item of items) {

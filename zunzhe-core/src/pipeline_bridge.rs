@@ -9,6 +9,7 @@ use tokio::process::Command;
 
 use crate::config::Config;
 use crate::process::{ChildError, ManagedChild};
+use crate::service::python_binary_available;
 
 /// 列出 fupan_output/<主播>/<场次>/ 下的复盘产物（与 Python notes 对齐）。
 pub fn list_notes(fupan_dir: &Path, name_filter: &str) -> Result<Vec<serde_json::Value>> {
@@ -99,11 +100,7 @@ pub struct PythonTool {
 
 impl PythonTool {
     pub fn from_project(project_dir: &Path) -> Self {
-        let python = if cfg!(windows) {
-            project_dir.join(".venv").join("Scripts").join("python.exe")
-        } else {
-            project_dir.join(".venv").join("bin").join("python")
-        };
+        let python = crate::service::python_bin(project_dir);
         Self {
             python,
             module: project_dir.join("fupan").join("pipeline.py"),
@@ -117,7 +114,7 @@ impl PythonTool {
         media_path: &str,
         record_name: &str,
     ) -> Result<PipelineSummary> {
-        if !self.python.exists() {
+        if !python_binary_available(&self.python) {
             anyhow::bail!(
                 "找不到复盘 Python 环境: {}。自动转写/知识提炼/精华切片需要虚拟环境，\
                  请运行 scripts/setup-macos.sh（Windows/Linux 安装对应依赖后创建 .venv）",
@@ -338,8 +335,55 @@ mod tests {
     #[test]
     fn python_tool_paths_are_relative_to_project() {
         let tool = PythonTool::from_project(Path::new("/tmp/proj"));
-        assert!(tool.python.to_string_lossy().contains(".venv"));
+        if cfg!(windows) {
+            assert_eq!(tool.python, PathBuf::from("python.exe"));
+        } else {
+            assert_eq!(tool.python, PathBuf::from("python3"));
+        }
         assert!(tool.module.ends_with("pipeline.py"));
+    }
+
+    #[test]
+    fn python_tool_falls_back_to_system_python_when_venv_missing() {
+        // 容器/云服务器不强制项目内 .venv；系统 python3 也能跑复盘桥接。
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-python-fallback-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tool = PythonTool::from_project(&dir);
+        if cfg!(windows) {
+            assert_eq!(tool.python, PathBuf::from("python.exe"));
+        } else {
+            assert_eq!(tool.python, PathBuf::from("python3"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn python_tool_prefers_project_venv_when_present() {
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-python-venv-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let venv = if cfg!(windows) {
+            dir.join(".venv").join("Scripts").join("python.exe")
+        } else {
+            dir.join(".venv").join("bin").join("python")
+        };
+        std::fs::create_dir_all(venv.parent().unwrap()).unwrap();
+        std::fs::write(&venv, "").unwrap();
+        let tool = PythonTool::from_project(&dir);
+        assert!(tool.python.to_string_lossy().contains(".venv"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

@@ -66,3 +66,11 @@ jobs:
           node healthcheck.test.cjs
           node local-notify.test.cjs
           node --check main.cjs
+      - name: Electron watchdog and local notify contracts (Windows)
+        shell: pwsh
+        working-directory: desktop/electron
+        if: runner.os == 'Windows'
+        run: |
+          node healthcheck.test.cjs
+          node local-notify.test.cjs
+          node --check main.cjs
