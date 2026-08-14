@@ -602,6 +602,21 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             // 与 daemon 的 process 队列走同一条路径：只入队，不在这里直接跑 Python。
             // 这样手动 process、下载后自动复盘、录制结束自动复盘都不会重复执行，
             // 且失败/重试/超时状态由复盘 worker 统一维护。
+            // daemon 未运行时先拉起，否则入队后任务会一直躺着，用户以为在
+            // 转写实际没有执行；与 download-video 的自动拉起语义保持一致。
+            if !service::rust_daemon_alive(&project_dir)
+                && let Err(e) = service::ensure_core(&project_dir)
+            {
+                println!(
+                    "{}",
+                    serde_json::to_string(&json!({
+                        "ok": false,
+                        "queued": false,
+                        "error": format!("复盘任务未入队，且 daemon 启动失败: {e:#}"),
+                    }))?
+                );
+                return Ok(());
+            }
             let task_id =
                 download::enqueue_process(&pool, &project_dir, &file_path, &anchor_name).await?;
             println!(
@@ -612,7 +627,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     "task_id": task_id,
                     "file": file_path,
                     "anchor": anchor_name,
-                    "hint": "daemon 的复盘 worker 会处理该任务；请确保 Rust daemon 正在运行"
+                    "hint": "已加入 daemon 复盘队列，转写/提炼/切片由后台 worker 处理"
                 }))?
             );
         }

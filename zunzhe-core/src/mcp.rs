@@ -495,6 +495,10 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
                 .get("anchor_name")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
+            // 与 CLI 一致：daemon 未运行时先拉起，确保入队后复盘 worker 会消费。
+            if !crate::service::rust_daemon_alive(project_dir) {
+                crate::service::ensure_core(project_dir)?;
+            }
             let task_id =
                 crate::download::enqueue_process(pool, project_dir, file_path, anchor_name).await?;
             Ok(serde_json::to_string(&json!({
@@ -503,7 +507,7 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
                 "task_id": task_id,
                 "file": file_path,
                 "anchor": anchor_name,
-                "hint": "daemon 的复盘 worker 会处理该任务；请确保 Rust daemon 正在运行"
+                "hint": "已加入 daemon 复盘队列，转写/提炼/切片由后台 worker 处理"
             }))?)
         }
         "service_start" => Ok(serde_json::to_string(&crate::service::ensure_core(
