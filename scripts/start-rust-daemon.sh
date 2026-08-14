@@ -27,4 +27,7 @@ echo "[rust-daemon] 构建 release 版本..."
 
 mkdir -p "$ROOT/logs"
 export RUST_LOG="${RUST_LOG:-info}"
+# 不显式重定向项目日志：launchd 场景下 TCC 会拒绝写 ~/Desktop，脚本会在
+# 重定向时直接失败。由 com.zunzhe.monitor.plist 的 StandardOut/Err 把日志
+# 接到 ~/Library/Logs/zunzhe/；手动运行时自然落在当前终端。
 exec "$ROOT/zunzhe-core/target/release/zunzhe-core" run-daemon "$@"
