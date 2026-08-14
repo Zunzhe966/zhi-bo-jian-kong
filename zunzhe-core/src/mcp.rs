@@ -36,6 +36,14 @@ pub async fn run_mcp(pool: SqlitePool, project_dir: &Path, cfg: Arc<Config>) -> 
     if let Err(e) = crate::video_library::migrate_legacy_video_db(&pool, &fupan_dir).await {
         error!("视频库旧库合并失败（MCP 继续运行）: {e:#}");
     }
+    // MCP server 可能长驻而 daemon 未运行：独立入口也要低频收敛数据库。
+    // daemon 已接管时由主循环维护；未接管时这里补位。哨兵与 CLI 共用，
+    // 避免多个进程重复 checkpoint；失败不中断 MCP。
+    if !crate::service::rust_daemon_alive(project_dir)
+        && let Err(e) = db::maintenance_if_due(project_dir, &pool).await
+    {
+        error!("MCP 数据库维护失败（继续运行）: {e:#}");
+    }
 
     while let Ok(Some(line)) = reader.next_line().await {
         if line.trim().is_empty() {

@@ -204,6 +204,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let db_path = cli.db.unwrap_or_else(|| project_dir.join("zunzhe-core.db"));
     let pool = db::open_pool(&db_path).await?;
     let fupan_dir = project_dir.join("fupan_output");
+    // CLI 是独立入口之一：daemon 已接管时由 daemon 主循环负责维护，未接管时
+    // 这里低频收敛 WAL/通知/任务/录制历史，避免长期只跑 CLI/MCP 无限膨胀。
+    // 哨兵节流保证每个 CLI 进程不会重复 checkpoint；失败只记日志。
+    if !service::rust_daemon_alive(&project_dir)
+        && let Err(e) = db::maintenance_if_due(&project_dir, &pool).await
+    {
+        eprintln!("数据库维护失败（不影响本次命令）: {e:#}");
+    }
     // 旧 Python 把视频库单独存在 fupan_output/video_library.db；启动命令前先
     // 无副作用合并到 Rust 主 DB，避免已下载标记、历史视频元数据被另一套 DB 遗忘。
     // 迁移接口本身幂等且跳过相同 id，失败不应阻塞只读查询，只记录诊断信息。

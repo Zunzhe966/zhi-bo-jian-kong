@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
 use sqlx::Row;
@@ -183,6 +184,67 @@ pub async fn open_pool(path: &Path) -> anyhow::Result<SqlitePool> {
     Ok(pool)
 }
 
+/// 独立 CLI/MCP/看门狗入口的数据库维护节流。
+///
+/// 单靠 daemon 主循环每 6 小时维护会在以下场景漏掉：MCP server 长驻且
+/// daemon 未运行、CLI 反复单独调用、桌面端看门狗只调 `doctor`。本函数在
+/// 每次调用时检查 `fupan_output/run/zunzhe-core.maintenance` 的修改时间，
+/// 超过 6 小时才执行一次，避免每个 CLI 进程都重复跑 checkpoint/清理。
+pub async fn maintenance_if_due(project_dir: &Path, pool: &SqlitePool) -> anyhow::Result<bool> {
+    let run_dir = project_dir.join("fupan_output").join("run");
+    let marker = run_dir.join("zunzhe-core.maintenance");
+    if maintenance_marker_age(&marker).is_some_and(|age| age < MAINTENANCE_INTERVAL) {
+        return Ok(false);
+    }
+    if let Some(parent) = marker.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // 先执行维护，成功后刷新哨兵：失败时下次调用可再次尝试，不会因为一次
+    // checkpoint/清理失败就静默跳过 6 小时。
+    let result = maintenance(pool).await;
+    match &result {
+        Ok(()) => {
+            let tmp = run_dir.join("zunzhe-core.maintenance.tmp");
+            std::fs::write(&tmp, chrono::Local::now().to_rfc3339())?;
+            std::fs::rename(&tmp, &marker)?;
+            tracing::debug!("独立入口数据库维护完成");
+        }
+        Err(e) => tracing::warn!("独立入口数据库维护失败: {e:#}"),
+    }
+    result.map(|_| true)
+}
+
+/// 哨兵文件内容是 RFC3339 时间戳；缺失/损坏视为“已到期”，让维护能自动恢复。
+fn maintenance_marker_age(marker: &Path) -> Option<Duration> {
+    let text = std::fs::read_to_string(marker).ok()?;
+    let ts = chrono::DateTime::parse_from_rfc3339(text.trim()).ok()?;
+    let secs = ts.timestamp();
+    let secs = u64::try_from(secs).ok()?;
+    Some(Duration::from_secs(
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .ok()?
+            .as_secs()
+            .saturating_sub(secs),
+    ))
+}
+
+/// daemon 主循环与独立入口共用的维护周期（6 小时）。
+pub const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+
+/// 测试专用：把维护哨兵设为刚写入，使 `maintenance_if_due` 在测试里可重复触发。
+#[cfg(test)]
+pub fn force_maintenance_due_for_test(project_dir: &Path) {
+    let marker = project_dir
+        .join("fupan_output")
+        .join("run")
+        .join("zunzhe-core.maintenance");
+    if let Some(parent) = marker.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(&marker, "2000-01-01T00:00:00+00:00").unwrap();
+}
+
 /// 周期性 SQLite 维护：WAL checkpoint 把 wal 落回主库并截断，`PRAGMA optimize`
 /// 让 SQLite 根据查询使用情况维护统计信息。24×30 运行中每 6 小时调用一次，
 /// 防止 WAL/查询计划长期膨胀；失败只记日志，不阻塞主循环。
@@ -365,6 +427,64 @@ mod maintenance_tests {
         let done = list_live_sessions(&pool, "done", 1000).await.unwrap();
         assert_eq!(done.len(), 500, "终态录制历史应只保留最近 500 条");
         std::mem::forget(file);
+    }
+}
+
+#[cfg(test)]
+mod opportunistic_maintenance_tests {
+    use super::*;
+    use std::time::SystemTime;
+
+    fn temp_project(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let project = std::env::temp_dir().join(format!(
+            "zunzhe-maint-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&project);
+        std::fs::create_dir_all(project.join("fupan_output").join("run")).unwrap();
+        let db = project.join("zunzhe-test.db");
+        (project, db)
+    }
+
+    #[tokio::test]
+    async fn maintenance_if_due_runs_and_updates_marker() {
+        let (project, db) = temp_project("due");
+        let pool = open_pool(&db).await.unwrap();
+        enqueue_task(&pool, "download", "https://x.test/due", "博主")
+            .await
+            .unwrap();
+        force_maintenance_due_for_test(&project);
+        let ran = maintenance_if_due(&project, &pool).await.unwrap();
+        assert!(ran, "哨兵已到期时应执行维护");
+        let tasks = list_tasks(&pool, "pending", 10).await.unwrap();
+        assert_eq!(tasks.len(), 1, "维护不应删除 pending 任务");
+        let marker = project
+            .join("fupan_output")
+            .join("run")
+            .join("zunzhe-core.maintenance");
+        assert!(
+            marker.exists(),
+            "维护成功后应刷新哨兵，避免每个 CLI 进程都重复 checkpoint"
+        );
+        // 刚刷新过的哨兵会使下一次调用短路。
+        let ran = maintenance_if_due(&project, &pool).await.unwrap();
+        assert!(!ran, "6 小时内不应重复执行维护");
+        std::mem::forget(db);
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[tokio::test]
+    async fn maintenance_if_due_does_not_fail_without_daemon() {
+        let (project, db) = temp_project("idle");
+        let pool = open_pool(&db).await.unwrap();
+        let ran = maintenance_if_due(&project, &pool).await.unwrap();
+        assert!(ran, "第一次调用无哨兵时应执行维护");
+        std::mem::forget(db);
+        let _ = std::fs::remove_dir_all(&project);
     }
 }
 
