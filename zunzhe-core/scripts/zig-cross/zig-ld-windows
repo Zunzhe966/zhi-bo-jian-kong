@@ -1,0 +1,74 @@
+#!/bin/bash
+# Zig 0.16 linker adapter for Rust's x86_64-pc-windows-gnu target.
+#
+# Rust's GNU winapi crate emits `-lwinapi_*`, which Zig interprets as a
+# dynamic system library and searches for `winapi_*.dll`. The bundled
+# `winapi-x86_64-pc-windows-gnu` crate ships those as static COFF import
+# archives (`libwinapi_*.a`), so rewrite them to absolute archive paths.
+#
+# `-l:libpthread.a` is a GNU ld syntax that Zig's lld does not accept; map it
+# to the plain `-lpthread` library name.
+set -euo pipefail
+
+ZIG="${ZIG_CC:-$HOME/.local/opt/zig-aarch64-macos-0.16.0/zig}"
+args=(-target x86_64-windows-gnu)
+if [[ -n "${CARGO_HOME:-}" ]]; then
+  search_dirs=("$CARGO_HOME/registry/src"/*/winapi-x86_64-pc-windows-gnu-0.4.0/lib)
+else
+  search_dirs=("$HOME/.cargo/registry/src"/*/winapi-x86_64-pc-windows-gnu-0.4.0/lib)
+fi
+out_args=()
+
+flush_winapi_lib() {
+    local name="$1"
+    local dir
+    for dir in "${search_dirs[@]}"; do
+        local candidate="$dir/libwinapi_${name}.a"
+        if [[ -f "$candidate" ]]; then
+            out_args+=("-Wl,-Bstatic" "$candidate" "-Wl,-Bdynamic")
+            return 0
+        fi
+    done
+    echo "zig-ld-windows: cannot find libwinapi_${name}.a in -L paths" >&2
+    exit 1
+}
+
+args_input=("$@")
+i=0
+while (( i < ${#args_input[@]} )); do
+    arg="${args_input[$i]}"
+    case "$arg" in
+        -m64) ;; # Zig target already selects 64-bit.
+        -L)
+            # Directory is consumed on the next argument.
+            if (( $# == 0 )); then
+                echo "zig-ld-windows: -L requires a directory" >&2
+                exit 1
+            fi
+            i=$((i + 1))
+            dir="${args_input[$i]}"
+            search_dirs+=("$dir")
+            out_args+=("$arg" "$dir")
+            ;;
+        -L*)
+            search_dirs+=("${arg#-L}")
+            out_args+=("$arg")
+            ;;
+        -lwinapi_*)
+            flush_winapi_lib "${arg#-lwinapi_}"
+            ;;
+        -l:libpthread.a)
+            out_args+=("-lpthread")
+            ;;
+        -lmsvcrt)
+            # Zig supplies its own UCRT when it links libc; the GNU msvcrt
+            # import library has no Zig lookup path and is not needed.
+            ;;
+        *)
+            out_args+=("$arg")
+            ;;
+    esac
+    i=$((i + 1))
+done
+
+exec "$ZIG" cc "${args[@]}" "${out_args[@]}"

@@ -1,0 +1,13 @@
+#!/bin/bash
+# Zig 0.16 C compiler adapter for Rust's x86_64-pc-windows-gnu target.
+set -euo pipefail
+
+ZIG="${ZIG_CC:-$HOME/.local/opt/zig-aarch64-macos-0.16.0/zig}"
+args=()
+for arg in "$@"; do
+  case "$arg" in
+    --target=x86_64-pc-windows-gnu) args+=(-target x86_64-windows-gnu) ;;
+    *) args+=("$arg") ;;
+  esac
+done
+exec "$ZIG" cc "${args[@]}"

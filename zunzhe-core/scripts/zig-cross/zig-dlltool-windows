@@ -1,0 +1,6 @@
+#!/bin/bash
+# Zig 0.16 dlltool adapter for the x86_64-pc-windows-gnu target.
+set -euo pipefail
+
+ZIG="${ZIG_CC:-$HOME/.local/opt/zig-aarch64-macos-0.16.0/zig}"
+exec "$ZIG" dlltool "$@"

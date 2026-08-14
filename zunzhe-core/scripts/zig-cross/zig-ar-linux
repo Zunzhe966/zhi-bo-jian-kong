@@ -1,0 +1,12 @@
+#!/bin/bash
+# Zig 0.16 archive adapter. Linux archives must be GNU format; this wrapper is
+# also used for ranlib, which only needs the archive table rebuilt.
+set -euo pipefail
+
+ZIG="${ZIG_CC:-$HOME/.local/opt/zig-aarch64-macos-0.16.0/zig}"
+op="$1"; shift
+case "$op" in
+  cq) exec "$ZIG" ar --format=gnu crs "$@" ;;
+  cqT) exec "$ZIG" ar --format=gnu crsT "$@" ;;
+  *) exec "$ZIG" ar --format=gnu "$op" "$@" ;;
+esac

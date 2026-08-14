@@ -1,0 +1,12 @@
+#!/bin/bash
+# Zig 0.16 archive adapter. Windows archives must be COFF format; this wrapper
+# is also used for ranlib on the Windows target.
+set -euo pipefail
+
+ZIG="${ZIG_CC:-$HOME/.local/opt/zig-aarch64-macos-0.16.0/zig}"
+op="$1"; shift
+case "$op" in
+  cq) exec "$ZIG" ar --format=coff crs "$@" ;;
+  cqT) exec "$ZIG" ar --format=coff crsT "$@" ;;
+  *) exec "$ZIG" ar --format=coff "$op" "$@" ;;
+esac
