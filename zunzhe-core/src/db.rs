@@ -215,6 +215,16 @@ pub async fn maintenance(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await
     .context("清理任务表")?;
+    // 直播录制历史表：终态（done/failed/stopped/interrupted）只保留最近
+    // 500 条；recording 是活动中的会话，无论 id 多旧都不能删，否则维护后
+    // 正在录制的会话会从状态机里消失，崩溃恢复/停止录制都会失效。
+    sqlx::query(
+        "DELETE FROM live_sessions WHERE status != 'recording' AND id NOT IN
+         (SELECT id FROM live_sessions WHERE status != 'recording' ORDER BY id DESC LIMIT 500)",
+    )
+    .execute(pool)
+    .await
+    .context("清理直播录制历史表")?;
     Ok(())
 }
 
@@ -296,6 +306,64 @@ mod maintenance_tests {
                 .any(|n| n.id == pending_notify),
             "维护不能删除待发送通知"
         );
+        std::mem::forget(file);
+    }
+
+    #[tokio::test]
+    async fn maintenance_prunes_finished_live_sessions_keeps_recording() {
+        let file = std::env::temp_dir().join(format!(
+            "zunzhe-maintenance-livesess-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pool = open_pool(&file).await.unwrap();
+        // 先写入一个活动中的 recording 会话（必须永远保留）。
+        let active = start_live_session(
+            &pool,
+            "https://live.test/active",
+            "主播甲",
+            "标题",
+            "bilibili",
+            "",
+            0,
+            "",
+        )
+        .await
+        .unwrap();
+        // 再写入超过 500 条的终态会话。
+        for i in 0..520 {
+            let id = start_live_session(
+                &pool,
+                &format!("https://live.test/{i}"),
+                "主播乙",
+                "标题",
+                "bilibili",
+                "",
+                0,
+                "",
+            )
+            .await
+            .unwrap();
+            end_live_session(&pool, id, "done", "").await.unwrap();
+        }
+
+        maintenance(&pool).await.unwrap();
+
+        // 活动中的 recording 必须保留。
+        assert!(
+            list_live_sessions(&pool, "recording", 10)
+                .await
+                .unwrap()
+                .iter()
+                .any(|s| s.id == active),
+            "维护不能删除正在录制的会话"
+        );
+        // 终态只保留最近 500 条。
+        let done = list_live_sessions(&pool, "done", 1000).await.unwrap();
+        assert_eq!(done.len(), 500, "终态录制历史应只保留最近 500 条");
         std::mem::forget(file);
     }
 }
