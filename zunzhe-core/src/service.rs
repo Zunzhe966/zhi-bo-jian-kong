@@ -383,7 +383,11 @@ pub fn diagnostics(project_dir: &Path) -> Result<serde_json::Value> {
         "uptime_human": uptime_human,
         "logs_writable": log_dir.is_dir() || std::fs::create_dir_all(&log_dir).is_ok(),
         "run_dir_writable": run_dir.is_dir() || std::fs::create_dir_all(&run_dir).is_ok(),
-        "ffmpeg": if ffmpeg_ok { "ok" } else { "missing（将使用 PATH 中的 ffmpeg）" },
+        "ffmpeg": if ffmpeg_ok {
+            "ok"
+        } else {
+            "missing（项目 ffmpeg/ 与 PATH 均未找到，录制/下载将失败，请安装 ffmpeg 或运行 scripts/setup-macos.sh）"
+        },
         "ffmpeg_available": ffmpeg_ok,
         "disk_free_mb": disk,
         "pipeline_python_ok": python_ok,
@@ -789,6 +793,34 @@ mod tests {
         // 当前平台是 macOS 时，本测试不要求 ffmpeg.exe 生效；这里锁定的是
         // 输出字段存在，跨平台 CI 会在 Windows 上验证真实行为。
         assert!(diag.get("ffmpeg_available").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diagnostics_missing_ffmpeg_hint_is_not_contradictory() {
+        // 空目录里既没有项目内置 ffmpeg，也不应在 PATH 兜底时声称“将使用
+        // PATH 中的 ffmpeg”（那会误导用户以为录制还能跑）。文案必须明确
+        // 指出缺失后果与修复路径。
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-diag-ffmpeg-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let diag = diagnostics(&dir).unwrap();
+        let text = diag["ffmpeg"].as_str().unwrap_or("");
+        if diag["ffmpeg_available"] == serde_json::json!(false) {
+            assert!(text.contains("missing"), "缺失时必须标记 missing: {text}");
+            assert!(
+                !text.contains("将使用 PATH 中的 ffmpeg"),
+                "缺失时不能声称将使用 PATH 兜底: {text}"
+            );
+            assert!(text.contains("录制/下载将失败"), "缺失时应说明后果: {text}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
