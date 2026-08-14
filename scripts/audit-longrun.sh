@@ -65,6 +65,8 @@ print(json.dumps({
   "uptime_secs": h.get("uptime_secs", d.get("uptime_secs", 0)),
   "heartbeat_age_secs": h.get("last_heartbeat_age_secs"),
   "heartbeat_lines": h.get("heartbeat_lines", 0),
+  "consecutive_heartbeats": h.get("consecutive_heartbeats", 0),
+  "log_gap_secs": h.get("log_gap_secs"),
 }, ensure_ascii=False))' 2>/dev/null || true)"
 if [ -z "$health" ]; then
   echo "$(date '+%Y-%m-%d %H:%M:%S %z') audit_unparseable" >> "$LOG"

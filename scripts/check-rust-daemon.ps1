@@ -16,6 +16,7 @@ if (-not (Test-Path $RustBin)) {
 $LogDir = Join-Path $Root 'logs'
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 $Log = Join-Path $LogDir 'zunzhe-core.watchdog.log'
+$AuditLog = Join-Path $LogDir 'zunzhe-core.audit.log'
 function Rotate-IfLarge {
   param([string]$Path, [int]$MaxBytes = 5242880, [int]$Keep = 5)
   if (-not (Test-Path $Path)) { return }
@@ -28,6 +29,7 @@ function Rotate-IfLarge {
   }
 }
 Rotate-IfLarge $Log
+Rotate-IfLarge $AuditLog
 $PidFile = Join-Path $Root 'fupan_output\run\zunzhe-core.pid'
 $Pid = if (Test-Path $PidFile) { (Get-Content -Raw $PidFile).Trim() } else { 'none' }
 
@@ -36,6 +38,42 @@ $daemonOk = $status -match '"rust_daemon":true'
 $heartbeatOk = $status -match '"heartbeat_ok":true'
 $now = Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz'
 Add-Content -Path $Log -Value "$now pid=$Pid rust_daemon=$daemonOk heartbeat_ok=$heartbeatOk"
+
+# 与 macOS/Linux 的 audit-longrun.sh 对齐：把 doctor 的 health_audit 指标也
+# 写入 logs/zunzhe-core.audit.log，让 Windows 长跑同样有 RSS/心跳/断档证据。
+try {
+  $diag = $status | ConvertFrom-Json -ErrorAction Stop
+  $audit = $diag.health_audit
+  if ($null -eq $audit) {
+    $audit = @{
+      ok = [bool]$diag.health
+      daemon_ok = [bool]($diag.daemon_ok -or $diag.rust_daemon)
+      heartbeat_ok = [bool]$diag.heartbeat_ok
+      pid = $Pid
+      rss_kib = $null
+      uptime_secs = [long]$diag.uptime_secs
+      heartbeat_age_secs = $null
+      heartbeat_lines = 0
+      consecutive_heartbeats = 0
+      log_gap_secs = $null
+    }
+  }
+  $auditLine = [ordered]@{
+    health = [bool]$audit.ok
+    daemon_ok = [bool]$audit.daemon_ok
+    heartbeat_ok = [bool]$audit.heartbeat_ok
+    pid = if ($null -ne $audit.pid) { $audit.pid } else { $Pid }
+    rss_kib = if ($null -ne $audit.rss_kib) { $audit.rss_kib } else { $null }
+    uptime_secs = if ($null -ne $audit.uptime_secs) { [long]$audit.uptime_secs } else { 0 }
+    heartbeat_age_secs = if ($null -ne $audit.heartbeat_age_secs) { $audit.heartbeat_age_secs } else { $null }
+    heartbeat_lines = if ($null -ne $audit.heartbeat_lines) { [int]$audit.heartbeat_lines } else { 0 }
+    consecutive_heartbeats = if ($null -ne $audit.consecutive_heartbeats) { [int]$audit.consecutive_heartbeats } else { 0 }
+    log_gap_secs = if ($null -ne $audit.log_gap_secs) { $audit.log_gap_secs } else { $null }
+  }
+  Add-Content -Path $AuditLog -Value "$now $(ConvertTo-Json -InputObject $auditLine -Compress -Depth 4)"
+} catch {
+  Add-Content -Path $AuditLog -Value "$now audit_unparseable"
+}
 
 if (-not $daemonOk -or -not $heartbeatOk) {
   Add-Content -Path $Log -Value "$now daemon unhealthy, calling ensure-services"

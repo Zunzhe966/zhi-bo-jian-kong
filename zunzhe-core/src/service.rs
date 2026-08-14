@@ -20,6 +20,8 @@ pub struct HealthAudit {
     pub started_at: Option<String>,
     pub last_heartbeat_age_secs: Option<u64>,
     pub heartbeat_lines: usize,
+    pub consecutive_heartbeats: usize,
+    pub log_gap_secs: Option<u64>,
     pub last_log_line_at: Option<String>,
 }
 
@@ -62,12 +64,33 @@ pub fn health_audit(project_dir: &Path) -> HealthAudit {
             None
         }
     });
+    // 同一 pid 启动后连续心跳数：uptime 日志里所有“包含当前 pid 且
+    // rust_daemon=true”的行数。日志轮转后可能只剩当前周期，但至少证明
+    // 最近这段时间没有断档。
+    let consecutive_heartbeats = if let Some(pid) = pid {
+        text.lines()
+            .filter(|line| {
+                line.contains(&format!("pid={pid}"))
+                    && (line.contains("rust_daemon=true") || line.contains("heartbeat_ok=true"))
+            })
+            .count()
+    } else {
+        0
+    };
+    let log_gap_secs = last_log_line_at.as_ref().and_then(|line| {
+        // 行首固定是 "YYYY-MM-DD HH:MM:SS +HHMM"，后面才接 pid 等诊断信息。
+        let ts = chrono::DateTime::parse_from_str(line.get(..25)?, "%Y-%m-%d %H:%M:%S %z").ok()?;
+        let now = chrono::Local::now().with_timezone(&ts.timezone());
+        Some((now - ts).num_seconds().max(0) as u64)
+    });
     let last_heartbeat_age_secs = heartbeat_age_secs(project_dir);
 
     let ok = daemon_ok
         && heartbeat_ok
         && last_heartbeat_age_secs.is_some()
-        && last_heartbeat_age_secs <= Some(30 * 60);
+        && last_heartbeat_age_secs <= Some(30 * 60)
+        && log_gap_secs.is_some()
+        && log_gap_secs <= Some(30 * 60);
     HealthAudit {
         ok,
         daemon_ok,
@@ -79,6 +102,8 @@ pub fn health_audit(project_dir: &Path) -> HealthAudit {
         started_at,
         last_heartbeat_age_secs,
         heartbeat_lines,
+        consecutive_heartbeats,
+        log_gap_secs,
         last_log_line_at,
     }
 }
@@ -1197,6 +1222,14 @@ mod tests {
         // 不作为硬性健康条件；真实常驻 daemon 下能读到即可用于诊断。
         assert!(audit.uptime_secs >= 120);
         assert!(audit.heartbeat_lines >= 1);
+        assert!(
+            audit.consecutive_heartbeats >= 1,
+            "同一 pid 的连续心跳数应 >=1: {audit:?}"
+        );
+        assert!(
+            audit.log_gap_secs.is_some_and(|gap| gap <= 30 * 60),
+            "uptime 日志最近心跳不应断档: {audit:?}"
+        );
         assert!(audit.started_at.is_some());
         assert!(audit.last_log_line_at.is_some());
         assert!(
