@@ -404,6 +404,7 @@ async fn tick(
     let mut checked = 0usize;
     let mut notified = 0usize;
     let mut enqueued = 0usize;
+    let mut skipped_cooldown = 0usize;
     let items: Vec<(String, String, Option<bool>)> = sources
         .into_iter()
         .map(|s| (s.url, s.name, s.download))
@@ -428,6 +429,7 @@ async fn tick(
                     "source {source_url} 连续失败 {source_fails} 次，冷却 {} 分钟",
                     cooldown / 60
                 );
+                skipped_cooldown += 1;
                 continue;
             }
         }
@@ -539,6 +541,7 @@ async fn tick(
         anchors_checked: checked,
         videos_notified: notified,
         notify_retried: notified_retry,
+        skipped_cooldown,
     })
 }
 
@@ -567,6 +570,7 @@ pub struct TickStats {
     pub anchors_checked: usize,
     pub videos_notified: usize,
     pub notify_retried: usize,
+    pub skipped_cooldown: usize,
 }
 
 /// 连续失败次数对应的冷却秒数：3 次起 15 分钟，之后按失败次数线性增加，上限 2 小时。

@@ -363,7 +363,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     "{}",
                     json!({"ok": true, "new_videos": stats.videos_notified + stats.downloads,
                            "checked": stats.anchors_checked, "notified": stats.videos_notified,
-                           "downloads": stats.downloads})
+                           "downloads": stats.downloads,
+                           "skipped_cooldown": stats.skipped_cooldown})
                 ),
                 Err(e) => println!("{}", json!({"ok": false, "error": e.to_string()})),
             }
