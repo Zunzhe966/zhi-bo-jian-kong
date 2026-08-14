@@ -1316,7 +1316,9 @@ pub async fn claim_pending_task_by_kind(
     );
     let backoff_sql = if kind.is_empty() { "" } else { " AND kind = ?" };
     sql.push_str(backoff_sql);
-    sql.push_str(" ORDER BY id LIMIT ?");
+    // 新任务（attempts=0）必须先排到前面，否则候选窗口恰好被退避任务占满
+    // 时会漏掉窗口外的新任务；退避任务之间仍按 id 保持先来后到。
+    sql.push_str(" ORDER BY CASE WHEN attempts = 0 THEN 0 ELSE 1 END, id LIMIT ?");
     let mut query = sqlx::query(&sql);
     if !kind.is_empty() {
         query = query.bind(kind);
@@ -1327,52 +1329,52 @@ pub async fn claim_pending_task_by_kind(
     query = query.bind(candidate_limit);
     let candidates = query.fetch_all(pool).await.context("查询待处理任务")?;
     let now = chrono::Local::now().naive_local();
-    let row = candidates.into_iter().find(|row| {
+    for row in candidates {
         let attempts: i64 = row.try_get("attempts").unwrap_or(0);
-        if attempts == 0 {
-            return true;
-        }
-        let updated_at: String = row.try_get("updated_at").unwrap_or_default();
-        let Some(updated) =
-            chrono::NaiveDateTime::parse_from_str(&updated_at, "%Y-%m-%d %H:%M:%S").ok()
-        else {
+        if attempts != 0 {
+            let updated_at: String = row.try_get("updated_at").unwrap_or_default();
+            if let Ok(updated) =
+                chrono::NaiveDateTime::parse_from_str(&updated_at, "%Y-%m-%d %H:%M:%S")
+            {
+                let wait_secs = match attempts {
+                    1 => 60,
+                    2 => 300,
+                    _ => 900,
+                };
+                if updated + chrono::Duration::seconds(wait_secs) > now {
+                    continue;
+                }
+            }
             // 坏时间戳按“已到期”处理，避免异常数据永久卡队列。
-            return true;
-        };
-        let wait_secs = match attempts {
-            1 => 60,
-            2 => 300,
-            _ => 900,
-        };
-        updated + chrono::Duration::seconds(wait_secs) <= now
-    });
-    let Some(row) = row else {
-        return Ok(None);
-    };
-    let id: i64 = row.try_get("id")?;
-    let updated = sqlx::query(
-        "UPDATE tasks SET status='processing', attempts=attempts+1, updated_at=datetime('now','localtime') WHERE id=? AND status = 'pending'",
-    )
-    .bind(id)
-    .execute(pool)
-    .await
-    .context("认领下载任务")?;
-    if updated.rows_affected() == 0 {
-        return Ok(None);
+        }
+        let id: i64 = row.try_get("id")?;
+        let updated = sqlx::query(
+            "UPDATE tasks SET status='processing', attempts=attempts+1, updated_at=datetime('now','localtime') WHERE id=? AND status = 'pending'",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .context("认领下载任务")?;
+        if updated.rows_affected() == 0 {
+            // 并发入口抢到同一任务时继续看候选里的下一条，避免整次认领返回
+            // None 让后面的可认领任务多等一轮。
+            continue;
+        }
+        let attempts: i64 = row.try_get("attempts")?;
+        return Ok(Some(Task {
+            id,
+            kind: row.try_get("kind")?,
+            url: row.try_get("url")?,
+            name: row.try_get("name")?,
+            status: "processing".to_string(),
+            // 认领时 DB 里已经 `attempts+1`，这里返回最新值，调用方据此决定是否落定 failed。
+            attempts: attempts + 1,
+            payload: row.try_get("payload")?,
+            created_at: row.try_get("created_at")?,
+            updated_at: row.try_get("updated_at")?,
+        }));
     }
-    let attempts: i64 = row.try_get("attempts")?;
-    Ok(Some(Task {
-        id,
-        kind: row.try_get("kind")?,
-        url: row.try_get("url")?,
-        name: row.try_get("name")?,
-        status: "processing".to_string(),
-        // 认领时 DB 里已经 `attempts+1`，这里返回最新值，调用方据此决定是否落定 failed。
-        attempts: attempts + 1,
-        payload: row.try_get("payload")?,
-        created_at: row.try_get("created_at")?,
-        updated_at: row.try_get("updated_at")?,
-    }))
+    Ok(None)
 }
 
 /// 启动/每轮 tick 前把上次崩溃遗留的 processing 任务归还 pending 重试。
@@ -1837,6 +1839,63 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(claimed.id, fresh, "新任务应跳过退避立即认领");
+    }
+
+    #[tokio::test]
+    async fn fresh_task_outside_backoff_window_is_still_claimed() {
+        let pool = test_pool().await;
+        // 前 20 条都是刚失败、处于退避期的任务：若候选窗口按 id 只取前 20
+        // 条，第 21 条新任务会被一起漏掉，worker 必须多等一轮才能认领。
+        // 新任务应排到退避任务前面，跨过整个退避窗口立即被认领。
+        let mut backoff_ids = Vec::new();
+        for i in 0..20 {
+            let id = enqueue_task(
+                &pool,
+                "download",
+                &format!("https://x.test/backoff-{i}"),
+                "博主",
+            )
+            .await
+            .unwrap();
+            backoff_ids.push(id);
+        }
+        let fresh = enqueue_task(&pool, "download", "https://x.test/fresh-outside", "博主")
+            .await
+            .unwrap();
+        // 模拟这 20 条都刚失败回到 pending，attempts=1 且在 1 分钟退避期内。
+        sqlx::query("UPDATE tasks SET attempts=1 WHERE id IN (SELECT id FROM tasks WHERE kind='download' AND url LIKE 'https://x.test/backoff-%')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let claimed = claim_pending_task_by_kind(&pool, "download", 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            claimed.id, fresh,
+            "退避窗口外的第 21 条新任务应立即被认领，而不是卡住"
+        );
+        assert_eq!(claimed.attempts, 1);
+
+        // 新任务被认领后，退避任务仍不能被提前认领。
+        assert!(
+            claim_pending_task_by_kind(&pool, "download", 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "退避中的任务不应被提前认领"
+        );
+        // 确认 20 条退避任务仍留在 pending，没有因为候选窗口被跳过而丢失。
+        let pending = list_tasks(&pool, "pending", 100).await.unwrap();
+        assert!(
+            pending
+                .iter()
+                .filter(|t| backoff_ids.contains(&t.id))
+                .count()
+                == backoff_ids.len(),
+            "退避任务应全部保持 pending: {pending:?}"
+        );
     }
 
     #[tokio::test]
