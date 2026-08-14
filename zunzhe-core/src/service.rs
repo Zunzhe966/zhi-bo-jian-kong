@@ -384,6 +384,21 @@ pub fn rotate_log(log: &Path, max_keep: usize) {
     }
 }
 
+/// 若日志文件超过阈值则轮转，保留 `max_keep` 份历史。
+///
+/// daemon 由 launchd 直接启动时没有父进程轮转 `logs/zunzhe-core.log`；
+/// 心跳记录器每 60 秒调用一次，超过 10MB 才轮转，避免 24×30 期间
+/// 日志文件无限增长，也避免频繁 rename 干扰正在 append 的日志句柄。
+pub fn rotate_log_if_large(log: &Path, max_keep: usize, max_bytes: u64) {
+    let Ok(meta) = std::fs::metadata(log) else {
+        return;
+    };
+    if meta.len() < max_bytes {
+        return;
+    }
+    rotate_log(log, max_keep);
+}
+
 /// 诊断项：供桌面端/CLI 快速判断“为什么监控没在跑”。
 pub fn diagnostics(project_dir: &Path) -> Result<serde_json::Value> {
     let log_dir = project_dir.join("logs");
@@ -913,6 +928,46 @@ mod tests {
         rotate_log(&log, 2);
         assert!(log.with_extension("log.1").exists());
         assert!(log.with_extension("log.2").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotate_log_if_large_keeps_small_file_untouched() {
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-rotate-if-large-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("zunzhe-core.log");
+        std::fs::write(&log, "small").unwrap();
+        rotate_log_if_large(&log, 5, 1024);
+        assert!(log.exists(), "小日志不应轮转");
+        assert!(!log.with_extension("log.1").exists(), "小日志不应产生历史");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotate_log_if_large_rotates_when_threshold_reached() {
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-rotate-large-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("zunzhe-core.log");
+        std::fs::write(&log, vec![b'x'; 4096]).unwrap();
+        rotate_log_if_large(&log, 5, 1024);
+        assert!(log.with_extension("log.1").exists(), "超限日志应轮转");
+        // rotate_log 只后移历史文件，不重建空文件；append 模式下次写会自动创建。
         let _ = std::fs::remove_dir_all(&dir);
     }
 

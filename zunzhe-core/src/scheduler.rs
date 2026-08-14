@@ -103,12 +103,17 @@ pub async fn run_daemon(
     // 不依赖 launchd/桌面端 watchdog；launchd 被 macOS TCC 挡在 ~/Desktop 外时
     // 也能持续留下 24×30 验收记录。
     let uptime_tx = stop.0.clone();
+    let core_log_path = project_dir.join("logs").join("zunzhe-core.log");
     // 心跳记录器每 60 秒追加一行，并在每次启动时轮转；此处只是普通追加，
     // 不再重复轮转，避免启动与心跳写同一个文件时产生竞争。
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         loop {
             interval.tick().await;
+            // launchd 直接 exec 启动时没有父进程轮转日志；心跳记录器顺带
+            // 按大小轮转主日志与 uptime 日志，避免 24×30 无限增长。
+            crate::service::rotate_log_if_large(&uptime_log, 3, 10 * 1024 * 1024);
+            crate::service::rotate_log_if_large(&core_log_path, 5, 10 * 1024 * 1024);
             let now = chrono::Local::now()
                 .format("%Y-%m-%d %H:%M:%S %z")
                 .to_string();
