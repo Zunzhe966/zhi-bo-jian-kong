@@ -132,6 +132,33 @@ pub async fn run_daemon(
             }
         }
     });
+    // 独立看门监督器：主循环若在 tick/等待阶段异常卡住超过 2 个间隔，
+    // 立即记录诊断并触发优雅退出。旧版心跳由主循环维护，卡住时外部看门狗
+    // 仍看到“进程活着”，uptime 日志继续写，形成假健康；本监督器保证
+    // 24×30 下主循环僵死会自动恢复（外部 watchdog/start_rust_daemon 拉起）。
+    let watchdog_interval = interval_secs.max(15);
+    let watchdog_limit = interval_secs.saturating_mul(2).max(60);
+    let watchdog_project_dir = project_dir.to_path_buf();
+    let watchdog_pid = std::process::id();
+    let watchdog_stop_tx = stop.0.clone();
+    let watchdog_stop_rx = stop.1.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(watchdog_interval));
+        loop {
+            interval.tick().await;
+            if *watchdog_stop_rx.borrow() {
+                break;
+            }
+            let fresh = crate::service::heartbeat_age_secs(&watchdog_project_dir)
+                .is_none_or(|age| age <= watchdog_limit);
+            if !fresh {
+                warn!(
+                    "心跳超过 {watchdog_limit}s 未更新（pid={watchdog_pid}），调度疑似僵死，触发优雅退出以便 watchdog 拉起"
+                );
+                let _ = watchdog_stop_tx.send(true);
+            }
+        }
+    });
     if let Some(limit) = duration_secs {
         let tx = stop.0.clone();
         tokio::spawn(async move {
@@ -193,16 +220,25 @@ pub async fn run_daemon(
             )
             .await;
         }
-        // duration 未到点且 tick 提前结束后，等待下一轮；期间继续响应退出。
+        // duration 未到点且 tick 提前结束后，等待下一轮；期间每 60 秒刷新心跳，
+        // 即使网络任务卡住也保留“调度器仍在运转”的可审计信号。
         let mut wait_exit = false;
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(interval_secs)) => {}
-            _ = stop.1.changed() => {
-                wait_exit = true;
+        let mut waited = 0u64;
+        while waited < interval_secs {
+            let step = (interval_secs - waited).min(60);
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(step)) => {}
+                _ = stop.1.changed() => {
+                    wait_exit = true;
+                    break;
+                }
+                _sig = shutdown_signal() => {
+                    wait_exit = true;
+                    break;
+                }
             }
-            _sig = shutdown_signal() => {
-                wait_exit = true;
-            }
+            waited = waited.saturating_add(step);
+            crate::service::touch_heartbeat(project_dir);
         }
         if wait_exit || *stop.1.borrow() {
             return shutdown_daemon(
@@ -755,6 +791,24 @@ mod tests {
         let _ = tokio::join!(&mut a, &mut b);
         // 两个句柄已完成，超时收尾不能 panic。
         abort_timed_out_tasks(a, b).await;
+    }
+
+    #[test]
+    fn heartbeat_watchdog_threshold_covers_wait_and_tick() {
+        // 等待阶段每 60 秒刷心跳，因此看门监督器阈值必须 >= 2 个间隔；
+        // 否则正常 tick + 等待组合（最坏 ~70s + 900s）会被误判为僵死。
+        let interval = 900u64;
+        let limit = interval.saturating_mul(2).max(60);
+        assert!(limit >= 2 * interval);
+        assert!(limit >= 70 + 60, "阈值必须覆盖 tick 超时与单次等待步长");
+
+        // 15 分钟间隔下，60 秒等待步长不会超过阈值。
+        let mut waited = 0u64;
+        while waited < interval {
+            let step = (interval - waited).min(60);
+            assert!(waited.saturating_add(step) <= limit);
+            waited = waited.saturating_add(step);
+        }
     }
 
     #[test]

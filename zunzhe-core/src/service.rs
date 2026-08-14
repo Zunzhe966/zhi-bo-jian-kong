@@ -282,6 +282,14 @@ pub fn heartbeat_fresh_public(project_dir: &Path) -> bool {
     heartbeat_fresh(project_dir, 30 * 60)
 }
 
+/// 心跳文件距当前时刻的秒数；文件缺失/损坏返回 None。
+/// 供 daemon 内部看门监督器判断主循环是否僵死。
+pub fn heartbeat_age_secs(project_dir: &Path) -> Option<u64> {
+    let meta = std::fs::metadata(heartbeat_file(project_dir)).ok()?;
+    let modified = meta.modified().ok()?;
+    modified.elapsed().ok().map(|d| d.as_secs())
+}
+
 /// 公开只读接口：当前 daemon 连续运行时长。
 pub fn daemon_uptime_public(project_dir: &Path) -> (u64, String) {
     daemon_uptime(project_dir)
