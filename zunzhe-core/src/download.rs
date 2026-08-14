@@ -61,8 +61,14 @@ impl Downloader {
     ) -> Result<DownloadResult> {
         let video_id = extract_video_id(url).unwrap_or_else(|| url.to_string());
         // 下载成功但视频库还没有该记录时补一行，保证“已下载”有事实源。
-        let _ = db::ensure_video_row(pool, &video_id, url, name, name).await;
-        let _ = db::mark_downloaded(pool, &video_id, true).await;
+        if let Err(e) = db::ensure_video_row(pool, &video_id, url, name, name).await {
+            // 视频库记录失败不能把已成功下载的文件当作失败：文件仍保留，
+            // 但必须留下可诊断日志，否则“已下载”状态会悄悄丢失。
+            tracing::warn!("下载成功但补写视频库记录失败 video_id={video_id}: {e:#}");
+        }
+        if let Err(e) = db::mark_downloaded(pool, &video_id, true).await {
+            tracing::warn!("下载成功但标记视频库已下载失败 video_id={video_id}: {e:#}");
+        }
         // 下载完成后是否入队复盘任务（转写/提炼/切片），由 fupan_config.ini
         // 三个独立开关决定；三项全关时不再入队，避免每次下载都白跑一次
         // Python 流水线。手动 process_media 仍可强制处理。
@@ -84,6 +90,9 @@ impl Downloader {
     async fn ytdlp_download(&self, url: &str, dir: &Path) -> Result<String> {
         let ytdlp = find_ytdlp(&self.project_dir).await;
         let mut cmd = Command::new(&ytdlp);
+        // 必须在 yt-dlp 启动前拍下目录快照；等它退出后再取，无法区分
+        // “这次新写出的文件”和“执行前就存在的旧文件”。
+        let before = files_in_dir(dir);
         cmd.kill_on_drop(true);
         cmd.args([
             "-f",
@@ -136,10 +145,22 @@ impl Downloader {
             ));
         }
 
-        // 找实际下载文件，标记已下载（以目录里最新视频文件为准）
+        // yt-dlp 已存在同名文件且 `--no-overwrites` 生效时仍会返回 0，但目录里
+        // 这次没有新文件；此时不能把“别的旧文件”当成本次下载成功。
         let file = find_latest_video(dir).unwrap_or_default();
         if file.is_empty() {
             return Err(anyhow!("yt-dlp 报告成功但没有产出视频文件"));
+        }
+        if before.contains(&file) {
+            let output_text = String::from_utf8_lossy(&output.stdout).to_string()
+                + &String::from_utf8_lossy(&output.stderr);
+            if output_text.contains("has already been downloaded") {
+                tracing::info!("yt-dlp 跳过已存在文件: {file}");
+                return Ok(file);
+            }
+            return Err(anyhow!(
+                "yt-dlp 报告成功但没有产出新的视频文件（同名文件已存在且未明确跳过）"
+            ));
         }
         Ok(file)
     }
@@ -369,6 +390,18 @@ fn find_latest_video(dir: &Path) -> Option<String> {
             if !path.is_file() {
                 continue;
             }
+            // 只认 yt-dlp 的 mp4 输出；目录里的 .part/.ytdl 临时文件、
+            // 封面图/描述文件都不算下载产物，避免把不完整文件或无关文件
+            // 当成“最新视频”。
+            if path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .as_deref()
+                != Some("mp4")
+            {
+                continue;
+            }
             let mtime = entry.metadata().ok().and_then(|m| m.modified().ok());
             if let Some(m) = mtime
                 && newest.as_ref().map(|(t, _)| m > *t).unwrap_or(true)
@@ -378,6 +411,16 @@ fn find_latest_video(dir: &Path) -> Option<String> {
         }
     }
     newest.map(|(_, p)| p.display().to_string())
+}
+
+fn files_in_dir(dir: &Path) -> std::collections::HashSet<String> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_file())
+        .map(|entry| entry.path().display().to_string())
+        .collect()
 }
 
 fn extract_video_id(url: &str) -> Option<String> {
@@ -639,6 +682,27 @@ mod tests {
         assert_eq!(
             find_latest_video(&dir).as_deref(),
             Some(b.display().to_string()).as_deref()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn latest_video_ignores_non_mp4_files() {
+        let dir = std::env::temp_dir().join(format!("zunzhe-dl-ext-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("partial.mp4.part");
+        let json = dir.join("meta.json");
+        let cover = dir.join("cover.jpg");
+        let mp4 = dir.join("video.mp4");
+        std::fs::write(&part, b"partial").unwrap();
+        std::fs::write(&json, b"{}").unwrap();
+        std::fs::write(&cover, b"img").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&mp4, b"real").unwrap();
+        assert_eq!(
+            find_latest_video(&dir).as_deref(),
+            Some(mp4.display().to_string()).as_deref(),
+            "只应返回完整 mp4，忽略 .part/封面/描述文件"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

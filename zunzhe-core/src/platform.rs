@@ -597,7 +597,9 @@ impl BilibiliAdapter {
                     .take(count as usize)
                     .collect();
                 if !ids.is_empty() {
-                    return (ids, last_error);
+                    // 之前尝试可能被 412 挡掉，但只要本次 stdout 有完整 BV 列表
+                    // 就按成功处理；必须清空旧错误，否则顶层日志会把成功误报成失败。
+                    return (ids, String::new());
                 }
                 last_error = String::from_utf8_lossy(&out.stderr)
                     .chars()
