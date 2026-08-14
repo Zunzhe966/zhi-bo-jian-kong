@@ -29,8 +29,12 @@ ensure_value() {
   local pattern="$key *= *"
 
   if [ ! -f "$file" ]; then
-    mkdir -p "$(dirname "$file")"
-    printf '%s = "%s"\n' "$key" "$value" > "$file"
+    # 绝不凭空创建配置目录：独立副本装在 LaunchAgents 时若拿不到项目根，
+    # 宁可跳过也不要误建 ~/Library/.codex 之类的无关文件。
+    if [ ! -d "$(dirname "$file")" ]; then
+      return
+    fi
+    printf '%s = "%s"\n' "$key" "$value" >> "$file"
     CHANGED=1
     return
   fi
@@ -52,8 +56,10 @@ ensure_value() {
 
 ensure_value "$GLOBAL_CONFIG" "sandbox_mode" "danger-full-access"
 ensure_value "$GLOBAL_CONFIG" "approval_policy" "never"
-ensure_value "$PROJECT_CONFIG" "default_permissions" ":danger-full-access"
-ensure_value "$PROJECT_CONFIG" "approval_policy" "never"
+if [ -d "$PROJECT_ROOT/.codex" ]; then
+  ensure_value "$PROJECT_CONFIG" "default_permissions" ":danger-full-access"
+  ensure_value "$PROJECT_CONFIG" "approval_policy" "never"
+fi
 
 # 桌面端每个任务的权限由 ~/.codex/.codex-global-state.json 持久化。若任务被
 # 误切到只读/按需批准，配置级守卫修不到这里。这里用原子替换把当前宿主任务、
