@@ -58,6 +58,29 @@ pub fn stop_all(project_dir: &Path) -> Result<serde_json::Value> {
 /// 桌面端/兼容层统一入口：Rust daemon 负责直播监控与视频监控，
 /// Python 服务仅在需要时作为兜底，避免重复录制同一路直播。
 pub fn ensure_core(project_dir: &Path) -> Result<serde_json::Value> {
+    // macOS 上 launchd 是 24×30 的正式管理者（KeepAlive 自动拉起）。
+    // 若已安装 com.zunzhe.monitor，ensure 优先让 launchd 拉起，避免本进程
+    // 直接 spawn 与 launchd 抢单实例锁；否则 launchd 会不断重试并报
+    // “已有 Rust daemon 在本项目运行”。
+    #[cfg(target_os = "macos")]
+    if launchd_monitor_installed() {
+        if rust_daemon_alive(project_dir) {
+            return Ok(
+                json!({"ok": true, "rust_daemon": "已在运行（launchd 管理）", "services": {}}),
+            );
+        }
+        // daemon 未健康时让 launchd 重新拉起；-k 确保已加载但僵死的服务被重启。
+        let uid = unsafe { libc::getuid() };
+        let ok = std::process::Command::new("launchctl")
+            .args(["kickstart", "-k", &format!("gui/{uid}/com.zunzhe.monitor")])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            return Ok(json!({"ok": true, "rust_daemon": "launchd 已接管", "services": {}}));
+        }
+        // launchctl 失败（服务未加载等）再走直接 spawn 兜底。
+    }
     let rust = start_rust_daemon(project_dir, 900)?;
     // Rust daemon 已统一接管直播检测/录制和视频监控；不再并行启动 Python
     // video_monitor，避免同一批视频源被两套逻辑重复检查/通知/下载。
@@ -66,6 +89,16 @@ pub fn ensure_core(project_dir: &Path) -> Result<serde_json::Value> {
         .cloned()
         .unwrap_or(serde_json::Value::Bool(true));
     Ok(json!({"ok": true, "rust_daemon": rust_status, "services": {}}))
+}
+
+/// macOS：检查 com.zunzhe.monitor 是否已安装到用户 LaunchAgents。
+#[cfg(target_os = "macos")]
+fn launchd_monitor_installed() -> bool {
+    let path = std::path::Path::new(&std::env::var("HOME").unwrap_or_default())
+        .join("Library")
+        .join("LaunchAgents")
+        .join("com.zunzhe.monitor.plist");
+    path.is_file()
 }
 
 /// 启动 Rust 核心 daemon 并写入 pid 文件（供桌面端/兼容层调用）。
