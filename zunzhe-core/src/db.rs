@@ -7,6 +7,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 
 use crate::model::{Anchor, LiveSession, NotifyEvent, Task, Video};
+use crate::watchlist::Watchlist;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS anchors (
@@ -218,6 +219,13 @@ pub async fn maintenance_if_due(project_dir: &Path, pool: &SqlitePool) -> anyhow
             // daemon 不在场时也要清理运行目录里的协议/原子写残留，否则
             // 长年只跑 CLI/MCP 的机器会让 fupan_output/run 无限增长。
             crate::bilibili_electron::maintain_run_dir(&run_dir);
+            // 旧核心 DB 迁移曾把视频空间地址写入 anchors；只有 URL_config.ini
+            // 是直播源权威，其他历史记录会让 list-live 展示假主播，逐次清理。
+            if let Ok(removed) = prune_orphan_anchors(pool, project_dir).await
+                && removed > 0
+            {
+                tracing::info!("清理 {removed} 条不在直播源里的历史 anchors 记录");
+            }
             touch_maintenance_marker(&run_dir)?;
             tracing::debug!("独立入口数据库维护完成");
         }
@@ -322,9 +330,78 @@ pub async fn maintenance(pool: &SqlitePool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 清理历史冗余的 anchors：`anchors` 表只用于兼容旧核心 DB 迁移展示，
+/// 直播监控的唯一权威是 `URL_config.ini`。旧库曾把视频空间地址也写入
+/// anchors（例如影视飓风 `space.bilibili.com/...`），这些记录不在直播源里，
+/// 会让 `list-live` 把没监控直播的博主也当成直播主播。
+pub async fn prune_orphan_anchors(pool: &SqlitePool, project_dir: &Path) -> anyhow::Result<usize> {
+    let watch = Watchlist::new(project_dir.to_path_buf());
+    let live_urls: std::collections::HashSet<String> = watch
+        .list_live()
+        .into_iter()
+        .map(|item| item.url.trim_end_matches('/').to_string())
+        .collect();
+    let rows = sqlx::query("SELECT id, url FROM anchors")
+        .fetch_all(pool)
+        .await
+        .context("读取 anchors 以清理孤儿记录")?;
+    let mut removed = 0usize;
+    for row in rows {
+        let id: i64 = row.try_get("id")?;
+        let url: String = row.try_get("url")?;
+        let normalized = url.trim_end_matches('/').to_string();
+        if !live_urls.contains(&normalized) {
+            sqlx::query("DELETE FROM anchors WHERE id = ?")
+                .bind(id)
+                .execute(pool)
+                .await
+                .context("删除孤儿 anchors 记录")?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod maintenance_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn prune_orphan_anchors_keeps_only_live_sources() {
+        let project = std::env::temp_dir().join(format!(
+            "zunzhe-prune-anchors-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&project);
+        std::fs::create_dir_all(project.join("config")).unwrap();
+        let db = project.join("zunzhe-test.db");
+        let pool = open_pool(&db).await.unwrap();
+        crate::db::add_anchor(&pool, "https://live.bilibili.com/123", "直播主播")
+            .await
+            .unwrap();
+        crate::db::add_anchor(&pool, "https://space.bilibili.com/946974", "旧库视频源")
+            .await
+            .unwrap();
+        std::fs::write(
+            project.join("config").join("URL_config.ini"),
+            "https://live.bilibili.com/123,直播主播\n",
+        )
+        .unwrap();
+
+        let removed = crate::db::prune_orphan_anchors(&pool, &project)
+            .await
+            .unwrap();
+        assert_eq!(removed, 1, "不在直播源里的历史 anchors 应被清理");
+        let anchors = crate::db::list_anchors(&pool).await.unwrap();
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(anchors[0].url, "https://live.bilibili.com/123");
+        std::mem::forget(db);
+        let _ = std::fs::remove_dir_all(&project);
+    }
 
     #[tokio::test]
     async fn maintenance_checkpoints_wal_and_optimize() {

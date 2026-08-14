@@ -228,7 +228,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     match cli.command {
         Command::AddLive { url, name, quality } | Command::AddAnchor { url, name, quality } => {
-            db::add_anchor(&pool, &url, &name).await?;
             let _ = watch.add_live(&url, &name, &quality);
             println!(
                 "{}",
@@ -237,7 +236,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::RemoveLive { url } | Command::RemoveAnchor { url } => {
             // `remove-live` 与 Python/旧桌面端一致是“暂停监控”，只注释 URL 行，
-            // 不清掉 SQLite anchors。否则列表页和 daemon 实际监控源会长期不一致。
+            // 不删除监控源本身；ini 才是权威，删除只发生在 delete-live。
             let removed = watch.remove_live(&url)?;
             println!(
                 "{}",
@@ -245,16 +244,15 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             );
         }
         Command::DeleteLive { url } => {
-            let removed = db::remove_anchor(&pool, &url).await?;
             let deleted = watch.delete_live(&url)?;
             println!(
                 "{}",
-                json!({"ok": removed || deleted, "url": url, "action": "delete-live"})
+                json!({"ok": deleted, "url": url, "action": "delete-live"})
             );
         }
         Command::ListLive | Command::ListAnchors => {
-            let anchors = db::list_anchors(&pool).await?;
             let items = watch.list_live();
+            let anchors = watch.live_anchor_view();
             println!(
                 "{}",
                 json!({"ok": true, "rooms": items, "anchors": anchors})
@@ -349,7 +347,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     Some(&notify)
                 },
             )?;
-            db::add_anchor(&pool, &url_for_opt, &name_for_opt).await?;
             println!(
                 "{}",
                 json!({"ok": true, "url": url, "name": if name.is_empty() { url.clone() } else { name.clone() },
@@ -359,7 +356,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::RemoveVideo { url } => {
             let removed = watch.remove_video(&url)?;
-            let _ = db::remove_anchor(&pool, &url).await;
             println!(
                 "{}",
                 json!({"ok": removed, "url": url, "action": "remove-video"})

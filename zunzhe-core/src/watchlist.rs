@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// 与 Python 版 fupan 兼容的监控列表与偏好读写。
 /// 直播列表: config/URL_config.ini（地址[,备注][,画质]）
@@ -28,6 +28,34 @@ pub struct VideoSource {
     pub name: String,
     pub download: Option<bool>,
     pub notify: String,
+}
+
+/// 直播源在 `anchors` 兼容字段里的展示视图。
+///
+/// SQLite `anchors` 表只保留旧核心 DB 迁移的历史数据，不参与任何监控决策；
+/// 直播监控的唯一权威是 `URL_config.ini`。为了不让旧记录把视频空间地址
+/// 显示成“直播主播”，对外展示统一由当前直播列表生成。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AnchorView {
+    pub url: String,
+    pub name: String,
+    pub enabled: bool,
+    pub notify_channel: String,
+}
+
+impl Watchlist {
+    /// 返回与 `list_live` 同源的 anchors 兼容视图；不读取 SQLite。
+    pub fn live_anchor_view(&self) -> Vec<AnchorView> {
+        self.list_live()
+            .into_iter()
+            .map(|item| AnchorView {
+                url: item.url,
+                name: item.remark,
+                enabled: item.enabled,
+                notify_channel: item.notify,
+            })
+            .collect()
+    }
 }
 
 impl Watchlist {
@@ -462,6 +490,23 @@ mod tests {
         assert_eq!(legacy.quality, "高清");
         assert!(item.enabled);
         assert!(!parse_live_line("#https://live.bilibili.com/2").enabled);
+    }
+
+    #[test]
+    fn live_anchor_view_comes_from_url_config_not_sqlite() {
+        let dir = temp_project("anchor-view");
+        fs::write(
+            dir.join("config").join("URL_config.ini"),
+            "https://live.bilibili.com/123,主播甲,原画\n",
+        )
+        .unwrap();
+        let w = super::Watchlist::new(dir.clone());
+        let view = w.live_anchor_view();
+        assert_eq!(view.len(), 1);
+        assert_eq!(view[0].url, "https://live.bilibili.com/123");
+        assert_eq!(view[0].name, "主播甲");
+        assert!(view[0].enabled);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

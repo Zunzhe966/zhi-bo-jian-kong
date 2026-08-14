@@ -195,6 +195,11 @@ pub async fn run_daemon(
         if now_ts.saturating_sub(last_maintenance) >= maintenance_interval as i64 {
             match db::maintenance(&pool).await {
                 Ok(()) => {
+                    if let Ok(removed) = db::prune_orphan_anchors(&pool, project_dir).await
+                        && removed > 0
+                    {
+                        info!("清理 {removed} 条不在直播源里的历史 anchors 记录");
+                    }
                     // B站 Electron 协议临时文件：调度轮次不跑 Electron，但旧版本
                     // 或手动诊断可能留下 payload/stderr 残留；一并按“超 7 天删 +
                     // 每类保留 10 个”清理，避免 run 目录无限增长。

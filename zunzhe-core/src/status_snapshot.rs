@@ -29,8 +29,8 @@ pub async fn build(project_dir: &Path, pool: &SqlitePool, cfg: &Config) -> Resul
     let fupan_dir = project_dir.join("fupan_output");
     let logs_dir = project_dir.join("logs");
 
-    let anchors = db::list_anchors(pool).await?;
     let watch = watchlist::Watchlist::new(project_dir.to_path_buf());
+    let anchors = watch.live_anchor_view();
     let live = watch.list_live();
     let video_sources = watch.list_video();
     let (recent_recordings, notes) = file_scan_cache(&downloads, &fupan_dir, project_dir)?;

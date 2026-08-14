@@ -223,7 +223,6 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
             watch.add_live(url, &format!("主播: {name}"), quality)?;
-            db::add_anchor(pool, url, name).await?;
             Ok(serde_json::to_string(
                 &json!({"ok":true,"url":url,"name":name}),
             )?)
@@ -235,10 +234,9 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
         }
         "live_delete" => {
             let url = args.get("url").and_then(|v| v.as_str()).unwrap_or_default();
-            let removed = db::remove_anchor(pool, url).await?;
             let deleted = watch.delete_live(url)?;
             Ok(serde_json::to_string(
-                &json!({"ok": removed || deleted, "url": url, "action": "delete-live"}),
+                &json!({"ok": deleted, "url": url, "action": "delete-live"}),
             )?)
         }
         "live_set_notify" => {
@@ -331,7 +329,6 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
                 _ => None,
             };
             watch.add_video(url, name, download_opt, None)?;
-            db::add_anchor(pool, url, name).await?;
             Ok(serde_json::to_string(
                 &json!({"ok":true,"url":url,"name":name,"download":download}),
             )?)
@@ -339,7 +336,6 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
         "video_remove" => {
             let url = args.get("url").and_then(|v| v.as_str()).unwrap_or_default();
             let removed = watch.remove_video(url)?;
-            let _ = db::remove_anchor(pool, url).await;
             Ok(serde_json::to_string(&json!({"ok":removed,"url":url}))?)
         }
         "video_list" => Ok(serde_json::to_string(
