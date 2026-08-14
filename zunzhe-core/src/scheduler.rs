@@ -722,12 +722,32 @@ mod tests {
         let _ = std::fs::remove_file(&file);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        let run_dir = dir.join("fupan_output").join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        // 首轮 tick 应执行一次到期维护并刷新哨兵，同时清理旧版本 Electron
+        // 协议残留；防止“启动后维护永远推迟”这类回归再次出现。
+        let old_payload = run_dir.join("bili_script_payload_stale.js");
+        std::fs::write(&old_payload, "old").unwrap();
+        set_mtime_days_ago(&old_payload, 8);
+        let stale_tmp = run_dir.join(".zunzhe-core.heartbeat.tmp.123.456.0");
+        std::fs::write(&stale_tmp, "stale").unwrap();
+        set_mtime_days_ago(&stale_tmp, 8);
         let pool = crate::db::open_pool(&file).await.unwrap();
         db::init_db(&pool).await.unwrap();
         let cfg = crate::config::Config::load(Path::new(env!("CARGO_MANIFEST_DIR")))
             .unwrap_or_else(|_| crate::config::Config::defaults_for_test());
         let result = run_daemon(pool, &dir, &cfg, 1, true, None).await;
         assert!(result.is_ok(), "{result:?}");
+        let marker = run_dir.join("zunzhe-core.maintenance");
+        assert!(marker.exists(), "首轮到期维护后应刷新维护哨兵");
+        let marker_ts = crate::db::maintenance_marker_timestamp(&marker).unwrap();
+        let now = chrono::Local::now().timestamp();
+        assert!(
+            (now - marker_ts).abs() <= 30,
+            "维护哨兵应记录本轮执行时间: now={now} ts={marker_ts}"
+        );
+        assert!(!old_payload.exists(), "首轮维护应清理超龄 payload 残留");
+        assert!(!stale_tmp.exists(), "首轮维护应清理超龄原子写残留");
         // --once 模式退出后必须清理 pid/锁，不能污染临时目录或真实工作区。
         assert!(
             !dir.join("fupan_output")
