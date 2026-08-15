@@ -40,6 +40,17 @@ pub async fn build(project_dir: &Path, pool: &SqlitePool, cfg: &Config) -> Resul
     let (uptime_secs, uptime_human) = service::daemon_uptime_public(project_dir);
     let video_count = db::count_videos(pool).await?;
     let switches = crate::download::PipelineSwitches::load(project_dir);
+    // 与 CLI/MCP doctor 同口径：源进入冷却后会静默不通知/不下载，
+    // 桌面端 status 必须能暴露该健康风险，不能只显示“服务运行中”。
+    // 读取失败按“未知”处理，不让状态快照整体失败。
+    let source_health = match db::source_health_summary(pool).await {
+        Ok((total, failing, cooling)) => {
+            json!({"total": total, "failing": failing, "cooling": cooling, "ok": cooling == 0})
+        }
+        Err(_) => {
+            json!({"total": null, "failing": null, "cooling": null, "ok": null})
+        }
+    };
 
     Ok(json!({
         "ok": true,
@@ -58,6 +69,7 @@ pub async fn build(project_dir: &Path, pool: &SqlitePool, cfg: &Config) -> Resul
         "heartbeat_ok": heartbeat_ok,
         "uptime_secs": uptime_secs,
         "uptime_human": uptime_human,
+        "source_health": source_health,
         "services": {
             "live_monitor": {"running": rust_running},
             "video_monitor": {"running": rust_running},
@@ -387,6 +399,54 @@ mod tests {
         assert_eq!(second_notes.len(), 0);
 
         clear_file_scan_cache_for_tests();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn snapshot_includes_source_health() {
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-status-source-health-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::create_dir_all(dir.join("fupan_output").join("run")).unwrap();
+        std::fs::write(dir.join("config").join("config.ini"), "[推送配置]\n").unwrap();
+        std::fs::write(dir.join("config").join("fupan_config.ini"), "[视频监控]\n").unwrap();
+        std::fs::write(
+            dir.join("config").join("config.ini.example"),
+            "[推送配置]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("config").join("fupan_config.ini.example"),
+            "[视频监控]\n",
+        )
+        .unwrap();
+
+        let file = std::env::temp_dir().join(format!(
+            "zunzhe-status-source-health-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pool = crate::db::open_pool(&file).await.unwrap();
+        crate::db::init_db(&pool).await.unwrap();
+        let cfg = Config::load(&dir).unwrap();
+
+        let snapshot = build(&dir, &pool, &cfg).await.unwrap();
+        assert_eq!(
+            snapshot["source_health"],
+            json!({"total": 0, "failing": 0, "cooling": 0, "ok": true})
+        );
+
+        std::mem::forget(file);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

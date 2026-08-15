@@ -76,6 +76,7 @@ export function statusFingerprint(data) {
   if (!data) return ''
   return JSON.stringify({
     services: data.services,
+    sourceHealth: data.source_health,
     live: data.live_watchlist,
     video: data.video_watchlist,
     notes: data.notes,

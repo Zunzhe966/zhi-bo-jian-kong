@@ -788,6 +788,13 @@ export default function App() {
             <span className={`status-pill ${svc.video_monitor?.running ? 'on' : 'off'}`}>
               <i className={`dot ${svc.video_monitor?.running ? 'on' : ''}`} />视频监控 {svc.video_monitor?.running ? '运行中' : '未运行'}
             </span>
+            <span className={`status-pill ${status?.source_health?.ok ? 'on' : status?.source_health?.ok === false ? 'off' : ''}`} title="平台风控或网络故障会让源进入冷却，冷却期间新视频不会通知/下载">
+              <i className={`dot ${status?.source_health?.ok ? 'on' : ''}`} />监控源 {status?.source_health?.ok === true
+                ? '健康'
+                : status?.source_health?.ok === false
+                  ? `异常（${status?.source_health?.cooling ?? '?'} 个冷却中）`
+                  : '未知'}
+            </span>
           </div>
         </header>
 

@@ -191,7 +191,7 @@ pub fn tools_list() -> Vec<Value> {
         json!({"name":"service_start","description":"启动 Rust 核心 daemon（统一直播+视频监控）","inputSchema":{"type":"object","properties":{}}}),
         json!({"name":"service_stop","description":"停止 Rust 核心 daemon","inputSchema":{"type":"object","properties":{}}}),
         json!({"name":"ensure_services","description":"确保 Rust 核心 daemon 运行（桌面端/watchdog 入口）","inputSchema":{"type":"object","properties":{}}}),
-        json!({"name":"doctor","description":"运行环境诊断（日志/磁盘/ffmpeg/守护心跳）","inputSchema":{"type":"object","properties":{}}}),
+        json!({"name":"doctor","description":"运行环境诊断（日志/磁盘/ffmpeg/守护心跳/监控源健康）","inputSchema":{"type":"object","properties":{}}}),
         json!({"name":"wizard_done","description":"标记桌面向导完成","inputSchema":{"type":"object","properties":{}}}),
         json!({"name":"test_email","description":"发送测试邮件","inputSchema":{"type":"object","properties":{}}}),
         json!({"name":"test_notify","description":"发送测试通知（Python 兼容别名）","inputSchema":{"type":"object","properties":{}}}),
@@ -544,9 +544,26 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
         "service_stop" => Ok(serde_json::to_string(&crate::service::stop_rust_daemon(
             project_dir,
         )?)?),
-        "doctor" => Ok(serde_json::to_string(&crate::service::diagnostics(
-            project_dir,
-        )?)?),
+        "doctor" => {
+            // 与 CLI doctor 共用同一口径：源进入冷却后，该博主的新视频会
+            // 静默不通知/不下载，必须让 MCP 调用方也能一眼看到平台风控。
+            // 读取失败只记字段为未知，不让 doctor 本身失败。
+            let mut diag = crate::service::diagnostics(project_dir)?;
+            if let Ok((total, failing, cooling)) = db::source_health_summary(pool).await
+                && let Some(obj) = diag.as_object_mut()
+            {
+                obj.insert(
+                    "source_health".to_string(),
+                    json!({
+                        "total": total,
+                        "failing": failing,
+                        "cooling": cooling,
+                        "ok": cooling == 0,
+                    }),
+                );
+            }
+            Ok(serde_json::to_string(&diag)?)
+        }
         "wizard_done" => {
             let mut updates = serde_json::Map::new();
             updates.insert("wizardDone".to_string(), Value::Bool(true));
@@ -680,6 +697,75 @@ mod tests {
         let inner: Value = serde_json::from_str(text).unwrap();
         assert_eq!(inner["ok"], false);
         assert!(inner["error"].as_str().unwrap().contains("引号"));
+    }
+
+    #[tokio::test]
+    async fn mcp_doctor_contract_includes_source_health() {
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-mcp-doctor-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        std::fs::create_dir_all(dir.join("fupan_output").join("run")).unwrap();
+        std::fs::write(
+            dir.join("config").join("config.ini"),
+            "[推送配置]\nSMTP邮件服务器 = smtp.qq.com\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("config").join("fupan_config.ini"), "[视频监控]\n").unwrap();
+        std::fs::write(
+            dir.join("config").join("config.ini.example"),
+            "[推送配置]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("config").join("fupan_config.ini.example"),
+            "[视频监控]\n",
+        )
+        .unwrap();
+
+        let file = std::env::temp_dir().join(format!(
+            "zunzhe-mcp-doctor-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pool = crate::db::open_pool(&file).await.unwrap();
+        crate::db::init_db(&pool).await.unwrap();
+
+        let fupan_dir = dir.join("fupan_output");
+        let library = VideoLibrary::new(pool.clone(), fupan_dir.clone());
+        let watch = Watchlist::new(dir.to_path_buf());
+        let api = ConfigApi::new(dir.to_path_buf());
+        let cfg = Config::load(&dir).unwrap();
+        let ctx = ToolContext {
+            library: &library,
+            fupan_dir: &fupan_dir,
+            cfg: &cfg,
+            pool: &pool,
+            watch: &watch,
+            api: &api,
+            project_dir: &dir,
+        };
+
+        let out = call_tool("doctor", &json!({}), &ctx).await.unwrap();
+        let diag: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(diag["ok"], true);
+        assert_eq!(
+            diag["source_health"],
+            json!({"total": 0, "failing": 0, "cooling": 0, "ok": true})
+        );
+
+        std::mem::forget(file);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
