@@ -100,6 +100,8 @@ enum Command {
         #[arg(default_value = "手动下载")]
         name: String,
     },
+    /// 批量下载多个视频到 downloads/短视频/（JSON 数组：[{"url":"...","name":"..."}]）
+    DownloadVideos { items_json: String },
     /// 查看邮箱配置状态
     EmailStatus,
     /// 写入 QQ 邮箱配置
@@ -448,6 +450,47 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 ),
             }
         }
+        Command::DownloadVideos { items_json } => {
+            if !crate::service::rust_daemon_alive(&project_dir) {
+                let started = crate::service::ensure_core(&project_dir);
+                if let Err(e) = started {
+                    println!(
+                        "{}",
+                        json!({
+                            "ok": false,
+                            "queued": false,
+                            "error": format!("批量下载任务未入队，且 daemon 启动失败: {e:#}"),
+                        })
+                    );
+                    return Ok(());
+                }
+            }
+            let parsed: Vec<serde_json::Value> = match serde_json::from_str(&items_json) {
+                Ok(v) => v,
+                Err(e) => {
+                    println!(
+                        "{}",
+                        json!({"ok": false, "queued": false, "error": format!("items_json 不是 JSON 数组: {e:#}")})
+                    );
+                    return Ok(());
+                }
+            };
+            let items: Vec<(String, String)> = parsed
+                .iter()
+                .map(|v| {
+                    let url = v.get("url").and_then(|u| u.as_str()).unwrap_or_default();
+                    let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("手动下载");
+                    (url.to_string(), name.to_string())
+                })
+                .collect();
+            match download::enqueue_downloads(&pool, &items).await {
+                Ok(summary) => println!("{}", serde_json::to_string(&summary)?),
+                Err(e) => println!(
+                    "{}",
+                    json!({"ok": false, "queued": false, "error": e.to_string()})
+                ),
+            }
+        }
         Command::EmailStatus => {
             let status = cfg.email_status();
             println!("{}", serde_json::to_string(&status)?);
@@ -738,6 +781,11 @@ mod tests {
                 "download-video",
                 "https://www.bilibili.com/video/BV1xx411c7mD",
                 "手动下载",
+            ],
+            &[
+                "zunzhe-core",
+                "download-videos",
+                r#"[{"url":"https://www.bilibili.com/video/BV1xx411c7mD","name":"手动下载"}]"#,
             ],
             &[
                 "zunzhe-core",

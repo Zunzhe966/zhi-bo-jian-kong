@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -22,6 +23,88 @@ pub async fn enqueue_download(pool: &SqlitePool, url: &str, name: &str) -> anyho
         anyhow::bail!("下载地址不能为空");
     }
     db::enqueue_task(pool, "download", url, name).await
+}
+
+/// 批量入队下载：供“勾选批量下载/全部下载”使用。
+///
+/// 逐个复用 `enqueue_download` 的队列去重与 daemon 消费语义；已下载的视频
+/// 直接跳过，避免“全部下载”重复拉取用户已经有的内容。返回汇总统计而不是
+/// 中途失败，单个坏 URL 不影响其余任务入队。
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchDownloadSummary {
+    pub requested: usize,
+    pub queued: usize,
+    pub duplicated: usize,
+    pub skipped_downloaded: usize,
+    pub errors: usize,
+    pub task_ids: Vec<i64>,
+    pub error_messages: Vec<String>,
+}
+
+pub async fn enqueue_downloads(
+    pool: &SqlitePool,
+    items: &[(String, String)],
+) -> anyhow::Result<BatchDownloadSummary> {
+    let mut summary = BatchDownloadSummary {
+        requested: items.len(),
+        queued: 0,
+        duplicated: 0,
+        skipped_downloaded: 0,
+        errors: 0,
+        task_ids: Vec::new(),
+        error_messages: Vec::new(),
+    };
+    let mut seen = HashSet::new();
+    for (url, name) in items {
+        let url = url.trim();
+        if url.is_empty() {
+            summary.errors += 1;
+            summary.error_messages.push("空 URL".to_string());
+            continue;
+        }
+        // “全部下载”不能重复拉已下载内容；按 URL 查询视频库，存在且已下载
+        // 时跳过。视频库缺失时仍允许下载（浏览列表还没入库的旧链接）。
+        let known_downloaded =
+            sqlx::query_scalar::<_, i64>("SELECT downloaded FROM videos WHERE url=? LIMIT 1")
+                .bind(url)
+                .fetch_optional(pool)
+                .await
+                .context("查询视频库下载状态")?;
+        if known_downloaded == Some(1) {
+            summary.skipped_downloaded += 1;
+            continue;
+        }
+        // 同一批内重复 URL 只入队一次；后续相同项计入 duplicated，避免
+        // “全部下载”里重复条目被并发创建多个任务。
+        if !seen.insert(url.to_string()) {
+            summary.duplicated += 1;
+            continue;
+        }
+        // 同一 URL 已在 pending/processing：不重复入队，计入 duplicated。
+        let existing = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM tasks WHERE kind='download' AND url=? AND status IN ('pending','processing') LIMIT 1",
+        )
+        .bind(url)
+        .fetch_optional(pool)
+        .await
+        .context("查询已有下载任务")?;
+        if let Some(id) = existing {
+            summary.duplicated += 1;
+            summary.task_ids.push(id);
+            continue;
+        }
+        match db::enqueue_task(pool, "download", url, name).await {
+            Ok(id) => {
+                summary.queued += 1;
+                summary.task_ids.push(id);
+            }
+            Err(e) => {
+                summary.errors += 1;
+                summary.error_messages.push(format!("{url}: {e:#}"));
+            }
+        }
+    }
+    Ok(summary)
 }
 
 /// 下载器：优先走平台原生路径（B站浏览器内核提取直链 + ffmpeg 合流），
@@ -936,6 +1019,67 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(dup_retry, after_failed, "pending 中再次入队应去重");
+        std::mem::forget(file);
+    }
+
+    #[tokio::test]
+    async fn enqueue_downloads_batch_skips_downloaded_and_dedupes() {
+        let file = std::env::temp_dir().join(format!(
+            "zunzhe-batch-dl-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pool = crate::db::open_pool(&file).await.unwrap();
+        crate::db::init_db(&pool).await.unwrap();
+        // 已下载记录：批量“全部下载”应跳过。
+        crate::db::upsert_video(
+            &pool,
+            &crate::model::VideoMeta {
+                id: "BVdownloaded".into(),
+                platform: "bilibili".into(),
+                url: "https://www.bilibili.com/video/BVdownloaded".into(),
+                title: "已下载".into(),
+                cover: String::new(),
+                published_at: String::new(),
+                duration: 0,
+            },
+            "主播",
+            "https://space.bilibili.com/1",
+            "",
+        )
+        .await
+        .unwrap();
+        crate::db::mark_downloaded(&pool, "BVdownloaded", true)
+            .await
+            .unwrap();
+        let url_new = "https://www.bilibili.com/video/BVnew";
+        let url_dup = "https://www.bilibili.com/video/BVdup";
+        let summary = enqueue_downloads(
+            &pool,
+            &[
+                (
+                    "https://www.bilibili.com/video/BVdownloaded".to_string(),
+                    "主播".to_string(),
+                ),
+                (url_new.to_string(), "主播".to_string()),
+                (url_dup.to_string(), "主播".to_string()),
+                (url_dup.to_string(), "主播".to_string()),
+                (String::new(), "主播".to_string()),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(summary.requested, 5);
+        assert_eq!(summary.queued, 2, "新 URL 与重复 pending 只算一次入队");
+        assert_eq!(summary.duplicated, 1);
+        assert_eq!(summary.skipped_downloaded, 1);
+        assert_eq!(summary.errors, 1);
+        assert_eq!(summary.task_ids.len(), 2);
+        let tasks = crate::db::list_tasks(&pool, "pending", 10).await.unwrap();
+        assert_eq!(tasks.len(), 2);
         std::mem::forget(file);
     }
 

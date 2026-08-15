@@ -174,6 +174,7 @@ pub fn tools_list() -> Vec<Value> {
         json!({"name":"blogger_videos","description":"列出博主历史视频","inputSchema":{"type":"object","properties":{"url":{"type":"string"},"count":{"type":"number"}},"required":["url"]}}),
         json!({"name":"download_video","description":"下载视频到 downloads/短视频/","inputSchema":{"type":"object","properties":{"url":{"type":"string"},"name":{"type":"string"}},"required":["url"]}}),
         json!({"name":"video_download","description":"下载视频到 downloads/短视频/（Python 兼容别名）","inputSchema":{"type":"object","properties":{"url":{"type":"string"},"name":{"type":"string"}},"required":["url"]}}),
+        json!({"name":"download_videos","description":"批量下载多个视频（跳过已下载与空 URL）","inputSchema":{"type":"object","properties":{"items_json":{"type":"string"}},"required":["items_json"]}}),
         json!({"name":"video_library","description":"查询视频库","inputSchema":{"type":"object","properties":{"source_url":{"type":"string"},"downloaded_only":{"type":"boolean"}}}}),
         json!({"name":"status","description":"桌面端状态快照（含最近录制、复盘产物与目录）","inputSchema":{"type":"object","properties":{}}}),
         json!({"name":"export_training_data","description":"导出训练数据 JSONL","inputSchema":{"type":"object","properties":{"anchor":{"type":"string"},"output":{"type":"string"}}}}),
@@ -404,6 +405,26 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
                 "hint": "已加入 daemon 下载队列，下载完成后会自动标记已下载",
             }))?)
         }
+        "download_videos" => {
+            let items_json = args
+                .get("items_json")
+                .and_then(|v| v.as_str())
+                .unwrap_or("[]");
+            let parsed: Vec<serde_json::Value> = serde_json::from_str(items_json)?;
+            let items: Vec<(String, String)> = parsed
+                .iter()
+                .map(|v| {
+                    let url = v.get("url").and_then(|u| u.as_str()).unwrap_or_default();
+                    let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("手动下载");
+                    (url.to_string(), name.to_string())
+                })
+                .collect();
+            if !crate::service::rust_daemon_alive(project_dir) {
+                crate::service::ensure_core(project_dir)?;
+            }
+            let summary = crate::download::enqueue_downloads(pool, &items).await?;
+            Ok(serde_json::to_string(&summary)?)
+        }
         "video_library" => {
             let source = args
                 .get("source_url")
@@ -619,6 +640,7 @@ mod tests {
             "live_check",
             "video_add",
             "video_download",
+            "download_videos",
             "blogger_videos",
             "video_remove",
             "video_list",
