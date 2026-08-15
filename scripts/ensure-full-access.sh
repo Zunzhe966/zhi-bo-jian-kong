@@ -163,6 +163,25 @@ if isinstance(assignment_map, dict):
                 repair_thread(tid)
                 break
 
+# 桌面端还会把每个任务当前 cwd 记录在 thread-tab-routes-v1:<tid> 里，
+# 进程台账清空后这些路由记录仍保留项目归属，也一并扫描。
+for key, route in container.items():
+    if not key.startswith("thread-tab-routes-v1:"):
+        continue
+    tid = key[len("thread-tab-routes-v1:"):]
+    if not isinstance(route, dict):
+        continue
+    for route_entry in route.get("routes") or []:
+        if not isinstance(route_entry, dict):
+            continue
+        cwd = route_entry.get("params", {}).get("cwd") or ""
+        if not cwd:
+            continue
+        for root in candidate_roots:
+            if os.path.abspath(cwd).startswith(root):
+                repair_thread(tid)
+                break
+
 # host 级默认：新任务从“完全访问 + 永不审批”继承，避免只有当前任务被修好、
 # 下次新建任务又退回只读/按需批准。
 host_defaults = {
