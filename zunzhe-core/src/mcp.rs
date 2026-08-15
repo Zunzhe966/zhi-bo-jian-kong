@@ -371,9 +371,8 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
                 Box::new(platform::RssAdapter::new())
             };
             let videos = adapter.list_videos(&url, count).await?;
-            for v in &videos {
-                let _ = library.upsert_browse(v, &url).await;
-            }
+            // 与 CLI blogger-videos 共用同一批量入库路径，封面有界并发。
+            let _ = library.upsert_browse_many(&videos, &url).await;
             let persisted = library.list(&url, "", false).await?;
             Ok(serde_json::to_string(
                 &json!({"ok":true,"platform":adapter.name(),"count":persisted.len(),"videos":crate::video_library::videos_compat_json(&persisted)}),

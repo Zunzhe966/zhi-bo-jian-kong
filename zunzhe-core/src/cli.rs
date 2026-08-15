@@ -399,9 +399,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             };
             let videos = adapter.list_videos(&url, count).await?;
             let library = video_library::VideoLibrary::new(pool.clone(), fupan_dir.clone());
-            for v in &videos {
-                let _ = library.upsert_browse(v, &url).await;
-            }
+            // 批量浏览统一走有界并发入库：封面下载不串行，单张失败不阻塞
+            // 其余视频，历史列表几十上百条时也不会被慢封面拖住。
+            let _ = library.upsert_browse_many(&videos, &url).await;
             // 返回已入库的视频，让前端拿到封面缓存、日期、时长与已下载标记，
             // 而不是只有平台适配器返回的原始 VideoMeta。
             let persisted = library.list(&url, "", false).await?;

@@ -34,6 +34,37 @@ impl VideoLibrary {
         Ok(cover_cache)
     }
 
+    /// 浏览博主历史视频批量入库：封面下载有界并发，单张失败只保留原 URL，
+    /// 不阻塞其余视频；结果保持输入顺序，方便调用方直接拿回已入库记录。
+    pub async fn upsert_browse_many(&self, metas: &[VideoMeta], source_url: &str) -> Vec<String> {
+        if metas.is_empty() {
+            return Vec::new();
+        }
+        const MAX_CONCURRENT: usize = 6;
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT));
+        let mut tasks = Vec::with_capacity(metas.len());
+        for meta in metas {
+            let sem = sem.clone();
+            let fupan_dir = self.fupan_dir.clone();
+            let pool = self.pool.clone();
+            let source_url = source_url.to_string();
+            let meta = meta.clone();
+            tasks.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await;
+                let cover_cache = cache_cover(&fupan_dir, &meta.cover, &meta.id)
+                    .await
+                    .unwrap_or_else(|_| meta.cover.clone());
+                let _ = db::upsert_video_browse(&pool, &meta, &source_url, &cover_cache).await;
+                cover_cache
+            }));
+        }
+        let mut results = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            results.push(task.await.unwrap_or_default());
+        }
+        results
+    }
+
     #[allow(dead_code)] // 下载完成标记接口
     pub async fn mark_downloaded(&self, video_id: &str, downloaded: bool) -> Result<()> {
         db::mark_downloaded(&self.pool, video_id, downloaded).await
@@ -446,6 +477,50 @@ mod tests {
     async fn cover_cache_missing_url_returns_empty() {
         let dir = std::env::temp_dir();
         assert_eq!(cache_cover(&dir, "", "x").await.unwrap(), "");
+    }
+
+    #[tokio::test]
+    async fn browse_many_preserves_order_and_tolerates_cover_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "zunzhe-browse-many-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("fupan_output")).unwrap();
+        let file = root.join("main.db");
+        let pool = crate::db::open_pool(&file).await.unwrap();
+        crate::db::init_db(&pool).await.unwrap();
+        let library = VideoLibrary::new(pool.clone(), root.join("fupan_output"));
+
+        let metas: Vec<VideoMeta> = (0..8)
+            .map(|i| VideoMeta {
+                id: format!("id{i}"),
+                platform: "bilibili".to_string(),
+                url: format!("https://x.test/{i}"),
+                title: format!("视频 {i}"),
+                cover: format!("https://x.test/cover{i}.jpg"),
+                published_at: "2026-08-15".to_string(),
+                duration: 60,
+            })
+            .collect();
+        let results = library
+            .upsert_browse_many(&metas, "https://space.bilibili.com/1")
+            .await;
+        assert_eq!(results.len(), metas.len());
+        // 封面地址不可达时按原 URL 兜底，顺序与输入一致，入库仍成功。
+        assert_eq!(results[0], metas[0].cover);
+        assert_eq!(results[7], metas[7].cover);
+        let rows = library
+            .list("https://space.bilibili.com/1", "", false)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 8);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
