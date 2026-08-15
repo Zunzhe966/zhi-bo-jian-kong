@@ -353,7 +353,10 @@ async fn bilibili_browser_download(project_dir: &Path, url: &str, dir: &Path) ->
         .and_then(|v| v.as_str())
         .unwrap_or("bilibili");
     let title = clean_name(title);
-    let output_file = dir.join(format!("{title}.mp4"));
+    // 同一博主可能发布两个标题完全相同的视频；`ffmpeg -y` 会直接覆盖旧文件，
+    // 造成“下载成功但上一个文件永久丢失”。这里先探测已存在文件，给重复标题
+    // 追加 `_2/_3` 序号，确保每次下载都写到独立文件。
+    let output_file = unique_media_path(dir, &title, "mp4");
     let ffmpeg = find_ffmpeg(project_dir);
     let mut args = vec![
         "-y".to_string(),
@@ -446,6 +449,21 @@ fn clean_name(input: &str) -> String {
     } else {
         trimmed
     }
+}
+
+/// 返回一个不覆盖已有文件的媒体路径：`标题.mp4`，存在则依次探测
+/// `标题_2.mp4`、`标题_3.mp4`……探测本身不创建文件，两个并发下载同一标题
+/// 时仍可能同时选中同一路径，但下载 worker 同一时刻只会处理一个任务，
+/// 因此不会出现 worker 内部互踩；外部手动 ffmpeg 写入同名文件时由
+/// ffmpeg `-y` 兜底覆盖，比静默丢旧文件更接近用户预期。
+fn unique_media_path(dir: &Path, stem: &str, ext: &str) -> PathBuf {
+    let mut candidate = dir.join(format!("{stem}.{ext}"));
+    let mut index = 2u32;
+    while candidate.exists() {
+        candidate = dir.join(format!("{stem}_{index}.{ext}"));
+        index += 1;
+    }
+    candidate
 }
 
 /// 下载目录名必须是一个安全的单层目录名：继续复用 `clean_name` 的非法字符清洗，
@@ -850,6 +868,29 @@ mod tests {
         assert!(!is_bilibili("https://example.com/video"));
         assert_eq!(clean_name(" 主播/甲:测试? "), "主播_甲_测试");
         assert_eq!(clean_name("////"), "bilibili");
+    }
+
+    #[test]
+    fn unique_media_path_appends_index_for_existing_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-unique-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = unique_media_path(&dir, "标题", "mp4");
+        assert_eq!(first, dir.join("标题.mp4"), "无冲突时直接使用原始路径");
+        std::fs::write(&first, b"old").unwrap();
+        let second = unique_media_path(&dir, "标题", "mp4");
+        assert_eq!(second, dir.join("标题_2.mp4"), "已有标题.mp4 时应追加 _2");
+        std::fs::write(&second, b"new").unwrap();
+        let third = unique_media_path(&dir, "标题", "mp4");
+        assert_eq!(third, dir.join("标题_3.mp4"), "已有 _2 时应继续追加 _3");
+        assert!(first.exists() && second.exists(), "旧文件不能被覆盖删除");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
