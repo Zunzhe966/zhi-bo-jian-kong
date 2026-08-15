@@ -81,6 +81,14 @@ pub async fn run_daemon(
     if let Err(e) = crate::video_library::migrate_legacy_core_db(&pool, project_dir).await {
         warn!("旧核心 DB 迁移失败，继续调度: {e:#}");
     }
+    // 项目从旧桌面副本迁到当前根后，任务表可能仍记录旧绝对路径；启动时
+    // 立即改写一次，避免“已复盘/已下载”状态继续指向过期位置。幂等且失败
+    // 不阻断 daemon。
+    if let Ok(rewritten) = db::rewrite_legacy_task_paths(&pool, project_dir).await
+        && rewritten > 0
+    {
+        info!("启动时改写 {rewritten} 条指向旧桌面根的任务路径");
+    }
     let watch = Watchlist::new(project_dir.to_path_buf());
     let monitor = LiveMonitor::new(&pool, project_dir, config, &watch);
     // 硬崩溃/断电后，SQLite 仍会留着上一实例的 recording 会话。新实例没有旧
@@ -199,6 +207,11 @@ pub async fn run_daemon(
                         && removed > 0
                     {
                         info!("清理 {removed} 条不在直播源里的历史 anchors 记录");
+                    }
+                    if let Ok(rewritten) = db::rewrite_legacy_task_paths(&pool, project_dir).await
+                        && rewritten > 0
+                    {
+                        info!("改写 {rewritten} 条指向旧桌面根的任务路径");
                     }
                     // B站 Electron 协议临时文件：调度轮次不跑 Electron，但旧版本
                     // 或手动诊断可能留下 payload/stderr 残留；一并按“超 7 天删 +

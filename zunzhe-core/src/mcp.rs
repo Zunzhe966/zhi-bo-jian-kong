@@ -43,6 +43,11 @@ pub async fn run_mcp(pool: SqlitePool, project_dir: &Path, cfg: Arc<Config>) -> 
     if let Err(e) = crate::video_library::migrate_legacy_core_db(&pool, project_dir).await {
         error!("旧核心 DB 合并失败（MCP 继续运行）: {e:#}");
     }
+    if let Ok(rewritten) = db::rewrite_legacy_task_paths(&pool, project_dir).await
+        && rewritten > 0
+    {
+        tracing::info!("MCP 启动时改写 {rewritten} 条指向旧桌面根的任务路径");
+    }
     while let Ok(Some(line)) = reader.next_line().await {
         if line.trim().is_empty() {
             continue;

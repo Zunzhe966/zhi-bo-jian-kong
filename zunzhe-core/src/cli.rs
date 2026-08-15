@@ -223,6 +223,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     if let Err(e) = video_library::migrate_legacy_core_db(&pool, &project_dir).await {
         eprintln!("旧核心 DB 合并失败（不影响本次命令）: {e:#}");
     }
+    // 项目可能从旧桌面副本迁到当前根；每次 CLI 入口幂等改写旧任务路径，
+    // 避免历史 process 任务引用过期位置。
+    if let Ok(rewritten) = db::rewrite_legacy_task_paths(&pool, &project_dir).await
+        && rewritten > 0
+    {
+        eprintln!("已改写 {rewritten} 条指向旧桌面根的任务路径");
+    }
     let watch = watchlist::Watchlist::new(project_dir.clone());
     let api = config_api::ConfigApi::new(project_dir.clone());
 

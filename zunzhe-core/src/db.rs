@@ -226,6 +226,11 @@ pub async fn maintenance_if_due(project_dir: &Path, pool: &SqlitePool) -> anyhow
             {
                 tracing::info!("清理 {removed} 条不在直播源里的历史 anchors 记录");
             }
+            if let Ok(rewritten) = rewrite_legacy_task_paths(pool, project_dir).await
+                && rewritten > 0
+            {
+                tracing::info!("改写 {rewritten} 条指向旧桌面根的任务路径");
+            }
             touch_maintenance_marker(&run_dir)?;
             tracing::debug!("独立入口数据库维护完成");
         }
@@ -330,6 +335,52 @@ pub async fn maintenance(pool: &SqlitePool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 把任务表里指向旧桌面项目根的历史路径改写到当前项目根。
+///
+/// 项目从 `~/Desktop/尊者监控直播短视频` 迁到 `~/Projects/尊者监控直播短视频`
+/// 后，旧的 `process` 任务 URL 仍指向桌面副本；文件其实已经随项目一起移动，
+/// 继续引用旧根会让“已复盘/已下载”记录与实际位置漂移，手动重试也会打开
+/// 不存在或过期的路径。只改前缀，不删任务、不改状态。
+pub async fn rewrite_legacy_task_paths(
+    pool: &SqlitePool,
+    project_dir: &Path,
+) -> anyhow::Result<usize> {
+    let canonical = project_dir
+        .canonicalize()
+        .unwrap_or_else(|_| project_dir.to_path_buf());
+    let home = std::env::var("HOME").unwrap_or_default();
+    let legacy_root = std::path::Path::new(&home).join("Desktop/尊者监控直播短视频");
+    let Some(legacy_prefix) = legacy_root.to_str().map(String::from) else {
+        return Ok(0);
+    };
+    let rows = sqlx::query("SELECT id, url FROM tasks WHERE url LIKE ?")
+        .bind(format!("{legacy_prefix}%"))
+        .fetch_all(pool)
+        .await
+        .context("读取旧路径任务")?;
+    let mut changed = 0usize;
+    for row in rows {
+        let id: i64 = row.try_get("id")?;
+        let url: String = row.try_get("url")?;
+        let Some(rest) = url.strip_prefix(&legacy_prefix) else {
+            continue;
+        };
+        let new_url = canonical.join(rest.trim_start_matches('/'));
+        let new_url = new_url.to_string_lossy().to_string();
+        if new_url == url {
+            continue;
+        }
+        sqlx::query("UPDATE tasks SET url=?, updated_at=datetime('now','localtime') WHERE id=?")
+            .bind(&new_url)
+            .bind(id)
+            .execute(pool)
+            .await
+            .context("改写任务旧路径")?;
+        changed += 1;
+    }
+    Ok(changed)
+}
+
 /// 清理历史冗余的 anchors：`anchors` 表只用于兼容旧核心 DB 迁移展示，
 /// 直播监控的唯一权威是 `URL_config.ini`。旧库曾把视频空间地址也写入
 /// anchors（例如影视飓风 `space.bilibili.com/...`），这些记录不在直播源里，
@@ -399,6 +450,45 @@ mod maintenance_tests {
         let anchors = crate::db::list_anchors(&pool).await.unwrap();
         assert_eq!(anchors.len(), 1);
         assert_eq!(anchors[0].url, "https://live.bilibili.com/123");
+        std::mem::forget(db);
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[tokio::test]
+    async fn rewrite_legacy_task_paths_points_to_current_project() {
+        let project = std::env::temp_dir().join(format!(
+            "zunzhe-rewrite-path-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&project);
+        std::fs::create_dir_all(project.join("fupan_output").join("run")).unwrap();
+        let db = project.join("zunzhe-test.db");
+        let pool = open_pool(&db).await.unwrap();
+
+        let home = std::env::var("HOME").unwrap();
+        let legacy = format!("{home}/Desktop/尊者监控直播短视频/downloads/短视频/主播/视频.mp4");
+        crate::db::enqueue_task(&pool, "process", &legacy, "主播")
+            .await
+            .unwrap();
+
+        let changed = crate::db::rewrite_legacy_task_paths(&pool, &project)
+            .await
+            .unwrap();
+        assert_eq!(changed, 1);
+        let tasks = crate::db::list_tasks(&pool, "pending", 10).await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        let url = &tasks[0].url;
+        let canonical = project.canonicalize().unwrap();
+        assert!(
+            url.starts_with(canonical.to_str().unwrap())
+                && url.ends_with("downloads/短视频/主播/视频.mp4"),
+            "任务路径应改写为当前项目根: {url}"
+        );
+        assert!(!url.contains("Desktop/尊者监控直播短视频"));
         std::mem::forget(db);
         let _ = std::fs::remove_dir_all(&project);
     }
