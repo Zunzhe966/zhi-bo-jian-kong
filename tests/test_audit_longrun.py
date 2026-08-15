@@ -244,4 +244,20 @@ assert result["ok"] is False, result
 assert result["doctor_pid"] == 201, result
 assert result["pid_aligned"] is False, result
 
+# Windows 看门狗把 pid 写成字符串、doctor 返回整数；同实例的跨类型 pid
+# 必须归一化后判对齐，不能误报 pid_aligned=false。
+string_pid = tmp / "string-pid.log"
+line = audit_line(
+    60,
+    81364,
+    rss_kib=20000,
+    disk_free_mb=1024,
+)
+line = line.replace('"pid": 81364', '"pid": "81364"', 1)
+string_pid.write_text(line + "\n", encoding="utf-8")
+result = run_verify(string_pid, doctor_pid=81364)
+assert result["pid"] == 81364, result
+assert result["doctor_pid"] == 81364, result
+assert result["pid_aligned"] is True, result
+
 print("通过：audit-longrun --verify 未满/满30天/跨轮转30天/缺失/源冷却/历史坏行/最近坏行/pid切换/同pid断档/RSS增长/RSS正常波动/磁盘不足/磁盘充足场景判定正确")

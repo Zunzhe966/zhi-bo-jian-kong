@@ -69,15 +69,23 @@ if not records:
     print('{"ok":false,"error":"审计日志无可解析记录"}')
     sys.exit(0)
 
+def norm_pid(value):
+    """统一 pid 类型：Windows 看门狗写入字符串，doctor 返回整数，
+    跨平台验收必须把两者归一化成 int 再比较，否则同实例被判不对齐。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
 now = datetime.datetime.now().astimezone()
 last_ts, last = records[-1]
 last_age = (now - last_ts).total_seconds()
-pid = last.get("pid")
-same_pid = [r for r in records if r[1].get("pid") == pid and r[1].get("heartbeat_ok")]
+pid = norm_pid(last.get("pid"))
+same_pid = [r for r in records if norm_pid(r[1].get("pid")) == pid and r[1].get("heartbeat_ok")]
 first_ts = same_pid[0][0] if same_pid else None
 running_secs = (last_ts - first_ts).total_seconds() if first_ts else 0
 target_secs = 24 * 3600 * 30
-same_pid_records = [r for r in records if r[1].get("pid") == pid and r[1].get("heartbeat_ok")]
+same_pid_records = [r for r in records if norm_pid(r[1].get("pid")) == pid and r[1].get("heartbeat_ok")]
 # 断档判定只看同一 pid 的连续心跳：不同 pid 之间的时间间隔是版本热切换/
 # 正常重启，不代表当前 daemon 断档；同一 pid 相邻记录间隔超过 180 秒才判
 # 断档，避免历史日志永久卡住 24×30 验收。
@@ -144,7 +152,7 @@ else:
 duration_ok = running_secs >= target_secs or uptime_secs >= target_secs
 # 当前 daemon 是验收对象：审计日志 pid 与 doctor pid 不一致时，说明最近
 # 发生过热切换/重启，不能拿旧 pid 的累计时长当“当前实例已跑满 24×30”。
-pid_aligned = not doctor_pid or pid == doctor_pid
+pid_aligned = not doctor_pid or pid == norm_pid(doctor_pid)
 if not pid_aligned:
     duration_ok = False
 ok = bool(pid) and duration_ok and gap_ok and recent_ok and source_ok and notify_ok and rss_ok and disk_ok
