@@ -611,6 +611,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn browse_cache_matches_source_url_normally() {
+        let root = std::env::temp_dir().join(format!(
+            "zunzhe-browse-normalize-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("fupan_output")).unwrap();
+        let file = root.join("main.db");
+        let pool = crate::db::open_pool(&file).await.unwrap();
+        crate::db::init_db(&pool).await.unwrap();
+        let library = VideoLibrary::new(pool.clone(), root.join("fupan_output"));
+        let stored = "https://space.bilibili.com/946974";
+        let meta = VideoMeta {
+            id: "BV2".into(),
+            platform: "bilibili".into(),
+            url: "https://www.bilibili.com/video/BV2".into(),
+            title: "缓存视频".into(),
+            cover: String::new(),
+            published_at: "2026-08-15".into(),
+            duration: 60,
+        };
+        library.upsert_browse(&meta, stored).await.unwrap();
+
+        // 尾部斜杠、大小写变化都不应影响缓存回退命中。
+        for input in [
+            "https://space.bilibili.com/946974/",
+            "HTTPS://SPACE.BILIBILI.COM/946974",
+            "https://space.bilibili.com/946974//",
+        ] {
+            let outcome = browse_with_fallback(&library, Err(anyhow::anyhow!("平台失败")), input)
+                .await
+                .unwrap();
+            assert!(outcome.from_cache, "输入 {input} 应命中缓存");
+            assert_eq!(outcome.videos.len(), 1);
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
     async fn legacy_video_migration_is_idempotent_and_does_not_overwrite() {
         let root = std::env::temp_dir().join(format!("zunzhe-legacy-video-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);

@@ -1395,7 +1395,10 @@ pub async fn get_videos(
          FROM videos WHERE 1=1",
     );
     if !source_url.is_empty() {
-        sql.push_str(" AND source_url = ?");
+        // 用户输入可能带尾部斜杠或大小写差异，和监控列表保存的 source_url
+        // 不一定逐字节相同；统一按“去尾部斜杠 + 大小写不敏感”匹配，保证
+        // 平台失败时本地缓存回退不会因为 URL 写法不同而查不到。
+        sql.push_str(" AND LOWER(TRIM(source_url, '/')) = LOWER(TRIM(?, '/'))");
     }
     if !anchor.is_empty() {
         sql.push_str(" AND anchor = ?");
