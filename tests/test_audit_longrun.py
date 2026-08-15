@@ -62,8 +62,20 @@ log.write_text(
 result = run_verify(log)
 assert result["ok"] is False, result
 assert result["pid"] == 123, result
-assert result["running_secs"] < 24 * 30 * 60, result
+assert result["running_secs"] < 24 * 3600 * 30, result
 assert result["gap_ok"] is True, result
+
+# 24×30 是“24 小时 × 30 天”，目标时长必须是 2,592,000 秒，而不是 43200 秒
+# （后者只是 12 小时）。跑满 30 天且健康时 --verify 必须判成功。
+full_30d = tmp / "full-30d.log"
+with full_30d.open("w", encoding="utf-8") as f:
+    # 真实 30 天每分钟一条心跳：首条在 30 天前，末条 60 秒前，共 43201 条。
+    for i in range(24 * 60 * 30 + 1):
+        f.write(audit_line(24 * 3600 * 30 - i * 60, 123) + "\n")
+result = run_verify(full_30d)
+assert result["ok"] is True, result
+assert result["target_secs"] == 24 * 3600 * 30, result
+assert result["running_secs"] >= 24 * 3600 * 30, result
 
 # 审计日志缺失：返回 ok=false 而不是崩溃。
 missing = run_verify(tmp / "missing.log")
@@ -139,4 +151,4 @@ same_pid_gap.write_text(
 result = run_verify(same_pid_gap)
 assert result["gap_ok"] is False, result
 
-print("通过：audit-longrun --verify 未满/缺失/源冷却/历史坏行/最近坏行/pid切换/同pid断档场景判定正确")
+print("通过：audit-longrun --verify 未满/满30天/缺失/源冷却/历史坏行/最近坏行/pid切换/同pid断档场景判定正确")
