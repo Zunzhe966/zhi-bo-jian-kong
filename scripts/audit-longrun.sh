@@ -68,9 +68,13 @@ same_pid = [r for r in records if r[1].get("pid") == pid and r[1].get("heartbeat
 first_ts = same_pid[0][0] if same_pid else None
 running_secs = (last_ts - first_ts).total_seconds() if first_ts else 0
 target_secs = 24 * 30 * 60
+same_pid_records = [r for r in records if r[1].get("pid") == pid and r[1].get("heartbeat_ok")]
+# 断档判定只看同一 pid 的连续心跳：不同 pid 之间的时间间隔是版本热切换/
+# 正常重启，不代表当前 daemon 断档；同一 pid 相邻记录间隔超过 180 秒才判
+# 断档，避免历史日志永久卡住 24×30 验收。
 gap_ok = all(
-    (records[i][0] - records[i - 1][0]).total_seconds() <= 180
-    for i in range(1, len(records))
+    (same_pid_records[i][0] - same_pid_records[i - 1][0]).total_seconds() <= 180
+    for i in range(1, len(same_pid_records))
 )
 recent_ok = last_age <= 300 and bool(last.get("heartbeat_ok")) and bool(last.get("health"))
 # 源/通知健康按“最近 30 分钟 + 最新快照”判定，而不是全历史累加：

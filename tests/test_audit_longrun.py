@@ -112,4 +112,31 @@ recent_notify_bad.write_text(
 result = run_verify(recent_notify_bad)
 assert result["notify_ok"] is False, result
 
-print("通过：audit-longrun --verify 未满/缺失/源冷却/历史坏行/最近坏行场景判定正确")
+# 不同 pid 之间的间隔（正常热切换）不应让 gap_ok 永久失败；同一 pid 的
+# 相邻记录超过 180 秒仍必须判断档。
+pid_switch = tmp / "pid-switch.log"
+pid_switch.write_text(
+    audit_line(6000, 100, notify_ok=True)
+    + "\n"
+    + audit_line(120, 101, notify_ok=True)
+    + "\n"
+    + audit_line(60, 101, notify_ok=True)
+    + "\n",
+    encoding="utf-8",
+)
+result = run_verify(pid_switch)
+assert result["gap_ok"] is True, result
+assert result["pid"] == 101, result
+
+same_pid_gap = tmp / "same-pid-gap.log"
+same_pid_gap.write_text(
+    audit_line(400, 102, notify_ok=True)
+    + "\n"
+    + audit_line(60, 102, notify_ok=True)
+    + "\n",
+    encoding="utf-8",
+)
+result = run_verify(same_pid_gap)
+assert result["gap_ok"] is False, result
+
+print("通过：audit-longrun --verify 未满/缺失/源冷却/历史坏行/最近坏行/pid切换/同pid断档场景判定正确")
