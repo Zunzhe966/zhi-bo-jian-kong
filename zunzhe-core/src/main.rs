@@ -10,6 +10,12 @@ async fn main() -> anyhow::Result<()> {
         let default_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             eprintln!("[zunzhe-core] panic: {info}");
+            // 桌面端读 stdout 的 JSON 契约；panic 时也输出中文错误，
+            // 避免用户看到 Rust 默认的英文崩溃信息。
+            println!(
+                "{}",
+                serde_json::json!({"ok": false, "error": "操作失败：后台程序处理内容时出错，请重试"})
+            );
             default_hook(info);
         }));
         let _ = tracing_subscriber::fmt()

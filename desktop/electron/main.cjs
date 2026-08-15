@@ -201,6 +201,25 @@ function runCli(args) {
   })
 }
 
+// 把后端/Electron 的错误翻译成中文。用户看到的是桌面界面，不是开发者终端；
+// 原始错误只写日志，便于排查，不直接弹给用户。
+function friendlyCliError(err, cmd) {
+  const raw = String((err && err.message) || err || '')
+  if (/panicked at|byte index is not a char boundary|RUST_BACKTRACE/.test(raw)) {
+    return '操作失败：后台程序处理中文内容时出错，请重试。如果仍然失败，请查看日志。'
+  }
+  if (raw.includes('命令超时')) return '后台处理超时，请稍后重试。'
+  if (raw.includes('无法启动后端')) return '无法启动后台服务，请检查安装或项目文件。'
+  if (raw.includes('找不到 Rust 核心')) return raw
+  if (/Error invoking remote method/.test(raw)) {
+    return friendlyCliError({ message: raw.replace(/^Error invoking remote method 'cli':\s*/, '') }, cmd)
+  }
+  console.error(`[尊者直播监控] cli 失败 ${cmd}:`, raw)
+  if (!raw) return '操作失败：后台服务未返回结果，请重试。'
+  if (raw.startsWith('操作') || /[\u4e00-\u9fff]/.test(raw)) return raw
+  return '操作失败：后台服务未返回预期结果，请重试。'
+}
+
 // 桌面端界面每 30 秒调一次 status，而 status 会递归扫描 downloads /
 // fupan_output。CLI 每次都是新进程，Rust 进程内缓存帮不上忙；这里在主进程
 // 按 60 秒复用完整快照，界面轮询最多每两次共享一次全量扫描，录制/复盘
@@ -398,9 +417,15 @@ app.whenReady().then(async () => {
   await applyStartupPrefs()
   startBackgroundTasks()
   ipcMain.handle('cli', (_, cmd, ...args) => {
-    if (cmd === 'status') return runStatusCached()
-    if (STATUS_INVALIDATING_COMMANDS.has(cmd)) invalidateStatusCache()
-    return runCli([cmd, ...args])
+    const task = cmd === 'status'
+      ? runStatusCached()
+      : (() => {
+          if (STATUS_INVALIDATING_COMMANDS.has(cmd)) invalidateStatusCache()
+          return runCli([cmd, ...args])
+        })()
+    return task.catch((e) => {
+      throw new Error(friendlyCliError(e, cmd))
+    })
   })
   ipcMain.handle('reload-ui', () => reloadUiWindow())
   ipcMain.handle('set-login-item', async (_, enabled) => {

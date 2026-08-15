@@ -148,15 +148,13 @@ impl Watchlist {
         let original_len = before.len();
         let after: Vec<String> = before
             .into_iter()
-            .filter(|old| {
-                parse_live_line(old).url.trim_end_matches('/') != url.trim_end_matches('/')
-            })
+            .filter(|old| !same_url(&parse_live_line(old).url, url))
             .collect();
         if after.len() == original_len {
             return Ok(false);
         }
         write_lines(&self.url_config(), &after)?;
-        self.delete_pref(url);
+        self.delete_pref(url.trim());
         Ok(true)
     }
 
@@ -215,14 +213,14 @@ impl Watchlist {
         let before = read_lines(&self.video_config());
         let after: Vec<String> = before
             .iter()
-            .filter(|old| parse_video_line(old).url != url.trim())
+            .filter(|old| !same_video_url(&parse_video_line(old).url, url))
             .cloned()
             .collect();
         if after.len() == before.len() {
             return Ok(false);
         }
         write_lines(&self.video_config(), &after)?;
-        self.delete_pref(url);
+        self.delete_pref(url.trim());
         Ok(true)
     }
 
@@ -418,8 +416,14 @@ fn parse_video_line(line: &str) -> VideoSource {
 }
 
 fn split_first_video_field(line: &str) -> (String, &str) {
+    // 用字符边界而不是“字节下标 + 1”切片：中文全角逗号占 3 字节，
+    // 之前删除含中文逗号的博主名时会在 UTF-8 中间切出 panic。
     match line.find([',', '，']) {
-        Some(idx) => (line[..idx].trim().to_string(), &line[idx + 1..]),
+        Some(idx) => {
+            let (head, tail) = line.split_at(idx);
+            let rest = tail.get(1..).unwrap_or("");
+            (head.trim().to_string(), rest)
+        }
         None => (line.trim().to_string(), ""),
     }
 }
@@ -429,6 +433,19 @@ fn split_video_rest(rest: &str) -> Vec<String> {
         .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty())
         .collect()
+}
+
+/// 两个 URL 是否属于同一个监控源：忽略大小写和末尾斜杠。
+fn same_url(a: &str, b: &str) -> bool {
+    let a = a.trim().trim_end_matches('/');
+    let b = b.trim().trim_end_matches('/');
+    a.eq_ignore_ascii_case(b)
+}
+
+/// 视频源 URL 匹配：视频列表可能带查询参数/结尾斜杠差异，删除时统一按
+/// “同源”判断，避免界面传回带尾斜杠或大小写不同的地址时误删失败。
+fn same_video_url(a: &str, b: &str) -> bool {
+    same_url(a, b)
 }
 
 fn format_live_line(url: &str, remark: &str, quality: &str) -> String {
@@ -536,6 +553,38 @@ mod tests {
         assert_eq!(fullwidth.url, "https://space.bilibili.com/3");
         assert_eq!(fullwidth.name, "博主，老师");
         assert_eq!(fullwidth.download, Some(false));
+    }
+
+    #[test]
+    fn fullwidth_comma_split_never_panics_on_utf8_boundary() {
+        // 回归：删除/解析含中文逗号的博主名时曾用字节下标 +1 切片，
+        // 全角逗号占 3 字节导致 panic；现在必须安全切在字符边界。
+        let item = parse_video_line("https://space.bilibili.com/1,测试,老师,下载=是");
+        assert_eq!(item.url, "https://space.bilibili.com/1");
+        assert_eq!(item.name, "测试，老师");
+        assert_eq!(item.download, Some(true));
+
+        let fullwidth = parse_video_line("https://space.bilibili.com/1,博主，老师，下载=否");
+        assert_eq!(fullwidth.url, "https://space.bilibili.com/1");
+        assert_eq!(fullwidth.name, "博主，老师");
+        assert_eq!(fullwidth.download, Some(false));
+    }
+
+    #[test]
+    fn remove_video_tolerates_trailing_slash_and_case() {
+        let dir = temp_project("remove-video-tolerance");
+        fs::write(
+            dir.join("config").join("视频监控列表.ini"),
+            "https://space.bilibili.com/1,测试,老师,下载=是\n",
+        )
+        .unwrap();
+        let w = super::Watchlist::new(dir.clone());
+        assert!(
+            w.remove_video("HTTPS://SPACE.BILIBILI.COM/1/").unwrap(),
+            "带尾斜杠/大小写的同源地址也应能删除"
+        );
+        assert_eq!(w.list_video().len(), 0, "删除后列表应为空");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
