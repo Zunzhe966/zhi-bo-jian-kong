@@ -511,6 +511,55 @@ pub async fn cache_cover(fupan_dir: &Path, cover_url: &str, video_id: &str) -> R
     }
 }
 
+/// 清理不再被视频库引用的封面缓存文件。
+///
+/// `fupan_output/covers` 由 `cache_cover` 按视频 id 落盘，历史浏览/接口失败
+/// 可能留下 DB 已不引用的孤儿文件；24×30 长跑中不清理会持续占用磁盘。
+/// 只删除 `videos.cover_cache` 中不存在的 `*.jpg/*.png`，已下载/已入库存档
+/// 的封面全部保留，避免破坏“已下载”事实与历史列表。
+pub async fn maintain_orphan_covers(
+    pool: &sqlx::SqlitePool,
+    fupan_dir: &Path,
+) -> anyhow::Result<usize> {
+    use std::collections::HashSet;
+
+    let rows: Vec<String> =
+        sqlx::query_scalar("SELECT cover_cache FROM videos WHERE cover_cache != ''")
+            .fetch_all(pool)
+            .await
+            .context("读取视频封面引用")?;
+    let referenced: HashSet<String> = rows
+        .iter()
+        .filter_map(|path| std::path::Path::new(path).file_name())
+        .filter_map(|name| name.to_str())
+        .map(|s| s.to_string())
+        .collect();
+    let covers = fupan_dir.join("covers");
+    let Ok(entries) = std::fs::read_dir(&covers) else {
+        return Ok(0);
+    };
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_image = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("jpg") || e.eq_ignore_ascii_case("png"));
+        if !is_image {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if !referenced.contains(&name) && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,6 +568,47 @@ mod tests {
     async fn cover_cache_missing_url_returns_empty() {
         let dir = std::env::temp_dir();
         assert_eq!(cache_cover(&dir, "", "x").await.unwrap(), "");
+    }
+
+    #[tokio::test]
+    async fn orphan_covers_are_removed_but_referenced_ones_survive() {
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-covers-maintain-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let covers = dir.join("covers");
+        std::fs::create_dir_all(&covers).unwrap();
+        std::fs::write(covers.join("keep.jpg"), b"keep").unwrap();
+        std::fs::write(covers.join("orphan.jpg"), b"orphan").unwrap();
+        std::fs::write(covers.join("orphan.png"), b"orphan").unwrap();
+        std::fs::write(covers.join("notes.txt"), b"keep").unwrap();
+
+        let file = dir.join("test.db");
+        let pool = crate::db::open_pool(&file).await.unwrap();
+        sqlx::query("INSERT INTO videos (id, url, title, cover_cache) VALUES (?, ?, ?, ?)")
+            .bind("keep-video")
+            .bind("https://x.test/v")
+            .bind("标题")
+            .bind(covers.join("keep.jpg").display().to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let removed = maintain_orphan_covers(&pool, &dir).await.unwrap();
+        assert_eq!(removed, 2);
+        assert!(covers.join("keep.jpg").exists(), "被引用封面必须保留");
+        assert!(!covers.join("orphan.jpg").exists());
+        assert!(!covers.join("orphan.png").exists());
+        assert!(covers.join("notes.txt").exists(), "非图片文件不得删除");
+
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_file(file.with_extension("db-shm"));
+        let _ = std::fs::remove_file(file.with_extension("db-wal"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

@@ -257,6 +257,14 @@ pub async fn run_daemon(
                     // 或手动诊断可能留下 payload/stderr 残留；一并按“超 7 天删 +
                     // 每类保留 10 个”清理，避免 run 目录无限增长。
                     maintain_run_dir_cleanup(&fupan_dir);
+                    // 封面缓存孤儿文件：历史浏览/接口失败可能留下 DB 不再引用
+                    // 的图片，维护时一并清理，避免 24×30 长跑磁盘无限膨胀。
+                    if let Ok(removed) =
+                        crate::video_library::maintain_orphan_covers(&pool, &fupan_dir).await
+                        && removed > 0
+                    {
+                        info!("清理 {removed} 个孤儿封面缓存文件");
+                    }
                     // 持久化维护哨兵：CLI/MCP 的 maintenance_if_due 与 daemon 主
                     // 循环共用同一哨兵；只更新内存计时的话，重启后又读到旧哨兵，
                     // 会重复执行维护，也无法证明“维护已完成”。
