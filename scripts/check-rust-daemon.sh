@@ -45,6 +45,7 @@ rotate_if_large() {
   fi
 }
 rotate_if_large "$LOG"
+rotate_if_large "$AUDIT_LOG"
 
 now="$(date '+%Y-%m-%d %H:%M:%S %z')"
 pid="$(cat "$ROOT/fupan_output/run/zunzhe-core.pid" 2>/dev/null || true)"
@@ -97,7 +98,7 @@ print(json.dumps({
     "notify_hint": nh.get("hint"),
     "notify_ok": bool(nh.get("ok", True)),
     "disk_free_mb": d.get("disk_free_mb"),
-}, ensure_ascii=False))' >> "$AUDIT_LOG" 2>/dev/null || echo "$now audit_unparseable" >> "$AUDIT_LOG"
+}, ensure_ascii=False))' 2>/dev/null | sed "s/^/$now /" >> "$AUDIT_LOG" 2>/dev/null || echo "$now audit_unparseable" >> "$AUDIT_LOG"
 
 if [ "$daemon_ok" = "false" ] || [ "$heartbeat_ok" = "false" ]; then
   echo "$now daemon unhealthy, calling ensure-services" >> "$LOG"
