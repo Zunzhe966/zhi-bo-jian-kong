@@ -804,6 +804,16 @@ fn is_plausible_bvid(text: &str) -> bool {
 /// `code != 0`、缺 `data.list.vlist` 或数组中无 BV 都视为“没有可用结果”，
 /// 由上层继续 RSSHub/yt-dlp 兜底，不把风控/空响应伪装成成功。
 fn parse_official_upload_response(data: &serde_json::Value, count: u32) -> Vec<VideoMeta> {
+    parse_official_upload_response_in_offset(data, count, *chrono::Local::now().offset())
+}
+
+/// 与 `parse_official_upload_response` 同语义，但日期按显式时区转换；
+/// 生产用本机时区，测试用固定偏移，避免结果随宿主机时区漂移。
+fn parse_official_upload_response_in_offset(
+    data: &serde_json::Value,
+    count: u32,
+    offset: chrono::FixedOffset,
+) -> Vec<VideoMeta> {
     if data.get("code").and_then(|c| c.as_i64()) != Some(0) {
         return Vec::new();
     }
@@ -829,7 +839,7 @@ fn parse_official_upload_response(data: &serde_json::Value, count: u32) -> Vec<V
                     .unwrap_or("")
                     .replace("http://", "https://"),
                 published_at: if ts > 0 {
-                    unix_to_date(ts)
+                    unix_to_date_in_offset(ts, offset)
                 } else {
                     String::new()
                 },
@@ -858,9 +868,18 @@ pub fn extract_bvids(text: &str) -> Vec<String> {
 }
 
 fn unix_to_date(ts: i64) -> String {
+    let offset = *chrono::Local::now().offset();
+    unix_to_date_in_offset(ts, offset)
+}
+
+/// 按显式时区把 Unix 时间戳转成 `YYYY-MM-DD`。
+///
+/// 生产语义沿用旧 Python `time.localtime`（本机时区）；单测用固定偏移，
+/// 避免测试结果随 CI/容器默认时区漂移。
+fn unix_to_date_in_offset(ts: i64, offset: chrono::FixedOffset) -> String {
     chrono::DateTime::from_timestamp(ts, 0)
         .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).unwrap_or_default())
-        .with_timezone(&chrono::Local)
+        .with_timezone(&offset)
         .format("%Y-%m-%d")
         .to_string()
 }
@@ -1231,7 +1250,11 @@ mod tests {
 
     #[test]
     fn unix_ts_converts_date() {
-        assert_eq!(unix_to_date(1786464000), "2026-08-12");
+        let east8 = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+        assert_eq!(unix_to_date_in_offset(1786464000, east8), "2026-08-12");
+        // 同一时刻在 UTC 是前一天，证明函数真的按传入时区而不是宿主机默认。
+        let utc = chrono::FixedOffset::east_opt(0).unwrap();
+        assert_eq!(unix_to_date_in_offset(1786464000, utc), "2026-08-11");
     }
 
     #[test]
@@ -1289,7 +1312,8 @@ mod tests {
                 {"title": "无 bvid 的行应被忽略"}
             ]}}
         });
-        let parsed = parse_official_upload_response(&ok, 10);
+        let east8 = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+        let parsed = parse_official_upload_response_in_offset(&ok, 10, east8);
         assert_eq!(parsed.len(), 2, "应忽略无 bvid 的行");
         assert_eq!(parsed[0].id, "BV1xx411c7mD");
         assert_eq!(parsed[0].title, "标题甲");

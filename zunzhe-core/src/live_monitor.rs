@@ -1002,7 +1002,16 @@ fn find_latest_segment(output_template: &str) -> Option<String> {
                 .unwrap_or(false)
         })
         .collect();
-    candidates.sort_by_key(|p| p.metadata().and_then(|m| m.modified()).ok());
+    // 修改时间可能因文件系统精度相同；用 mtime 主键、文件名序号稳定排序，
+    // 避免同批次分段在 Linux 等平台上随机选到旧文件。
+    candidates.sort_by(|a, b| {
+        let time = a
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .cmp(&b.metadata().and_then(|m| m.modified()).ok());
+        time.then_with(|| a.file_name().cmp(&b.file_name()))
+    });
     candidates.last().map(|p| p.display().to_string())
 }
 
