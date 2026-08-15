@@ -63,16 +63,21 @@ pub fn health_audit(project_dir: &Path) -> HealthAudit {
         .lines()
         .filter(|line| line.contains("rust_daemon=true") || line.contains("heartbeat_ok=true"))
         .count();
-    let started_at = text
-        .lines()
-        .find(|line| line.contains(" started "))
-        .map(|line| {
-            line.split(" started")
-                .next()
-                .map(str::trim)
-                .unwrap_or_default()
-                .to_string()
-        });
+    // 合并读取后当前文件可能保留上一实例的 started 行；started_at 必须只取
+    // “当前 pid”的启动行，否则重启后 health_audit 会报告旧实例的启动时间。
+    let started_at = if let Some(pid) = pid {
+        text.lines()
+            .find(|line| line.contains(" started ") && line.contains(&format!("pid={pid}")))
+            .map(|line| {
+                line.split(" started")
+                    .next()
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .to_string()
+            })
+    } else {
+        None
+    };
     let last_log_line_at = text.lines().rev().find_map(|line| {
         let mut parts = line.splitn(3, ' ');
         let date = parts.next()?;
@@ -1564,6 +1569,51 @@ mod tests {
         assert_eq!(audit.heartbeat_lines, 0);
         assert!(audit.started_at.is_none());
         assert!(audit.last_log_line_at.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn health_audit_started_at_only_matches_current_pid() {
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-health-started-pid-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        std::fs::create_dir_all(dir.join("fupan_output").join("run")).unwrap();
+
+        // 合并读取后日志里既有旧实例的 started 行，也有当前实例的启动行；
+        // started_at 必须指向当前 pid，而不是被历史行带偏。
+        write_rust_daemon_pid(&dir, 424242);
+        touch_heartbeat(&dir);
+        let old_start = chrono::Local::now() - chrono::Duration::days(20);
+        let new_start = chrono::Local::now() - chrono::Duration::seconds(60);
+        std::fs::write(
+            dir.join("logs").join("zunzhe-core.uptime.log"),
+            format!(
+                "{} started pid=111\n{} started pid=424242\n{} pid=424242 rust_daemon=true heartbeat_ok=true\n",
+                old_start.format("%Y-%m-%d %H:%M:%S %z"),
+                new_start.format("%Y-%m-%d %H:%M:%S %z"),
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S %z")
+            ),
+        )
+        .unwrap();
+
+        let audit = health_audit(&dir);
+        let started_at = audit.started_at.expect("当前 pid 的 started 行应存在");
+        assert!(
+            !started_at.starts_with(&old_start.format("%Y-%m-%d").to_string()),
+            "started_at 不应指向旧实例: {started_at}"
+        );
+        assert!(
+            started_at.starts_with(&new_start.format("%Y-%m-%d").to_string()),
+            "started_at 应指向当前实例: {started_at}"
+        );
+        assert!(audit.uptime_secs < 24 * 3600, "uptime 应基于当前实例");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
