@@ -939,6 +939,37 @@ pub async fn source_failure_state(
     Ok((fails.clamp(0, i64::from(u32::MAX)) as u32, ts))
 }
 
+/// 所有视频监控源的健康摘要。
+///
+/// 24×30 验收不只要求 daemon 进程活着，还要求监控源本身稳定：平台风控或
+/// 网络故障会造成源连续失败，进入冷却后该博主的新视频会静默不通知/不下载。
+/// `doctor` 与长跑审计据此把“存在连续失败源”当成健康风险，而不是只报
+/// 进程/心跳。返回 `(总数, 连续失败数, 冷却中数)`；无记录视为全部健康。
+pub async fn source_health_summary(pool: &SqlitePool) -> anyhow::Result<(u64, u64, u64)> {
+    let total: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM monitor_baseline WHERE source_url <> ''")
+            .fetch_one(pool)
+            .await
+            .context("统计监控源总数")?;
+    let failing: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM monitor_baseline WHERE consecutive_fails > 0 AND source_url <> ''",
+    )
+    .fetch_one(pool)
+    .await
+    .context("统计监控源连续失败数")?;
+    let cooling: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM monitor_baseline WHERE consecutive_fails >= 3 AND source_url <> ''",
+    )
+    .fetch_one(pool)
+    .await
+    .context("统计监控源冷却数")?;
+    Ok((
+        total.max(0) as u64,
+        failing.max(0) as u64,
+        cooling.max(0) as u64,
+    ))
+}
+
 /// 把 SQLite `YYYY-MM-DD HH:MM:SS` 本地时间解析成 Unix 秒。
 fn parse_local_datetime(text: &str) -> Option<i64> {
     chrono::NaiveDateTime::parse_from_str(text.trim(), "%Y-%m-%d %H:%M:%S")
@@ -2414,6 +2445,28 @@ mod tests {
             source_failure_state(&pool, url).await.unwrap(),
             (0, 0),
             "成功后失败计数与时间都应清零"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_health_summary_counts_failing_and_cooling() {
+        let pool = test_pool().await;
+        assert_eq!(source_health_summary(&pool).await.unwrap(), (0, 0, 0));
+
+        let ok_url = "https://rss.example.com/ok";
+        let fail_url = "https://rss.example.com/fail";
+        let cooling_url = "https://rss.example.com/cooling";
+        mark_source_baselined(&pool, ok_url).await.unwrap();
+        for _ in 0..2 {
+            bump_source_failures(&pool, fail_url).await.unwrap();
+        }
+        for _ in 0..4 {
+            bump_source_failures(&pool, cooling_url).await.unwrap();
+        }
+        assert_eq!(
+            source_health_summary(&pool).await.unwrap(),
+            (3, 2, 1),
+            "应分别统计总源数、连续失败源数、冷却中源数"
         );
     }
 

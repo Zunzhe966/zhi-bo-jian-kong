@@ -33,6 +33,9 @@ def audit_line(seconds_ago: int, pid: int, health: bool = True) -> str:
             "daemon_ok": health,
             "heartbeat_ok": health,
             "pid": pid,
+            "source_ok": True,
+            "source_cooling": 0,
+            "source_failing": 0,
         },
         ensure_ascii=False,
     )
@@ -56,4 +59,21 @@ assert result["gap_ok"] is True, result
 missing = run_verify(tmp / "missing.log")
 assert missing["ok"] is False and "error" in missing, missing
 
-print("通过：audit-longrun --verify 未满/缺失场景判定正确")
+# 源进入冷却（source_ok=false）时，即使 pid/心跳/断档都正常，也不能判验收通过。
+source_bad = tmp / "source-bad.log"
+source_bad.write_text(
+    audit_line(120, 123) + "\n" + audit_line(60, 123) + "\n",
+    encoding="utf-8",
+)
+source_bad.write_text(
+    source_bad.read_text(encoding="utf-8").replace(
+        '"source_ok": true', '"source_ok": false', 1
+    ),
+    encoding="utf-8",
+)
+result = run_verify(source_bad)
+assert result["ok"] is False, result
+assert result["source_ok"] is False, result
+assert result["source_cooling"] == 0, result
+
+print("通过：audit-longrun --verify 未满/缺失/源冷却场景判定正确")

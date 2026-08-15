@@ -732,10 +732,25 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             println!("{}", serde_json::to_string(&result)?);
         }
         Command::Doctor => {
-            println!(
-                "{}",
-                serde_json::to_string(&crate::service::diagnostics(&project_dir)?)?
-            );
+            let mut diag = crate::service::diagnostics(&project_dir)?;
+            // 24×30 验收不仅要看进程/心跳，还要看监控源是否持续失败。
+            // 源进入冷却后，该博主的新视频会静默不通知/不下载；把源健康
+            // 摘要放进 doctor，桌面端/审计脚本才能一眼看到平台风控造成的
+            // “假健康”。读取失败只记字段为未知，不让 doctor 本身失败。
+            if let Ok((total, failing, cooling)) = db::source_health_summary(&pool).await
+                && let Some(obj) = diag.as_object_mut()
+            {
+                obj.insert(
+                    "source_health".to_string(),
+                    json!({
+                        "total": total,
+                        "failing": failing,
+                        "cooling": cooling,
+                        "ok": cooling == 0,
+                    }),
+                );
+            }
+            println!("{}", serde_json::to_string(&diag)?);
         }
     }
     Ok(())

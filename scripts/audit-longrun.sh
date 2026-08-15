@@ -73,6 +73,9 @@ gap_ok = all(
     for i in range(1, len(records))
 )
 recent_ok = last_age <= 300 and bool(last.get("heartbeat_ok")) and bool(last.get("health"))
+# 源健康字段只在最新 doctor/审计脚本写入后才存在；旧审计行缺字段视为健康，
+# 只有明确记录 source_ok=false（源进入冷却）才判定不满足 24×30 验收。
+source_ok = all(rec.get("source_ok", True) for _, rec in records)
 uptime_secs = 0
 try:
     diag = json.loads(subprocess.check_output(
@@ -85,7 +88,7 @@ except Exception:
 # 审计日志会按 5MB 轮转，首条可能不在当前文件里；daemon 自报 uptime 是
 # 同一 pid 的连续运行时长，作为轮转后的辅助证据。
 duration_ok = running_secs >= target_secs or uptime_secs >= target_secs
-ok = bool(pid) and duration_ok and gap_ok and recent_ok
+ok = bool(pid) and duration_ok and gap_ok and recent_ok and source_ok
 print(json.dumps({
     "ok": ok,
     "pid": pid,
@@ -95,6 +98,9 @@ print(json.dumps({
     "records_same_pid": len(same_pid),
     "gap_ok": gap_ok,
     "recent_ok": recent_ok,
+    "source_ok": source_ok,
+    "source_cooling": last.get("source_cooling", 0),
+    "source_failing": last.get("source_failing", 0),
     "last_age_secs": int(last_age),
 }, ensure_ascii=False))
 PY
@@ -140,6 +146,7 @@ fi
 health="$(printf '%s' "$status" | python3 -c 'import json,sys
 d=json.load(sys.stdin)
 h=d.get("health_audit") or {}
+sh=d.get("source_health") or {}
 print(json.dumps({
   "health": bool(d.get("health", h.get("ok", False))),
   "daemon_ok": bool(d.get("daemon_ok", d.get("rust_daemon", h.get("daemon_ok", False)))),
@@ -151,6 +158,10 @@ print(json.dumps({
   "heartbeat_lines": h.get("heartbeat_lines", 0),
   "consecutive_heartbeats": h.get("consecutive_heartbeats", 0),
   "log_gap_secs": h.get("log_gap_secs"),
+  "source_total": sh.get("total", 0),
+  "source_failing": sh.get("failing", 0),
+  "source_cooling": sh.get("cooling", 0),
+  "source_ok": bool(sh.get("ok", True)),
 }, ensure_ascii=False))' 2>/dev/null || true)"
 if [ -z "$health" ]; then
   echo "$(date '+%Y-%m-%d %H:%M:%S %z') audit_unparseable" >> "$LOG"
