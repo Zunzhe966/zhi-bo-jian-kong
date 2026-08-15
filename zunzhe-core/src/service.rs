@@ -25,6 +25,27 @@ pub struct HealthAudit {
     pub last_log_line_at: Option<String>,
 }
 
+/// 合并读取 uptime 主日志与轮转历史（`.1..3`）。
+///
+/// 24×30 长跑期间若 daemon 重启导致启动行被轮转到历史文件，只读当前文件
+/// 会丢掉同 pid 的最早起点，uptime 变成“最近一段”而不是“本实例全程”。
+/// 轮转方向是 `.3` 最旧、当前文件最新，按该顺序拼接后上层可统一按时间排序。
+pub fn read_uptime_logs(project_dir: &Path) -> String {
+    let dir = project_dir.join("logs");
+    let base = dir.join("zunzhe-core.uptime.log");
+    let mut parts = Vec::new();
+    for idx in (1..=3).rev() {
+        let rotated = base.with_extension(format!("log.{idx}"));
+        if let Ok(text) = std::fs::read_to_string(&rotated) {
+            parts.push(text);
+        }
+    }
+    if let Ok(text) = std::fs::read_to_string(&base) {
+        parts.push(text);
+    }
+    parts.join("")
+}
+
 /// 读取 daemon 自己每 60 秒追加的 uptime 日志，量化“连续心跳、启动记录、
 /// 日志断档、当前 RSS”四个 24×30 关键指标。任何一项不可解析都不 panic，
 /// 只把该字段留空并保持 `ok=false`，让上层诊断而不是让审计进程崩溃。
@@ -37,8 +58,7 @@ pub fn health_audit(project_dir: &Path) -> HealthAudit {
     let (uptime_secs, uptime_human) = daemon_uptime(project_dir);
     let rss_kib = pid.and_then(process_rss_kib);
 
-    let log = project_dir.join("logs").join("zunzhe-core.uptime.log");
-    let text = std::fs::read_to_string(&log).unwrap_or_default();
+    let text = read_uptime_logs(project_dir);
     let heartbeat_lines = text
         .lines()
         .filter(|line| line.contains("rust_daemon=true") || line.contains("heartbeat_ok=true"))
@@ -774,10 +794,10 @@ fn daemon_uptime(project_dir: &Path) -> (u64, String) {
     let Ok(pid) = pid_text.trim().parse::<u32>() else {
         return (0, String::new());
     };
-    let log = project_dir.join("logs").join("zunzhe-core.uptime.log");
-    let Ok(text) = std::fs::read_to_string(&log) else {
+    let text = read_uptime_logs(project_dir);
+    if text.is_empty() {
         return (0, String::new());
-    };
+    }
     static UPTIME_TS_RE: OnceLock<regex::Regex> = OnceLock::new();
     let re = UPTIME_TS_RE.get_or_init(|| {
         regex::Regex::new(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{4}")
@@ -1411,6 +1431,48 @@ mod tests {
         let (secs, human) = daemon_uptime(&dir);
         assert_eq!(secs, 0);
         assert!(human.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn daemon_uptime_merges_rotated_logs() {
+        // 24×30 期间 uptime 日志会被 daemon 启动时轮转；如果医生只看当前
+        // 文件，跨轮转后就会把“本实例全程”误算成“最近一段”。这里模拟
+        // 启动行落在 .1 历史里、当前文件只剩心跳，验证能合并出正确时长。
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-uptime-rotated-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        std::fs::create_dir_all(dir.join("fupan_output").join("run")).unwrap();
+        write_rust_daemon_pid(&dir, 424242);
+
+        let started = chrono::Local::now() - chrono::Duration::seconds(9000);
+        std::fs::write(
+            dir.join("logs").join("zunzhe-core.uptime.log.1"),
+            format!(
+                "{} started pid=424242\n",
+                started.format("%Y-%m-%d %H:%M:%S %z")
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("logs").join("zunzhe-core.uptime.log"),
+            format!(
+                "{} pid=424242 rust_daemon=true heartbeat_ok=true\n",
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S %z")
+            ),
+        )
+        .unwrap();
+
+        let (secs, human) = daemon_uptime(&dir);
+        assert!(secs >= 8900, "应跨轮转文件读取最早启动行，实际 {secs}");
+        assert!(human.contains("小时"), "2.5 小时应有人类可读格式: {human}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
