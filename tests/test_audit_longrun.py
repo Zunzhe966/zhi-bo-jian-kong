@@ -25,7 +25,14 @@ def run_verify(log: Path):
     return json.loads(out)
 
 
-def audit_line(seconds_ago: int, pid: int, health: bool = True) -> str:
+def audit_line(
+    seconds_ago: int,
+    pid: int,
+    health: bool = True,
+    *,
+    source_ok: bool = True,
+    notify_ok: bool = True,
+) -> str:
     ts = datetime.datetime.now().astimezone() - datetime.timedelta(seconds=seconds_ago)
     return f'{ts.strftime("%Y-%m-%d %H:%M:%S %z")} ' + json.dumps(
         {
@@ -33,9 +40,12 @@ def audit_line(seconds_ago: int, pid: int, health: bool = True) -> str:
             "daemon_ok": health,
             "heartbeat_ok": health,
             "pid": pid,
-            "source_ok": True,
+            "source_ok": source_ok,
             "source_cooling": 0,
             "source_failing": 0,
+            "notify_ok": notify_ok,
+            "notify_pending": 0,
+            "notify_failed": 0,
         },
         ensure_ascii=False,
     )
@@ -76,4 +86,30 @@ assert result["ok"] is False, result
 assert result["source_ok"] is False, result
 assert result["source_cooling"] == 0, result
 
-print("通过：audit-longrun --verify 未满/缺失/源冷却场景判定正确")
+# 历史坏行（已修复/清理）不应永久卡住验收：坏行滚出最近 30 分钟窗口后，
+# 即使审计文件里仍保留旧记录，notify_ok 也应恢复为 true。
+old_notify_bad = tmp / "old-notify-bad.log"
+old_notify_bad.write_text(
+    audit_line(60 * 60 * 2, 123, notify_ok=False)
+    + "\n"
+    + audit_line(60 * 60, 123, notify_ok=True)
+    + "\n",
+    encoding="utf-8",
+)
+result = run_verify(old_notify_bad)
+assert result["ok"] is False, result  # 仍未跑满 24×30，但健康维度应通过
+assert result["notify_ok"] is True, result
+
+# 最近 30 分钟内的通知失败仍然不能判健康，防止长期卡住的问题变成“永久掩盖”。
+recent_notify_bad = tmp / "recent-notify-bad.log"
+recent_notify_bad.write_text(
+    audit_line(120, 123, notify_ok=True)
+    + "\n"
+    + audit_line(60, 123, notify_ok=False)
+    + "\n",
+    encoding="utf-8",
+)
+result = run_verify(recent_notify_bad)
+assert result["notify_ok"] is False, result
+
+print("通过：audit-longrun --verify 未满/缺失/源冷却/历史坏行/最近坏行场景判定正确")

@@ -73,12 +73,16 @@ gap_ok = all(
     for i in range(1, len(records))
 )
 recent_ok = last_age <= 300 and bool(last.get("heartbeat_ok")) and bool(last.get("health"))
-# 源健康字段只在最新 doctor/审计脚本写入后才存在；旧审计行缺字段视为健康，
-# 只有明确记录 source_ok=false（源进入冷却）才判定不满足 24×30 验收。
-source_ok = all(rec.get("source_ok", True) for _, rec in records)
-# 通知投递健康：旧审计行缺字段视为健康；只有明确记录 notify_ok=false
-# （配置缺失或通知表堆积失败/pending）才判定不满足 24×30 验收。
-notify_ok = all(rec.get("notify_ok", True) for _, rec in records)
+# 源/通知健康按“最近 30 分钟 + 最新快照”判定，而不是全历史累加：
+# 一条早已修复的历史异常（例如用户清理测试通知、平台恢复）不应永久卡住
+# 24×30 验收；但最近 30 分钟出现过冷却/通知失败仍会被判定为不健康。
+recent_window = datetime.timedelta(minutes=30)
+source_ok = bool(last.get("source_ok", True)) and all(
+    rec.get("source_ok", True) for ts, rec in records if ts >= last_ts - recent_window
+)
+notify_ok = bool(last.get("notify_ok", True)) and all(
+    rec.get("notify_ok", True) for ts, rec in records if ts >= last_ts - recent_window
+)
 uptime_secs = 0
 try:
     diag = json.loads(subprocess.check_output(
@@ -108,6 +112,7 @@ print(json.dumps({
     "notify_pending": last.get("notify_pending", 0),
     "notify_failed": last.get("notify_failed", 0),
     "notify_hint": last.get("notify_hint"),
+    "health_window_secs": int(recent_window.total_seconds()),
     "last_age_secs": int(last_age),
 }, ensure_ascii=False))
 PY

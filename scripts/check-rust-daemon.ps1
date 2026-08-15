@@ -56,7 +56,31 @@ try {
       heartbeat_lines = 0
       consecutive_heartbeats = 0
       log_gap_secs = $null
+      source_total = 0
+      source_failing = 0
+      source_cooling = 0
+      source_ok = $true
+      notify_pending = 0
+      notify_failed = 0
+      notify_latest_failed_channel = $null
+      notify_hint = $null
+      notify_ok = $true
     }
+  }
+  $sourceHealth = $diag.source_health
+  $notifyHealth = $diag.notify_health
+  if ($null -ne $sourceHealth) {
+    $audit.source_total = [int]$sourceHealth.total
+    $audit.source_failing = [int]$sourceHealth.failing
+    $audit.source_cooling = [int]$sourceHealth.cooling
+    $audit.source_ok = [bool]$sourceHealth.ok
+  }
+  if ($null -ne $notifyHealth) {
+    $audit.notify_pending = [int]$notifyHealth.pending
+    $audit.notify_failed = [int]$notifyHealth.failed
+    $audit.notify_latest_failed_channel = $notifyHealth.latest_failed_channel
+    $audit.notify_hint = $notifyHealth.hint
+    $audit.notify_ok = [bool]$notifyHealth.ok
   }
   $auditLine = [ordered]@{
     health = [bool]$audit.ok

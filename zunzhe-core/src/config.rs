@@ -158,12 +158,24 @@ impl Config {
         let login = self.get_main("推送配置", "邮箱登录账号");
         let auth = self.get_main("推送配置", "发件人密码(授权码)");
         let to = self.get_main("推送配置", "收件人邮箱");
-        !host.is_empty() && !login.is_empty() && !auth.is_empty() && !to.is_empty()
+        !host.is_empty()
+            && !login.is_empty()
+            && !auth.is_empty()
+            && !to.is_empty()
+            && !self.email_is_placeholder()
     }
 
     pub fn email_status(&self) -> EmailStatus {
         let cfg = self.email_settings();
         let status = EmailStatus::from_settings(cfg.clone());
+        if status.configured && self.email_is_placeholder() {
+            return EmailStatus {
+                configured: false,
+                missing: vec!["真实邮箱账号".into()],
+                hint: "当前配置是示例占位邮箱（test@qq.com / to@qq.com），不会真正发信：请在桌面端「全局设置」填写你的 QQ 邮箱账号、授权码与收件邮箱".into(),
+                ..status
+            };
+        }
         // 只列出真正缺失的项；host 有默认值，不要把“SMTP服务器”误报为缺失。
         let missing: Vec<String> = ["邮箱登录账号", "发件人密码(授权码)", "收件人邮箱"]
             .iter()
@@ -210,6 +222,22 @@ impl Config {
             sender_name: self.get_main("推送配置", "发件人显示昵称"),
             to: self.get_main("推送配置", "收件人邮箱"),
         }
+    }
+
+    /// 判断邮箱配置是否为占位示例（test@qq.com / to@qq.com 等）。
+    ///
+    /// 模板和演示环境常写入这些值，真实发信必然失败；识别为“未配置”让
+    /// doctor/email-status/通知健康都给出可操作提示，而不是假健康。
+    fn email_is_placeholder(&self) -> bool {
+        let fields = [
+            self.get_main("推送配置", "邮箱登录账号"),
+            self.get_main("推送配置", "发件人邮箱"),
+            self.get_main("推送配置", "收件人邮箱"),
+        ];
+        fields.iter().any(|v| {
+            let v = v.trim().to_lowercase();
+            v == "test@qq.com" || v == "to@qq.com" || v.contains("example")
+        })
     }
 
     pub fn push_channels(&self) -> PushChannels {
@@ -847,6 +875,33 @@ SMTP邮件服务器 = smtp.qq.com
             );
         }
         assert!(!status.hint.contains("SMTP服务器"));
+    }
+
+    #[test]
+    fn placeholder_email_is_reported_unconfigured() {
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-config-placeholder-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::write(
+            dir.join("config").join("config.ini"),
+            "[推送配置]\nsmtp邮件服务器 = smtp.qq.com\n\
+             邮箱登录账号 = test@qq.com\n发件人密码(授权码) = placeholder\n\
+             发件人邮箱 = test@qq.com\n收件人邮箱 = to@qq.com\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("config").join("fupan_config.ini"), "[视频监控]\n").unwrap();
+        let cfg = Config::load(&dir).unwrap();
+        assert!(!cfg.email_configured());
+        let status = cfg.email_status();
+        assert!(!status.configured);
+        assert!(status.hint.contains("示例占位邮箱"), "{status:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
