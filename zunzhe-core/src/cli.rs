@@ -127,6 +127,25 @@ enum Command {
     TestEmail,
     /// 发送测试通知（Python 兼容别名）
     TestNotify,
+    /// 列出最近通知记录（status 可填 pending/sent/failed/空）
+    NotifyList {
+        #[arg(default_value = "")]
+        status: String,
+        #[arg(default_value_t = 50)]
+        limit: i64,
+    },
+    /// 把最近失败的邮件/推送通知重新放回队列（配置补齐后手动重发）
+    NotifyRetry {
+        #[arg(default_value_t = 100)]
+        limit: i64,
+    },
+    /// 清理已发送/已失败的通知记录（limit=0 表示全部）
+    NotifyPrune {
+        #[arg(default_value = "failed")]
+        status: String,
+        #[arg(default_value_t = 0)]
+        limit: i64,
+    },
     /// 读取配置（all/config/fupan_config，密钥脱敏）
     GetConfig {
         #[arg(default_value = "all")]
@@ -594,6 +613,32 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 ),
             }
         }
+        Command::NotifyList { status, limit } => {
+            let limit = if limit <= 0 { 50 } else { limit };
+            let events = db::list_notify(&pool, &status, limit).await?;
+            println!(
+                "{}",
+                json!({"ok": true, "count": events.len(), "notify": events})
+            );
+        }
+        Command::NotifyRetry { limit } => {
+            let limit = if limit <= 0 { 100 } else { limit };
+            let retried = db::retry_failed_notify(&pool, limit).await?;
+            let pending = db::list_pending_notify(&pool, limit).await?;
+            println!(
+                "{}",
+                json!({"ok": true, "retried": retried, "pending_count": pending.len(),
+                       "hint": "已把失败通知放回队列，daemon 下一轮按退避重试；也可再执行 notify-retry 立即重发"})
+            );
+        }
+        Command::NotifyPrune { status, limit } => {
+            let limit = if limit <= 0 { i64::MAX } else { limit };
+            let removed = db::prune_notify(&pool, &status, limit).await?;
+            println!(
+                "{}",
+                json!({"ok": true, "removed": removed, "status": status})
+            );
+        }
         Command::GetConfig { file, section, key } => {
             println!("{}", api.get(&file, &section, &key)?);
         }
@@ -846,6 +891,9 @@ mod tests {
             &["zunzhe-core", "notes"],
             &["zunzhe-core", "test-email"],
             &["zunzhe-core", "test-notify"],
+            &["zunzhe-core", "notify-list", "", "20"],
+            &["zunzhe-core", "notify-retry", "100"],
+            &["zunzhe-core", "notify-prune", "failed", "0"],
             &["zunzhe-core", "get-config", "all", "", ""],
             &[
                 "zunzhe-core",

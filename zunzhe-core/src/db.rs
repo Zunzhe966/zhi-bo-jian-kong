@@ -571,6 +571,68 @@ mod maintenance_tests {
     }
 
     #[tokio::test]
+    async fn failed_notify_can_be_retried_and_pruned() {
+        let file = std::env::temp_dir().join(format!("zunzhe-notify-mgmt-{}", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let pool = crate::db::open_pool(&file).await.unwrap();
+        for _ in 0..3 {
+            let id = crate::db::add_notify(&pool, "video", "博主", "标题", "内容", "微信")
+                .await
+                .unwrap();
+            crate::db::fail_notify(&pool, id).await.unwrap();
+        }
+        let sent = crate::db::add_notify(&pool, "video", "博主", "标题", "内容", "邮箱")
+            .await
+            .unwrap();
+        crate::db::mark_notify_done(&pool, sent).await.unwrap();
+
+        assert_eq!(
+            crate::db::list_notify(&pool, "failed", 10)
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+        let retried = crate::db::retry_failed_notify(&pool, 2).await.unwrap();
+        assert_eq!(retried, 2, "只应重试前两条失败通知");
+        assert_eq!(
+            crate::db::list_pending_notify(&pool, 10)
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "重试后的通知必须回到 pending 队列"
+        );
+        assert_eq!(
+            crate::db::list_notify(&pool, "failed", 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let pruned = crate::db::prune_notify(&pool, "sent", 0).await.unwrap();
+        assert_eq!(pruned, 1, "应能清理已发送记录");
+        let retried_all = crate::db::retry_failed_notify(&pool, 0).await.unwrap();
+        assert_eq!(retried_all, 1, "limit=0 应表示不限制，重试剩余失败通知");
+        assert_eq!(
+            crate::db::list_pending_notify(&pool, 10)
+                .await
+                .unwrap()
+                .len(),
+            3,
+            "三次失败通知都应回到 pending 队列"
+        );
+        let err = crate::db::prune_notify(&pool, "pending", 10)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("只允许清理"), "pending 不得清理");
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_file(file.with_extension("db-shm"));
+        let _ = std::fs::remove_file(file.with_extension("db-wal"));
+    }
+
+    #[tokio::test]
     async fn maintenance_prunes_finished_live_sessions_keeps_recording() {
         let file = std::env::temp_dir().join(format!(
             "zunzhe-maintenance-livesess-{}-{}.db",
@@ -1874,6 +1936,49 @@ pub async fn bump_notify_attempts(pool: &SqlitePool, id: i64) -> anyhow::Result<
         .await
         .context("查询通知重试计数")?;
     Ok(attempts)
+}
+
+/// 把已收敛为 failed 的通知重新放回 pending 队列，供配置补齐后手动重试。
+///
+/// 返回被重新入队的记录数。只有终态 failed 才允许重置，避免把正在发送的
+/// pending 记录重置成另一轮重复投递；`attempts` 同时清零，并把创建时间拨
+/// 到当前，让退避从手动重试那一刻重新起算，而不是沿用旧的失败时间。
+pub async fn retry_failed_notify(pool: &SqlitePool, limit: i64) -> anyhow::Result<u64> {
+    let effective = if limit <= 0 { i64::MAX } else { limit };
+    let result = sqlx::query(
+        "UPDATE notify SET status='pending', attempts=0, created_at=datetime('now','localtime')
+         WHERE id IN (
+             SELECT id FROM notify WHERE status='failed' ORDER BY id ASC LIMIT ?
+         )",
+    )
+    .bind(effective)
+    .execute(pool)
+    .await
+    .context("重新入队失败通知")?;
+    Ok(result.rows_affected())
+}
+
+/// 删除指定状态的终态通知记录，返回删除条数。
+///
+/// 只允许清理 sent/failed 等已完成投递的记录；pending 是还没送完的通知，
+/// 删除会静默丢提醒，因此明确拒绝。
+pub async fn prune_notify(pool: &SqlitePool, status: &str, limit: i64) -> anyhow::Result<u64> {
+    if !matches!(status, "sent" | "failed") {
+        anyhow::bail!("只允许清理 sent 或 failed 状态的通知记录: {status}");
+    }
+    let effective = if limit <= 0 { i64::MAX } else { limit };
+    let result = sqlx::query(
+        "DELETE FROM notify WHERE status=? AND id IN (
+             SELECT id FROM notify WHERE status=? ORDER BY id ASC LIMIT ?
+         )",
+    )
+    .bind(status)
+    .bind(status)
+    .bind(effective)
+    .execute(pool)
+    .await
+    .context("清理通知记录")?;
+    Ok(result.rows_affected())
 }
 
 #[cfg(test)]

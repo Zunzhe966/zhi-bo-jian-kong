@@ -195,6 +195,9 @@ pub fn tools_list() -> Vec<Value> {
         json!({"name":"wizard_done","description":"标记桌面向导完成","inputSchema":{"type":"object","properties":{}}}),
         json!({"name":"test_email","description":"发送测试邮件","inputSchema":{"type":"object","properties":{}}}),
         json!({"name":"test_notify","description":"发送测试通知（Python 兼容别名）","inputSchema":{"type":"object","properties":{}}}),
+        json!({"name":"notify_list","description":"列出最近通知记录（status 可填 pending/sent/failed/空）","inputSchema":{"type":"object","properties":{"status":{"type":"string"},"limit":{"type":"number"}}}}),
+        json!({"name":"notify_retry","description":"把失败通知重新放回队列（配置补齐后手动重发）","inputSchema":{"type":"object","properties":{"limit":{"type":"number"}}}}),
+        json!({"name":"notify_prune","description":"清理已发送/已失败的通知记录（limit=0 表示全部）","inputSchema":{"type":"object","properties":{"status":{"type":"string"},"limit":{"type":"number"}}}}),
     ]
 }
 
@@ -617,6 +620,42 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
                 )?),
             }
         }
+        "notify_list" => {
+            let status = args
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
+            let limit = if limit <= 0 { 200 } else { limit };
+            let events = db::list_notify(pool, status, limit).await?;
+            Ok(serde_json::to_string(
+                &json!({"ok":true,"count":events.len(),"notify":events}),
+            )?)
+        }
+        "notify_retry" => {
+            let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(100);
+            let limit = if limit <= 0 { 100 } else { limit };
+            let retried = db::retry_failed_notify(pool, limit).await?;
+            let pending = db::list_pending_notify(pool, limit).await?;
+            Ok(serde_json::to_string(&json!({
+                "ok":true,
+                "retried":retried,
+                "pending_count":pending.len(),
+                "hint":"已把失败通知放回队列，daemon 下一轮按退避重试；也可再执行 notify-retry 立即重发",
+            }))?)
+        }
+        "notify_prune" => {
+            let status = args
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("failed");
+            let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(0);
+            let limit = if limit <= 0 { i64::MAX } else { limit };
+            let removed = db::prune_notify(pool, status, limit).await?;
+            Ok(serde_json::to_string(
+                &json!({"ok":true,"removed":removed,"status":status}),
+            )?)
+        }
         _ => anyhow::bail!("工具未实现: {name}"),
     }
 }
@@ -673,6 +712,9 @@ mod tests {
             "notes_list",
             "process_media",
             "test_email",
+            "notify_list",
+            "notify_retry",
+            "notify_prune",
         ] {
             assert!(names.contains(expected), "MCP 缺工具: {expected}");
         }
