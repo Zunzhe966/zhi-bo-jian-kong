@@ -77,6 +77,24 @@ gap_ok = all(
     for i in range(1, len(same_pid_records))
 )
 recent_ok = last_age <= 300 and bool(last.get("heartbeat_ok")) and bool(last.get("health"))
+# RSS 增长判定：24×30 验收要求“RSS 不增长”。取同一 pid 首条/末条可解析的
+# rss_kib 对比；增长超过 256 MiB 判定失败，防止内存泄漏在长跑里被“进程活着”
+# 掩盖。老版本审计行没有 rss_kib 时视为兼容（rss_ok=true），一旦有数据就开始
+# 强制验收。
+rss_records = [
+    (ts, rec.get("rss_kib"))
+    for ts, rec in same_pid_records
+    if isinstance(rec.get("rss_kib"), int)
+]
+rss_ok = True
+rss_baseline_kib = None
+rss_latest_kib = None
+rss_growth_mib = 0
+if rss_records:
+    rss_baseline_kib = rss_records[0][1]
+    rss_latest_kib = rss_records[-1][1]
+    rss_growth_mib = max(0, (rss_latest_kib - rss_baseline_kib)) / 1024
+    rss_ok = rss_growth_mib <= 256
 # 源/通知健康按“最近 30 分钟 + 最新快照”判定，而不是全历史累加：
 # 一条早已修复的历史异常（例如用户清理测试通知、平台恢复）不应永久卡住
 # 24×30 验收；但最近 30 分钟出现过冷却/通知失败仍会被判定为不健康。
@@ -99,7 +117,7 @@ except Exception:
 # 审计日志会按 5MB 轮转，首条可能不在当前文件里；daemon 自报 uptime 是
 # 同一 pid 的连续运行时长，作为轮转后的辅助证据。
 duration_ok = running_secs >= target_secs or uptime_secs >= target_secs
-ok = bool(pid) and duration_ok and gap_ok and recent_ok and source_ok and notify_ok
+ok = bool(pid) and duration_ok and gap_ok and recent_ok and source_ok and notify_ok and rss_ok
 print(json.dumps({
     "ok": ok,
     "pid": pid,
@@ -109,6 +127,10 @@ print(json.dumps({
     "records_same_pid": len(same_pid),
     "gap_ok": gap_ok,
     "recent_ok": recent_ok,
+    "rss_ok": rss_ok,
+    "rss_baseline_kib": rss_baseline_kib,
+    "rss_latest_kib": rss_latest_kib,
+    "rss_growth_mib": round(rss_growth_mib, 1),
     "source_ok": source_ok,
     "notify_ok": notify_ok,
     "source_cooling": last.get("source_cooling", 0),

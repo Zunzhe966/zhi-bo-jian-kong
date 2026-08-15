@@ -32,6 +32,7 @@ def audit_line(
     *,
     source_ok: bool = True,
     notify_ok: bool = True,
+    rss_kib: int | None = None,
 ) -> str:
     ts = datetime.datetime.now().astimezone() - datetime.timedelta(seconds=seconds_ago)
     return f'{ts.strftime("%Y-%m-%d %H:%M:%S %z")} ' + json.dumps(
@@ -46,6 +47,7 @@ def audit_line(
             "notify_ok": notify_ok,
             "notify_pending": 0,
             "notify_failed": 0,
+            "rss_kib": rss_kib,
         },
         ensure_ascii=False,
     )
@@ -151,4 +153,29 @@ same_pid_gap.write_text(
 result = run_verify(same_pid_gap)
 assert result["gap_ok"] is False, result
 
-print("通过：audit-longrun --verify 未满/满30天/缺失/源冷却/历史坏行/最近坏行/pid切换/同pid断档场景判定正确")
+# RSS 增长超过阈值必须拦截验收，防止内存泄漏被“进程活着 + 心跳连续”掩盖。
+rss_leak = tmp / "rss-leak.log"
+rss_leak.write_text(
+    audit_line(120, 124, rss_kib=20_000)
+    + "\n"
+    + audit_line(60, 124, rss_kib=20_000 + 300 * 1024)
+    + "\n",
+    encoding="utf-8",
+)
+result = run_verify(rss_leak)
+assert result["rss_ok"] is False, result
+assert result["rss_growth_mib"] > 256, result
+
+# RSS 正常波动不应误伤：增长小于阈值时 rss_ok 必须保持 true。
+rss_ok_file = tmp / "rss-ok.log"
+rss_ok_file.write_text(
+    audit_line(120, 124, rss_kib=20_000)
+    + "\n"
+    + audit_line(60, 124, rss_kib=21_000)
+    + "\n",
+    encoding="utf-8",
+)
+result = run_verify(rss_ok_file)
+assert result["rss_ok"] is True, result
+
+print("通过：audit-longrun --verify 未满/满30天/缺失/源冷却/历史坏行/最近坏行/pid切换/同pid断档/RSS增长/RSS正常波动场景判定正确")
