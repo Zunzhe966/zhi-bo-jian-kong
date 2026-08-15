@@ -612,10 +612,15 @@ export default function App() {
     setHistoryLoading(true)
     try {
       const r = await window.desktop.cli('blogger-videos', row.url, '0')
-      const list = (r.videos || []).map((v) => ({
-        ...v,
-        key: v.url,
-        date: v.date || v.published_at || '',
+      const list = await Promise.all((r.videos || []).map(async (v) => {
+        const coverCache = v.cover_cache || ''
+        const coverUrl = coverCache ? (await window.desktop.coverUrl(coverCache)) : ''
+        return {
+          ...v,
+          key: v.url,
+          date: v.date || v.published_at || '',
+          cover_url: coverUrl || '',
+        }
       }))
       setHistoryVideos(list)
       if (r.warning) message.warning(r.warning)
@@ -1076,8 +1081,8 @@ export default function App() {
           }}
           columns={[
             { title: '封面', dataIndex: 'cover_cache', width: 100, align: 'center',
-              render: (c, r) => (c
-                ? <img src={`file://${c}`} alt="" style={{ width: 96, height: 54, objectFit: 'cover', borderRadius: 4 }} />
+              render: (c, r) => (r.cover_url
+                ? <img src={r.cover_url} alt="" style={{ width: 96, height: 54, objectFit: 'cover', borderRadius: 4 }} />
                 : <a onClick={() => r.cover && window.desktop.openExternal(r.cover)} style={{ color: '#999' }}>无缓存</a>) },
             { title: '标题', dataIndex: 'title', ellipsis: true,
               render: (t, r) => (

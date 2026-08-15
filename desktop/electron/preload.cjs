@@ -9,5 +9,6 @@ contextBridge.exposeInMainWorld('desktop', {
   openPath: (p) => ipcRenderer.invoke('open-path', p),
   openExternal: (url) => ipcRenderer.invoke('open-external', url),
   readText: (p) => ipcRenderer.invoke('read-text', p),
+  coverUrl: (p) => ipcRenderer.invoke('cover-url', p),
   biliLogin: () => ipcRenderer.invoke('bili-login'),
 })

@@ -75,6 +75,8 @@ Python 工具层  faster-whisper / LLM 提炼 / ffmpeg 切片 / yt-dlp 兜底
 - 桌面端 Electron 已改为调用 Rust 核心二进制（优先 release、缺省 debug），
   `status` 同时返回 `rust_daemon` 与兼容的 `services` 字段，服务按钮/守护
   只看 Rust daemon，不再启动 Python 双跑
+- 桌面端历史视频封面经受限制的 `local-file://` 协议读取项目内缓存；渲染
+  进程不再直连 `file://` 本地路径，路径穿越/越权读取一律拒绝
 - 视频监控支持监控列表/偏好/服务管理，首次监控只记录基线，之后只对新视频通知/下载
 - 下载成功后自动入队复盘（独立后台 worker，转写/提炼/切片），录制结束同样自动复盘；
   复盘队列按 kind 独立认领/恢复，失败 3 次落定 failed，不再无限循环

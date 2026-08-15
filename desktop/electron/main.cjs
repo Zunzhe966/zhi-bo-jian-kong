@@ -1,9 +1,12 @@
 const { app, BrowserWindow, Tray, Menu, globalShortcut, ipcMain, shell, nativeImage, Notification } = require('electron')
+const { protocol, net } = require('electron')
 const path = require('path')
+const { pathToFileURL } = require('url')
 const { spawn } = require('child_process')
 const fs = require('fs')
 const { consumeNotifyQueue } = require('./local-notify.cjs')
 const { healthcheckInvocation } = require('./healthcheck.cjs')
+const { projectLocalUrl } = require('./local-file-url.cjs')
 
 // electron/ 在 desktop/ 下，Rust 核心在项目根目录（再上一级）
 const PROJECT_DIR = path.resolve(__dirname, '..', '..')
@@ -17,6 +20,12 @@ const ICON_PNG = path.join(ASSETS, 'icon.png')
 const ICON_TRAY = path.join(ASSETS, 'icon-32.png')
 const APP_NAME = '尊者直播监控'
 const HOTKEY = 'Control+Shift+L'
+const LOCAL_FILE_SCHEME = 'local-file'
+
+// 必须在 app ready 之前声明特权 scheme，之后才能用 protocol.handle。
+protocol.registerSchemesAsPrivileged([
+  { scheme: LOCAL_FILE_SCHEME, privileges: { secure: true, supportFetchAPI: true, stream: true } },
+])
 const NOTIFY_QUEUE = path.join(PROJECT_DIR, 'fupan_output', 'run', 'pending_notify.json')
 const NOTIFY_SEEN_FILE = path.join(PROJECT_DIR, 'fupan_output', 'run', 'desktop_seen_notify_ids.json')
 
@@ -50,6 +59,30 @@ function loadAppIcon() {
   console.warn('[尊者直播监控] 图标加载失败，请运行 npm run icons')
   return nativeImage.createEmpty()
 }
+
+// 历史视频封面等本地文件通过 `local-file://<相对项目根路径>` 提供，
+// 不使用 `file://` 直连（Electron 默认 webSecurity 会拦截跨源 file 子资源）。
+// 协议只允许解析项目根内的真实文件，避免把任意本地路径暴露给渲染进程。
+function registerLocalFileProtocol() {
+  protocol.handle(LOCAL_FILE_SCHEME, async (request) => {
+    try {
+      const url = new URL(request.url)
+      const rel = decodeURIComponent(url.pathname.replace(/^\/+/, ''))
+      const resolved = path.resolve(PROJECT_DIR, rel)
+      if (resolved !== PROJECT_DIR && !resolved.startsWith(PROJECT_DIR + path.sep)) {
+        return new Response('forbidden', { status: 403 })
+      }
+      if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) {
+        return new Response('not found', { status: 404 })
+      }
+      return net.fetch(pathToFileURL(resolved).toString())
+    } catch (e) {
+      return new Response('bad request', { status: 400 })
+    }
+  })
+}
+
+app.whenReady().then(() => registerLocalFileProtocol())
 
 /** Windows 托盘需要 16~32px 小图标，1024px 大图会显示空白 */
 function trayIcon() {
@@ -347,6 +380,9 @@ app.whenReady().then(async () => {
   ipcMain.handle('read-text', (_, p) => {
     try { return fs.readFileSync(p, 'utf8') } catch { return '' }
   })
+  // 把封面等项目内本地文件转成安全协议 URL；路径不在项目根时返回空串，
+  // 前端会退化为“无缓存”而不是暴露任意本地文件。
+  ipcMain.handle('cover-url', (_, p) => projectLocalUrl(PROJECT_DIR, p, LOCAL_FILE_SCHEME))
   // B站授权：弹出真实浏览器窗口，用户可选登录；关闭后导出会话 Cookie 供下载会员/高清视频
   ipcMain.handle('bili-login', async () => {
     const { harvestBilibiliCookies, DEFAULT_OUT } = require('./bili-cookie.cjs')
