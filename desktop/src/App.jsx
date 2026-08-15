@@ -611,7 +611,7 @@ export default function App() {
     setHistoryOpen(true)
     setHistoryLoading(true)
     try {
-      const r = await window.desktop.cli('blogger-videos', row.url, '40')
+      const r = await window.desktop.cli('blogger-videos', row.url, '0')
       const list = (r.videos || []).map((v) => ({
         ...v,
         key: v.url,

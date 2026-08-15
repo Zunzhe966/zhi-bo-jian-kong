@@ -88,10 +88,10 @@ enum Command {
         #[arg(default_value = "")]
         downloaded_only: String,
     },
-    /// 列出博主历史视频，供前端批量选择与下载
+    /// 列出博主历史视频；count=0 表示全部，默认全部
     BloggerVideos {
         url: String,
-        #[arg(default_value = "30")]
+        #[arg(default_value = "0")]
         count: u32,
     },
     /// 下载指定视频到 downloads/短视频/
@@ -864,5 +864,30 @@ mod tests {
     fn mcp_info_requires_no_extra_args() {
         let cli = Cli::try_parse_from(["zunzhe-core", "mcp-info"]).unwrap();
         assert!(matches!(cli.command, Command::McpInfo));
+    }
+
+    #[test]
+    fn blogger_videos_default_and_zero_mean_all() {
+        let defaulted = Cli::try_parse_from([
+            "zunzhe-core",
+            "blogger-videos",
+            "https://space.bilibili.com/1",
+        ])
+        .unwrap();
+        match defaulted.command {
+            Command::BloggerVideos { count, .. } => assert_eq!(count, 0, "默认应表示全部"),
+            other => panic!("应解析为 BloggerVideos: {other:?}"),
+        }
+        let explicit = Cli::try_parse_from([
+            "zunzhe-core",
+            "blogger-videos",
+            "https://space.bilibili.com/1",
+            "0",
+        ])
+        .unwrap();
+        match explicit.command {
+            Command::BloggerVideos { count, .. } => assert_eq!(count, 0),
+            other => panic!("count=0 应解析为全部: {other:?}"),
+        }
     }
 }

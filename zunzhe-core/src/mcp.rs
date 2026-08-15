@@ -171,7 +171,7 @@ pub fn tools_list() -> Vec<Value> {
         json!({"name":"video_remove","description":"移除发视频监控","inputSchema":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}),
         json!({"name":"video_list","description":"列出发视频监控","inputSchema":{"type":"object","properties":{}}}),
         json!({"name":"video_check_now","description":"立即检查一轮新视频","inputSchema":{"type":"object","properties":{}}}),
-        json!({"name":"blogger_videos","description":"列出博主历史视频","inputSchema":{"type":"object","properties":{"url":{"type":"string"},"count":{"type":"number"}},"required":["url"]}}),
+        json!({"name":"blogger_videos","description":"列出博主历史视频（count=0 表示全部）","inputSchema":{"type":"object","properties":{"url":{"type":"string"},"count":{"type":"number"}},"required":["url"]}}),
         json!({"name":"download_video","description":"下载视频到 downloads/短视频/","inputSchema":{"type":"object","properties":{"url":{"type":"string"},"name":{"type":"string"}},"required":["url"]}}),
         json!({"name":"video_download","description":"下载视频到 downloads/短视频/（Python 兼容别名）","inputSchema":{"type":"object","properties":{"url":{"type":"string"},"name":{"type":"string"}},"required":["url"]}}),
         json!({"name":"download_videos","description":"批量下载多个视频（跳过已下载与空 URL）","inputSchema":{"type":"object","properties":{"items_json":{"type":"string"}},"required":["items_json"]}}),
@@ -360,7 +360,7 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
-            let count = args.get("count").and_then(|v| v.as_u64()).unwrap_or(30) as u32;
+            let count = args.get("count").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             let cookie = cfg.get_fupan("视频监控", "b站cookie");
             let adapter: Box<dyn platform::Platform> = if url.contains("bilibili.com") {
                 Box::new(platform::BilibiliAdapter::with_cookie_and_project_dir(

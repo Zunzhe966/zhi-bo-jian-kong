@@ -85,11 +85,18 @@ fn upload_list_failure_message(official: &str, rsshub: &str, ytdlp: &str) -> Str
 /// 用 B 站 WBI 公钥和投稿列表参数生成签名查询串。
 ///
 /// 纯函数便于单测；排序、拼参、`w_rid` 均按官方 WBI 规则执行。
-fn build_wbi_query(img_key: &str, sub_key: &str, mid: &str, count: u32, wts: u64) -> String {
+fn build_wbi_query(
+    img_key: &str,
+    sub_key: &str,
+    mid: &str,
+    count: u32,
+    page: u32,
+    wts: u64,
+) -> String {
     let mut params = [
         ("mid".to_string(), mid.to_string()),
         ("ps".to_string(), count.to_string()),
-        ("pn".to_string(), "1".to_string()),
+        ("pn".to_string(), page.to_string()),
         ("order".to_string(), "pubdate".to_string()),
         ("platform".to_string(), "web".to_string()),
         ("web_location".to_string(), "1550101".to_string()),
@@ -104,6 +111,24 @@ fn build_wbi_query(img_key: &str, sub_key: &str, mid: &str, count: u32, wts: u64
     let mixin = mixin_key(img_key, sub_key);
     let digest = md5_hex(&format!("{query}{mixin}"));
     format!("{query}&w_rid={digest}")
+}
+
+/// 判断 B站投稿列表是否应继续翻页。
+///
+/// `count == 0` 表示“全部历史视频”：只要总投稿数已知且还没取满就继续；
+/// 否则以 count 为上限。总投稿数未知时，按“当前页是否已取满”保守继续，
+/// 但调用方仍必须设置最大页数护栏，防止接口异常时无限翻页。
+fn should_fetch_more(count: u32, fetched: usize, total: Option<u32>, page: u32) -> bool {
+    if page >= 50 {
+        return false;
+    }
+    if count > 0 && fetched as u32 >= count {
+        return false;
+    }
+    match total {
+        Some(t) => (fetched as u32) < t,
+        None => page < 10,
+    }
 }
 
 pub trait Platform: Send + Sync {
@@ -141,13 +166,15 @@ impl Default for BilibiliAdapter {
 }
 
 impl BilibiliAdapter {
-    /// 请求一次 B站官方投稿接口并解析 BV 列表；返回空表示需要上层换下一组兜底。
+    /// 请求一次 B站官方投稿接口并解析完整元数据；返回 `(videos, total)`。
+    /// `total` 是 `data.page.count`（总投稿数，可能缺失），供分页判断是否
+    /// 还有下一页。空列表表示需要上层换下一组兜底。
     async fn request_upload_ids(
         &self,
         signed_query: &str,
         headers: &reqwest::header::HeaderMap,
         count: u32,
-    ) -> Vec<String> {
+    ) -> (Vec<VideoMeta>, Option<u32>) {
         let signed = format!("https://api.bilibili.com/x/space/wbi/arc/search?{signed_query}");
         let Ok(resp) = self
             .client
@@ -156,21 +183,24 @@ impl BilibiliAdapter {
             .send()
             .await
         else {
-            return Vec::new();
+            return (Vec::new(), None);
         };
         // HTTP 层必须是成功状态，B站 412/5xx 时继续走 RSSHub/yt-dlp，
         // 不能让 HTML 或错误 JSON 被当成“空列表”。
         if !resp.status().is_success() {
-            return Vec::new();
+            return (Vec::new(), None);
         }
         let Ok(data) = resp.json::<serde_json::Value>().await else {
-            return Vec::new();
+            return (Vec::new(), None);
         };
-        parse_official_upload_response(&data, count)
+        let total = data["data"]["page"]["count"]
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok());
+        (parse_official_upload_response(&data, count), total)
     }
 
     /// 取 B 站 wbi 图片并生成查询签名（w_rid/wts）。失败返回空串，调用方走无签名兜底。
-    async fn wbi_query(&self, mid: &str, count: u32) -> anyhow::Result<String> {
+    async fn wbi_query(&self, mid: &str, count: u32, page: u32) -> anyhow::Result<String> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(20))
             .build()
@@ -206,7 +236,7 @@ impl BilibiliAdapter {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        Ok(build_wbi_query(&img_key, &sub_key, mid, count, wts))
+        Ok(build_wbi_query(&img_key, &sub_key, mid, count, page, wts))
     }
 
     pub fn with_project_dir(project_dir: PathBuf) -> Self {
@@ -417,10 +447,17 @@ impl Platform for BilibiliAdapter {
             // 三个兜底都只返回“空列表”，但空的原因可能是 412 风控，也可能是
             // 网络/DNS 故障。把每级的真实原因带上来，顶层报错才不至于把
             // “api.bilibili.com 解析失败”误导成“请配置 cookie”。
-            let (mut bvids, official_err) = self.upload_ids_official(&mid, count).await;
+            let (official_videos, official_err) = self.upload_ids_official(&mid, count).await;
             let mut rsshub_err = String::new();
             let mut ytdlp_err = String::new();
-            tracing::warn!("B站官方投稿接口返回 {} 条 ({official_err})", bvids.len());
+            tracing::warn!(
+                "B站官方投稿接口返回 {} 条 ({official_err})",
+                official_videos.len()
+            );
+            let mut bvids = official_videos
+                .iter()
+                .map(|v| v.id.clone())
+                .collect::<Vec<_>>();
             if bvids.is_empty() {
                 let (next, err) = self.upload_ids_rsshub(&mid, count).await;
                 bvids = next;
@@ -440,11 +477,15 @@ impl Platform for BilibiliAdapter {
                     &ytdlp_err
                 )));
             }
-            // view 补全并发执行：B站接口单次 1-3 秒，10 条串行会拖慢监控轮次。
-            let results =
-                futures_util::future::join_all(bvids.iter().map(|bvid| self.view(bvid))).await;
-            // 占位/补全失败的结果不能进入历史视频库，否则会伪装成“成功但空”。
-            let out: Vec<VideoMeta> = results.into_iter().flatten().collect();
+            // 官方 vlist 已带标题/封面/时长/日期，直接作为结果；
+            // 兜底源只有 BV 号时仍并发调用 view 补全，避免把占位伪装成成功。
+            let out = if official_videos.is_empty() {
+                let results =
+                    futures_util::future::join_all(bvids.iter().map(|bvid| self.view(bvid))).await;
+                results.into_iter().flatten().collect()
+            } else {
+                official_videos
+            };
             if out.is_empty() {
                 return Err(anyhow!("B站视频信息补全失败，请配置 B站 cookie 或稍后重试"));
             }
@@ -454,9 +495,9 @@ impl Platform for BilibiliAdapter {
 }
 
 impl BilibiliAdapter {
-    /// 返回 `(bv_ids, 失败原因)`。失败原因用于顶层区分风控与网络故障，
+    /// 返回 `(videos, 失败原因)`。失败原因用于顶层区分风控与网络故障，
     /// 空串表示“无具体原因可描述”。
-    async fn upload_ids_official(&self, mid: &str, count: u32) -> (Vec<String>, String) {
+    async fn upload_ids_official(&self, mid: &str, count: u32) -> (Vec<VideoMeta>, String) {
         // 旧 Python 的投稿列表接口明确不使用匿名 buvid：那会更容易触发 412。
         // 这里只使用用户配置或浏览器授权 Cookie，不补匿名设备 Cookie。
         let cookie = self.upload_list_cookie();
@@ -478,32 +519,44 @@ impl BilibiliAdapter {
         // 一次失败不代表接口不可用：重试一次再回退 RSSHub/yt-dlp，避免
         // 偶发网络抖动让官方接口被静默跳过。
         let mut reason = String::new();
-        for attempt in 0..2 {
-            match self.wbi_query(mid, count).await {
-                Ok(signed_query) => {
-                    let ids = self
-                        .request_upload_ids(&signed_query, &headers, count)
-                        .await;
-                    if !ids.is_empty() {
-                        return (ids, reason);
-                    }
-                    if reason.is_empty() {
-                        reason = "官方 wbi 接口未返回 BV（可能是 412 风控或接口变更）".to_string();
-                    }
-                    tracing::warn!(
-                        "B站官方投稿接口第 {} 次尝试未返回 BV，重试一次",
-                        attempt + 1
-                    );
-                }
+        let mut out = Vec::new();
+        let mut page = 1u32;
+        let mut total = None;
+        // 官方单页最多约 30 条；固定每页请求 50（B站上限），count=0 时
+        // 表示“全部历史视频”，循环直到 total 读完或 50 页护栏。
+        // 分页失败时把已收集的视频交给上层兜底判断，不能把“只拿到半截”
+        // 当作完整成功。
+        let page_size = if count == 0 { 50 } else { count };
+        loop {
+            let signed = match self.wbi_query(mid, page_size, page).await {
+                Ok(q) => q,
                 Err(e) => {
                     if reason.is_empty() {
                         reason = format!("官方接口签名失败: {e:#}");
                     }
-                    tracing::warn!("B站官方 wbi 签名第 {} 次失败: {e:#}", attempt + 1);
+                    break;
                 }
+            };
+            let (videos, page_total) = self.request_upload_ids(&signed, &headers, page_size).await;
+            if total.is_none() {
+                total = page_total;
             }
+            if videos.is_empty() {
+                if reason.is_empty() {
+                    reason = "官方 wbi 接口未返回 BV（可能是 412 风控或接口变更）".to_string();
+                }
+                break;
+            }
+            out.extend(videos);
+            if !should_fetch_more(count, out.len(), total, page) {
+                break;
+            }
+            page += 1;
         }
-        (Vec::new(), reason)
+        if out.is_empty() {
+            return (Vec::new(), reason);
+        }
+        (out, String::new())
     }
 
     async fn upload_ids_rsshub(&self, mid: &str, count: u32) -> (Vec<String>, String) {
@@ -520,10 +573,12 @@ impl BilibiliAdapter {
                         if ids.is_empty() {
                             return (Vec::new(), "RSSHub 返回 HTML 但未解析出 BV 号".to_string());
                         }
-                        (
-                            ids.into_iter().take(count as usize).collect(),
-                            String::new(),
-                        )
+                        let limit = if count == 0 {
+                            usize::MAX
+                        } else {
+                            count as usize
+                        };
+                        (ids.into_iter().take(limit).collect(), String::new())
                     }
                     Ok(_) => (Vec::new(), "RSSHub 返回非 HTML 内容".to_string()),
                     Err(e) => (Vec::new(), format!("RSSHub 响应读取失败: {e:#}")),
@@ -572,9 +627,13 @@ impl BilibiliAdapter {
             for attempt in 0..2 {
                 let mut cmd = Command::new(&candidate);
                 cmd.kill_on_drop(true);
-                cmd.args(["--flat-playlist", "--playlist-end"])
-                    .arg(count.to_string())
-                    .args(["--print", "%(id)s"])
+                if count > 0 {
+                    cmd.args(["--flat-playlist", "--playlist-end"])
+                        .arg(count.to_string());
+                } else {
+                    cmd.arg("--flat-playlist");
+                }
+                cmd.args(["--print", "%(id)s"])
                     .arg(format!("https://space.bilibili.com/{mid}/video"));
                 if let Some(cookie_file) = &cookie_file {
                     cmd.args(["--cookies", cookie_file.display().to_string().as_str()]);
@@ -594,7 +653,11 @@ impl BilibiliAdapter {
                     .lines()
                     .map(|s| s.trim().to_string())
                     .filter(|s| is_plausible_bvid(s))
-                    .take(count as usize)
+                    .take(if count == 0 {
+                        usize::MAX
+                    } else {
+                        count as usize
+                    })
                     .collect();
                 if !ids.is_empty() {
                     // 之前尝试可能被 412 挡掉，但只要本次 stdout 有完整 BV 列表
@@ -740,7 +803,7 @@ fn is_plausible_bvid(text: &str) -> bool {
 ///
 /// `code != 0`、缺 `data.list.vlist` 或数组中无 BV 都视为“没有可用结果”，
 /// 由上层继续 RSSHub/yt-dlp 兜底，不把风控/空响应伪装成成功。
-fn parse_official_upload_response(data: &serde_json::Value, count: u32) -> Vec<String> {
+fn parse_official_upload_response(data: &serde_json::Value, count: u32) -> Vec<VideoMeta> {
     if data.get("code").and_then(|c| c.as_i64()) != Some(0) {
         return Vec::new();
     }
@@ -749,11 +812,35 @@ fn parse_official_upload_response(data: &serde_json::Value, count: u32) -> Vec<S
     };
     rows.iter()
         .filter_map(|r| {
-            r.get("bvid")
-                .and_then(|b| b.as_str())
-                .map(|s| s.to_string())
+            let bvid = r.get("bvid").and_then(|b| b.as_str())?;
+            let ts = r.get("pubdate").and_then(|t| t.as_i64()).unwrap_or(0);
+            Some(VideoMeta {
+                id: bvid.to_string(),
+                platform: "bilibili".to_string(),
+                url: format!("https://www.bilibili.com/video/{bvid}"),
+                title: r
+                    .get("title")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or(bvid)
+                    .to_string(),
+                cover: r
+                    .get("pic")
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("")
+                    .replace("http://", "https://"),
+                published_at: if ts > 0 {
+                    unix_to_date(ts)
+                } else {
+                    String::new()
+                },
+                duration: r.get("length").and_then(|l| l.as_i64()).unwrap_or(0),
+            })
         })
-        .take(count as usize)
+        .take(if count == 0 {
+            rows.len()
+        } else {
+            count as usize
+        })
         .collect()
 }
 
@@ -1155,6 +1242,7 @@ mod tests {
             "ABCDEFGHIJKLMNOPQRSTUVWXYZ01",
             "946974",
             10,
+            1,
             1786550400,
         );
         assert_eq!(
@@ -1165,34 +1253,61 @@ mod tests {
     }
 
     #[test]
+    fn wbi_query_accepts_page_number() {
+        let query = build_wbi_query(
+            "1234567890abcdefghijklmnopqrstuvwxyz",
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ01",
+            "946974",
+            30,
+            2,
+            1786550400,
+        );
+        assert!(query.contains("pn=2"), "{query}");
+        assert!(query.contains("ps=30"), "{query}");
+    }
+
+    #[test]
+    fn should_fetch_more_respects_count_total_and_page_guard() {
+        // 指定数量：取满即停。
+        assert!(!should_fetch_more(30, 30, Some(80), 1));
+        assert!(should_fetch_more(30, 29, Some(80), 1));
+        // count=0 表示全部：只要还有更多就继续，直到总投稿数读完。
+        assert!(should_fetch_more(0, 30, Some(80), 1));
+        assert!(!should_fetch_more(0, 80, Some(80), 2));
+        // 总投稿数未知：最多翻到 50 页护栏。
+        assert!(should_fetch_more(0, 100, None, 9));
+        assert!(!should_fetch_more(0, 100, None, 10));
+    }
+
+    #[test]
     fn official_upload_response_requires_code_zero_and_bvids() {
         let ok = serde_json::json!({
             "code": 0,
             "data": {"list": {"vlist": [
-                {"bvid": "BV1xx411c7mD"},
-                {"bvid": "BV1yy411c7mD"},
+                {"bvid": "BV1xx411c7mD", "title": "标题甲", "pic": "http://x.test/1.jpg", "pubdate": 1786464000, "length": 61},
+                {"bvid": "BV1yy411c7mD", "title": "标题乙"},
                 {"title": "无 bvid 的行应被忽略"}
             ]}}
         });
-        assert_eq!(
-            parse_official_upload_response(&ok, 10),
-            vec!["BV1xx411c7mD".to_string(), "BV1yy411c7mD".to_string()]
-        );
-        assert_eq!(
-            parse_official_upload_response(&serde_json::json!({"code": -412}), 10),
-            Vec::<String>::new()
-        );
-        assert_eq!(
-            parse_official_upload_response(&serde_json::json!({"code": 0, "data": {}}), 10),
-            Vec::<String>::new()
-        );
-        assert_eq!(
-            parse_official_upload_response(
-                &serde_json::json!({"code": 0, "data": {"list": {"vlist": []}}}),
-                10
-            ),
-            Vec::<String>::new()
-        );
+        let parsed = parse_official_upload_response(&ok, 10);
+        assert_eq!(parsed.len(), 2, "应忽略无 bvid 的行");
+        assert_eq!(parsed[0].id, "BV1xx411c7mD");
+        assert_eq!(parsed[0].title, "标题甲");
+        assert_eq!(parsed[0].cover, "https://x.test/1.jpg");
+        assert_eq!(parsed[0].published_at, "2026-08-12");
+        assert_eq!(parsed[0].duration, 61);
+        assert_eq!(parsed[1].id, "BV1yy411c7mD");
+        assert_eq!(parsed[1].title, "标题乙");
+        for bad in [
+            serde_json::json!({"code": -412}),
+            serde_json::json!({"code": 0, "data": {}}),
+            serde_json::json!({"code": 0, "data": {"list": {"vlist": []}}}),
+        ] {
+            assert!(
+                parse_official_upload_response(&bad, 10).is_empty(),
+                "无有效 vlist 时应返回空，而不是伪装成成功"
+            );
+        }
     }
 
     #[test]
