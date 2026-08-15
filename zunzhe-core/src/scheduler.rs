@@ -111,21 +111,41 @@ pub async fn run_daemon(
     };
     // 独立下载队列 worker：不参与 70 秒 tick 护栏，每个任务自身有 600 秒超时。
     // 下载耗时不会阻塞直播/视频检查，也不会被 tick abort 后永远卡 processing。
-    let mut download_worker = tokio::spawn(download::run_download_worker(
-        pool.clone(),
-        project_dir.to_path_buf(),
+    let download_pool = pool.clone();
+    let download_project = project_dir.to_path_buf();
+    let mut download_worker = spawn_supervised_worker(
+        "下载",
+        stop.0.clone(),
         stop.1.clone(),
-        std::time::Duration::from_secs(600),
-        std::time::Duration::from_secs(5),
-    ));
+        Duration::from_secs(5),
+        move |rx| {
+            download::run_download_worker(
+                download_pool.clone(),
+                download_project.clone(),
+                rx,
+                std::time::Duration::from_secs(600),
+                std::time::Duration::from_secs(5),
+            )
+        },
+    );
     // 独立复盘队列 worker：下载/录制完成后自动转写、提炼、切片。
-    let mut pipeline_worker = tokio::spawn(crate::pipeline_bridge::run_pipeline_worker(
-        pool.clone(),
-        project_dir.to_path_buf(),
+    let pipeline_pool = pool.clone();
+    let pipeline_project = project_dir.to_path_buf();
+    let mut pipeline_worker = spawn_supervised_worker(
+        "复盘",
+        stop.0.clone(),
         stop.1.clone(),
-        std::time::Duration::from_secs(3600),
-        std::time::Duration::from_secs(5),
-    ));
+        Duration::from_secs(5),
+        move |rx| {
+            crate::pipeline_bridge::run_pipeline_worker(
+                pipeline_pool.clone(),
+                pipeline_project.clone(),
+                rx,
+                std::time::Duration::from_secs(3600),
+                std::time::Duration::from_secs(5),
+            )
+        },
+    );
     // 独立心跳记录器：每 60 秒把“daemon 进程仍在运行”写入 uptime 日志，
     // 不依赖 launchd/桌面端 watchdog；launchd 被 macOS TCC 挡在 ~/Desktop 外时
     // 也能持续留下 24×30 验收记录。主日志轮转交给外层启动器（start_rust_daemon
@@ -298,6 +318,79 @@ pub async fn run_daemon(
     }
 }
 
+/// 启动一个带自愈监督的队列 worker。
+///
+/// worker 自身返回 `Err` 或 panic 时，单个 worker 不应拖垮整个 daemon：
+/// 监督任务记录诊断并重新拉起 worker（最多 3 次连续失败，避免坏配置无限
+/// 快速重启刷日志）。停止信号优先于重启；外层停机时会 abort 内层任务并
+/// 归还 processing 队列，避免任务永久卡死。
+fn spawn_supervised_worker<F, Fut>(
+    name: &'static str,
+    stop_tx: tokio::sync::watch::Sender<bool>,
+    mut stop_rx: tokio::sync::watch::Receiver<bool>,
+    restart_delay: Duration,
+    factory: F,
+) -> tokio::task::JoinHandle<anyhow::Result<()>>
+where
+    F: Fn(tokio::sync::watch::Receiver<bool>) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut consecutive_failures = 0u64;
+        let mut task = tokio::spawn(factory(stop_rx.clone()));
+        loop {
+            let result = tokio::select! {
+                _ = stop_rx.changed() => {
+                    if *stop_rx.borrow() {
+                        task.abort();
+                        let _ = task.await;
+                        return Ok(());
+                    }
+                    continue;
+                }
+                r = &mut task => r,
+            };
+            if *stop_rx.borrow() {
+                return Ok(());
+            }
+            consecutive_failures += 1;
+            let (normal, reason) = match &result {
+                Ok(Ok(())) => (true, "正常退出".to_string()),
+                Ok(Err(e)) => (false, format!("失败: {e:#}")),
+                Err(join) if join.is_panic() => (false, "panic".to_string()),
+                Err(_) => (false, "已取消".to_string()),
+            };
+            if normal {
+                info!("{} worker 正常退出，重启后重新接管队列", name);
+                consecutive_failures = 0;
+            }
+            warn!(
+                "{} worker 退出（{reason}，连续失败 {consecutive_failures} 次），5 秒后自动重启",
+                name
+            );
+            if consecutive_failures >= 3 {
+                error!(
+                    "{} worker 连续失败 3 次，停止自动重启并触发 daemon 停机",
+                    name
+                );
+                let _ = stop_tx.send(true);
+                return Err(anyhow!("{} worker 连续失败 3 次", name));
+            }
+            let mut waiting = false;
+            tokio::select! {
+                _ = stop_rx.changed() => {
+                    waiting = *stop_rx.borrow();
+                }
+                _ = tokio::time::sleep(restart_delay) => {}
+            }
+            if waiting {
+                return Ok(());
+            }
+            task = tokio::spawn(factory(stop_rx.clone()));
+        }
+    })
+}
+
 /// 所有退出路径共用同一套收尾逻辑，确保 SIGTERM/SIGINT、--once、--duration、
 /// 外部 stop 命令都不会遗留 ffmpeg 或下载/复盘子任务。
 async fn shutdown_daemon(
@@ -322,10 +415,9 @@ async fn stop_download_worker(
     worker: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
 ) {
     let _ = stop.send(true);
-    if !worker.is_finished() {
-        worker.abort();
-        let _ = worker.await;
-    }
+    // 监督器收到 stop 后会先 abort 内层 worker，再返回；直接等它收尾，
+    // 不能只 abort 监督任务本身，否则内层下载任务可能仍在后台跑。
+    let _ = worker.await;
     let _ = db::recover_processing_by_kind(pool, "download").await;
 }
 
@@ -336,10 +428,7 @@ async fn stop_pipeline_worker(
     worker: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
 ) {
     let _ = stop.send(true);
-    if !worker.is_finished() {
-        worker.abort();
-        let _ = worker.await;
-    }
+    let _ = worker.await;
     let _ = db::recover_processing_by_kind(pool, "process").await;
 }
 
@@ -763,6 +852,91 @@ mod tests {
         // 条，否则新视频会被误判成“已基线”而永久漏通知。
         const _: () = assert!(SCHEDULER_VIDEO_WINDOW >= 11, "窗口过小会漏掉爆发式发布");
         assert_eq!(SCHEDULER_VIDEO_WINDOW, 30);
+    }
+
+    #[tokio::test]
+    async fn supervised_worker_restarts_after_error_and_stops_after_three() {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let attempts_clone = attempts.clone();
+        let supervisor = spawn_supervised_worker(
+            "测试",
+            tx.clone(),
+            rx,
+            Duration::from_millis(20),
+            move |_stop| {
+                let attempts = attempts_clone.clone();
+                async move {
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err(anyhow::anyhow!("模拟 worker 异常"))
+                }
+            },
+        );
+        // 连续失败 3 次后监督器应主动停机并返回错误。
+        let result = supervisor.await.expect("监督器任务本身不应 panic");
+        assert!(result.is_err(), "连续失败 3 次监督器应返回错误: {result:?}");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(*tx.borrow(), "连续失败后应触发 daemon 停机信号");
+    }
+
+    #[tokio::test]
+    async fn supervised_worker_recovers_from_panic() {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let attempts_clone = attempts.clone();
+        let supervisor = spawn_supervised_worker(
+            "测试",
+            tx.clone(),
+            rx,
+            Duration::from_millis(20),
+            move |_stop| {
+                let attempts = attempts_clone.clone();
+                async move {
+                    let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if n < 2 {
+                        panic!("模拟 worker panic");
+                    }
+                    tokio::time::sleep(Duration::from_millis(10_000)).await;
+                    Ok(())
+                }
+            },
+        );
+        // 前两次 panic 由监督器隔离并重启，第三次进入正常等待状态。
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(!*tx.borrow(), "panic 自愈成功不应触发停机");
+        tx.send(true).unwrap();
+        assert!(supervisor.await.expect("监督器任务本身不应 panic").is_ok());
+    }
+
+    #[tokio::test]
+    async fn supervised_worker_stop_aborts_inner_long_task() {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let running = std::sync::Arc::new(tokio::sync::Notify::new());
+        let running_clone = running.clone();
+        let supervisor = spawn_supervised_worker(
+            "测试",
+            tx.clone(),
+            rx,
+            Duration::from_millis(20),
+            move |_stop| {
+                let running = running_clone.clone();
+                async move {
+                    running.notify_waiters();
+                    tokio::time::sleep(Duration::from_millis(10_000)).await;
+                    Ok(())
+                }
+            },
+        );
+        running.notified().await;
+        // 停机信号必须在监督器等待窗口内被响应，并 abort 内层 10 秒任务。
+        tx.send(true).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(2_000);
+        tokio::time::timeout_at(deadline, supervisor)
+            .await
+            .expect("stop 后监督器应在时限内返回")
+            .expect("监督器任务本身不应 panic")
+            .expect("停机路径应返回 Ok");
     }
 
     #[tokio::test]
