@@ -618,7 +618,8 @@ export default function App() {
         date: v.date || v.published_at || '',
       }))
       setHistoryVideos(list)
-      if (!list.length) message.warning('没拉到视频，可能该地址不是博主主页，或需要在设置里先做 B站授权')
+      if (r.warning) message.warning(r.warning)
+      else if (!list.length) message.warning('没拉到视频，可能该地址不是博主主页，或需要在设置里先做 B站授权')
     } catch (e) {
       message.error(String(e.message || e))
     } finally {

@@ -16,6 +16,15 @@ pub struct VideoLibrary {
     fupan_dir: PathBuf,
 }
 
+/// 历史视频浏览的结果：拉取成功时返回最新列表；平台风控/网络失败时回退
+/// 到本地已入库缓存，避免用户想看“以前下载过没”时直接被报错挡住。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BrowseOutcome {
+    pub videos: Vec<Video>,
+    pub from_cache: bool,
+    pub warning: Option<String>,
+}
+
 impl VideoLibrary {
     pub fn new(pool: SqlitePool, fupan_dir: PathBuf) -> Self {
         Self { pool, fupan_dir }
@@ -77,6 +86,39 @@ impl VideoLibrary {
         downloaded_only: bool,
     ) -> Result<Vec<Video>> {
         db::get_videos(&self.pool, source_url, anchor, downloaded_only).await
+    }
+}
+
+/// 浏览博主历史视频的公共入口：成功时入库并返回最新列表；失败但本地已有
+/// 该博主的视频记录时，回退显示缓存列表并附上原因，不让一次平台 412 就
+/// 让“已下载/未下载”完全不可见。只有既拉取失败又没有缓存时才向上报错。
+pub async fn browse_with_fallback(
+    library: &VideoLibrary,
+    fetch: anyhow::Result<Vec<VideoMeta>>,
+    source_url: &str,
+) -> anyhow::Result<BrowseOutcome> {
+    match fetch {
+        Ok(metas) => {
+            let _ = library.upsert_browse_many(&metas, source_url).await;
+            let videos = library.list(source_url, "", false).await?;
+            Ok(BrowseOutcome {
+                videos,
+                from_cache: false,
+                warning: None,
+            })
+        }
+        Err(e) => {
+            let videos = library.list(source_url, "", false).await?;
+            if videos.is_empty() {
+                return Err(e);
+            }
+            tracing::warn!("历史视频拉取失败，显示本地缓存: {e:#}");
+            Ok(BrowseOutcome {
+                videos,
+                from_cache: true,
+                warning: Some(format!("平台拉取失败，已显示上次缓存列表: {e:#}")),
+            })
+        }
     }
 }
 
@@ -519,6 +561,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows.len(), 8);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn browse_falls_back_to_cache_when_platform_fails() {
+        let root = std::env::temp_dir().join(format!(
+            "zunzhe-browse-fallback-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("fupan_output")).unwrap();
+        let file = root.join("main.db");
+        let pool = crate::db::open_pool(&file).await.unwrap();
+        crate::db::init_db(&pool).await.unwrap();
+        let library = VideoLibrary::new(pool.clone(), root.join("fupan_output"));
+        let source = "https://space.bilibili.com/946974";
+
+        // 无缓存时平台失败应原样报错，不能假装有列表。
+        let err = browse_with_fallback(&library, Err(anyhow::anyhow!("412 风控")), source)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("412"));
+
+        // 先成功入库一条，再模拟平台失败：应回退到缓存并带明确标记。
+        let meta = VideoMeta {
+            id: "BV1".into(),
+            platform: "bilibili".into(),
+            url: "https://www.bilibili.com/video/BV1".into(),
+            title: "已有视频".into(),
+            cover: String::new(),
+            published_at: "2026-08-15".into(),
+            duration: 120,
+        };
+        library.upsert_browse(&meta, source).await.unwrap();
+        let outcome = browse_with_fallback(&library, Err(anyhow::anyhow!("RSSHub 403")), source)
+            .await
+            .unwrap();
+        assert!(outcome.from_cache);
+        assert_eq!(outcome.videos.len(), 1);
+        assert!(outcome.warning.as_deref().unwrap().contains("RSSHub 403"));
 
         let _ = std::fs::remove_dir_all(&root);
     }

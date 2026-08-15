@@ -397,20 +397,23 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             } else {
                 Box::new(platform::RssAdapter::new())
             };
-            let videos = adapter.list_videos(&url, count).await?;
             let library = video_library::VideoLibrary::new(pool.clone(), fupan_dir.clone());
-            // 批量浏览统一走有界并发入库：封面下载不串行，单张失败不阻塞
-            // 其余视频，历史列表几十上百条时也不会被慢封面拖住。
-            let _ = library.upsert_browse_many(&videos, &url).await;
-            // 返回已入库的视频，让前端拿到封面缓存、日期、时长与已下载标记，
-            // 而不是只有平台适配器返回的原始 VideoMeta。
-            let persisted = library.list(&url, "", false).await?;
+            // 平台拉取失败但有本地缓存时回退显示缓存，避免 412 风控让用户
+            // 连“以前下载过没”都看不到；无缓存才把真实错误抛给桌面端。
+            let outcome = video_library::browse_with_fallback(
+                &library,
+                adapter.list_videos(&url, count).await,
+                &url,
+            )
+            .await?;
             let result = json!({
                 "ok": true,
                 "platform": adapter.name(),
                 "url": url,
-                "count": persisted.len(),
-                "videos": video_library::videos_compat_json(&persisted),
+                "count": outcome.videos.len(),
+                "from_cache": outcome.from_cache,
+                "warning": outcome.warning,
+                "videos": video_library::videos_compat_json(&outcome.videos),
             });
             println!("{}", result);
         }

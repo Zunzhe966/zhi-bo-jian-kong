@@ -59,12 +59,13 @@ Python 工具层  faster-whisper / LLM 提炼 / ffmpeg 切片 / yt-dlp 兜底
   `cargo test --all-targets`、release 构建与 CLI 契约冒烟，作为“三平台可编译运行”
   的自动化证据。
 - 当前真实状态：GitHub Actions 账户计费未恢复，三平台 CI 全部 `not started`；
-  本机 macOS 全量回归已绿（193 lib + 1 ignored + 6 集成契约），Windows/Linux
-  本机交叉 check 因缺 C 交叉编译器无法作为最终证据。
+  本机 macOS 全量回归已绿（210 passed + 1 ignored + 7 集成契约）；Windows/Linux
+  已用 Zig 0.16 完成交叉链接（`check-cross-zig.sh`），Linux 另有 Docker 真实
+  构建与 `run-daemon --once` 实跑验证。
 
 ### Rust 重构（zunzhe-core）已交付能力
 
-- M0-M17 全部完成并通过 `cargo test --all-targets`（193 lib + 1 ignored + 6
+- M0-M17 全部完成并通过 `cargo test --all-targets`（210 passed + 1 ignored + 7
   集成契约测试）+ `cargo clippy --all-targets -D warnings` + `cargo fmt --check`
 - M13 组装收尾：macOS 守护脚本、launchd 模板、使用说明、图谱更新
 - CLI/MCP 命令与 Python 版对齐；SQLite 持久化、崩溃可恢复、任务失败只记日志不拖垮 daemon

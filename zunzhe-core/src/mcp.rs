@@ -370,12 +370,15 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
             } else {
                 Box::new(platform::RssAdapter::new())
             };
-            let videos = adapter.list_videos(&url, count).await?;
-            // 与 CLI blogger-videos 共用同一批量入库路径，封面有界并发。
-            let _ = library.upsert_browse_many(&videos, &url).await;
-            let persisted = library.list(&url, "", false).await?;
+            // 与 CLI blogger-videos 共用同一浏览入口：成功入库，失败回退缓存。
+            let outcome = crate::video_library::browse_with_fallback(
+                library,
+                adapter.list_videos(&url, count).await,
+                &url,
+            )
+            .await?;
             Ok(serde_json::to_string(
-                &json!({"ok":true,"platform":adapter.name(),"count":persisted.len(),"videos":crate::video_library::videos_compat_json(&persisted)}),
+                &json!({"ok":true,"platform":adapter.name(),"count":outcome.videos.len(),"from_cache":outcome.from_cache,"warning":outcome.warning,"videos":crate::video_library::videos_compat_json(&outcome.videos)}),
             )?)
         }
         "download_video" | "video_download" => {
