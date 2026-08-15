@@ -1198,6 +1198,18 @@ export default function App() {
           这里显示最近 50 条失败通知。配置邮箱/微信补齐后点「重试全部失败通知」；
           不需要的历史失败记录可以清理，避免通知健康一直显示异常。
         </p>
+        {status?.notify_health?.hint ? (
+          <div style={{
+            marginBottom: 12,
+            padding: '10px 12px',
+            borderRadius: 8,
+            background: status?.notify_health?.ok ? '#f6ffed' : '#fff1f0',
+            border: `1px solid ${status?.notify_health?.ok ? '#b7eb8f' : '#ffccc7'}`,
+            color: '#333',
+          }}>
+            <strong>诊断建议：</strong> {status?.notify_health?.hint}
+          </div>
+        ) : null}
         <Table
           rowKey="id"
           loading={notifyLoading}

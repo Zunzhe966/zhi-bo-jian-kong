@@ -663,12 +663,17 @@ pub fn diagnostics(project_dir: &Path) -> Result<serde_json::Value> {
     let switches = crate::download::PipelineSwitches::load(project_dir);
     // 通知投递健康摘要：由调用方注入 DB 数据，doctor 只负责把字段原样返回，
     // 避免这里异步查询破坏同步签名。读取失败时字段为 null，不让 doctor 失败。
+    let notify_configured = loaded_cfg
+        .as_ref()
+        .is_some_and(|cfg| cfg.email_configured() || cfg.push_channels().configured());
     let notify_health = json!({
-        "configured": loaded_cfg.as_ref().is_some_and(|cfg| cfg.email_configured() || cfg.push_channels().configured()),
+        "configured": notify_configured,
         "pending": null,
         "failed": null,
         "sent": null,
         "ok": null,
+        "latest_failed_channel": null,
+        "hint": crate::db::notify_health_hint(0, 0, notify_configured, None),
     });
     Ok(json!({
         "ok": true,

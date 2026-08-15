@@ -107,6 +107,7 @@ print(json.dumps({
     "source_failing": last.get("source_failing", 0),
     "notify_pending": last.get("notify_pending", 0),
     "notify_failed": last.get("notify_failed", 0),
+    "notify_hint": last.get("notify_hint"),
     "last_age_secs": int(last_age),
 }, ensure_ascii=False))
 PY
@@ -171,6 +172,8 @@ print(json.dumps({
   "source_ok": bool(sh.get("ok", True)),
   "notify_pending": nh.get("pending", 0),
   "notify_failed": nh.get("failed", 0),
+  "notify_latest_failed_channel": nh.get("latest_failed_channel"),
+  "notify_hint": nh.get("hint"),
   "notify_ok": bool(nh.get("ok", True)),
 }, ensure_ascii=False))' 2>/dev/null || true)"
 if [ -z "$health" ]; then

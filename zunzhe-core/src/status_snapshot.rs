@@ -56,16 +56,27 @@ pub async fn build(project_dir: &Path, pool: &SqlitePool, cfg: &Config) -> Resul
     let notify_health = match db::notify_health_summary(pool).await {
         Ok((pending, failed, sent)) => {
             let configured = cfg.email_configured() || cfg.push_channels().configured();
+            let latest_failed_channel = db::latest_failed_notify_channel(pool).await.ok().flatten();
             json!({
                 "pending": pending,
                 "failed": failed,
                 "sent": sent,
                 "configured": configured,
                 "ok": failed == 0 && pending == 0 && configured,
+                "latest_failed_channel": latest_failed_channel,
+                "hint": db::notify_health_hint(pending, failed, configured, latest_failed_channel.as_deref()),
             })
         }
         Err(_) => {
-            json!({"pending": null, "failed": null, "sent": null, "configured": null, "ok": null})
+            json!({
+                "pending": null,
+                "failed": null,
+                "sent": null,
+                "configured": null,
+                "ok": null,
+                "latest_failed_channel": null,
+                "hint": "通知健康查询失败，请查看 daemon 日志",
+            })
         }
     };
 
@@ -498,6 +509,15 @@ mod tests {
         let status = build(&dir, &pool, &cfg).await.unwrap();
         assert_eq!(status["notify_health"]["failed"], json!(1));
         assert_eq!(status["notify_health"]["ok"], json!(false));
+        assert_eq!(
+            status["notify_health"]["latest_failed_channel"],
+            json!("微信")
+        );
+        let hint = status["notify_health"]["hint"].as_str().unwrap();
+        assert!(
+            hint.contains("Server酱"),
+            "未配置时应给出可操作提示: {hint}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -649,7 +649,7 @@ async fn tick(
                         Ok(_) if is_new => {
                             known.insert(v.id.clone());
                             if notify_enabled {
-                                let title = "【尊者直播监控】博主发布新视频".to_string();
+                                let title = new_video_notify_title(&name, &v.title);
                                 let content =
                                     format!("博主：{}\n标题：{}\n链接：{}", name, v.title, v.url);
                                 match notifier
@@ -849,6 +849,12 @@ pub async fn check_video_sources(
         Ok(result) => result,
         Err(_) => Err(anyhow!("check-videos 超过 70 秒，已中止本轮检查")),
     }
+}
+
+/// 新视频通知标题：与旧 Python `send_new_video_alert` 对齐，带上博主名和
+/// 视频标题，避免多条不同视频在通知列表里看起来都像同一条。
+fn new_video_notify_title(anchor: &str, video_title: &str) -> String {
+    format!("【新视频】{anchor} 发布了新内容：{video_title}")
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -1153,6 +1159,16 @@ mod tests {
             assert!(waited.saturating_add(step) <= limit);
             waited = waited.saturating_add(step);
         }
+    }
+
+    #[test]
+    fn new_video_notify_title_includes_anchor_and_video() {
+        let title = new_video_notify_title("测试UP主", "你被AI内容骗过吗？");
+        assert_eq!(title, "【新视频】测试UP主 发布了新内容：你被AI内容骗过吗？");
+        assert!(
+            title.contains("你被AI内容骗过吗？"),
+            "标题必须带上视频标题，避免多条不同视频看起来像同一条: {title}"
+        );
     }
 
     #[test]

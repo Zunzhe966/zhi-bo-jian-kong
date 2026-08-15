@@ -4,6 +4,16 @@
 > 再看 `需求梳理与Rust重构方案.md`（需求与设计）和 `git status`（进度），
 > 然后从"当前阶段"继续。
 
+## 运行权限基线（不可漂移）
+
+本项目的 Codex 运行配置锚定在 `.codex/config.toml`，固定为：
+
+- `approval_policy = "never"`：不向用户弹审批。
+- `default_permissions = ":danger-full-access"`：默认完全访问。
+- 项目目录标记为 `trusted`，保证本地读写与网络访问不受限制。
+
+如果桌面对话右上角的模式显示不是“完全访问”，通常是因为某个 Codex 对话被单独选择了“工作区/只读”等模式，或应用更新后重新创建了会话。恢复方法：打开该任务的权限/模式选择器，切回“完全访问”；或确认项目根目录下 `.codex/config.toml` 仍保持上面的三行配置，然后重启该任务。不要依赖其他任务或临时配置来覆盖本项目的基线。
+
 ## 一、项目是什么
 
 - GitHub 私有仓库：`Zunzhe966/zun-zhe-zhi-bo-jian-kong`

@@ -804,6 +804,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 && let Some(obj) = diag.as_object_mut()
             {
                 let configured = cfg.email_configured() || cfg.push_channels().configured();
+                let latest_failed_channel =
+                    db::latest_failed_notify_channel(&pool).await.ok().flatten();
                 obj.insert(
                     "notify_health".to_string(),
                     json!({
@@ -812,6 +814,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                         "sent": sent,
                         "configured": configured,
                         "ok": failed == 0 && pending == 0 && configured,
+                        "latest_failed_channel": latest_failed_channel,
+                        "hint": db::notify_health_hint(
+                            pending,
+                            failed,
+                            configured,
+                            latest_failed_channel.as_deref(),
+                        ),
                     }),
                 );
             }

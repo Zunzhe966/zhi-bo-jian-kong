@@ -664,6 +664,31 @@ mod maintenance_tests {
         let _ = std::fs::remove_file(file.with_extension("db-wal"));
     }
 
+    #[test]
+    fn notify_health_hint_points_to_action() {
+        let configured = false;
+        let hint = crate::db::notify_health_hint(0, 2, configured, Some("微信")).unwrap();
+        assert!(hint.contains("Server酱"), "未配置时应提示 Server酱: {hint}");
+        assert!(hint.contains("notify-retry"), "未配置时应提示重试: {hint}");
+
+        let hint = crate::db::notify_health_hint(0, 1, true, Some("PushPlus")).unwrap();
+        assert!(hint.contains("PushPlus"), "应定位失败通道: {hint}");
+        assert!(
+            hint.contains("notify-prune"),
+            "已配置失败应提示清理: {hint}"
+        );
+
+        let hint = crate::db::notify_health_hint(3, 0, true, None).unwrap();
+        assert!(hint.contains("等待发送"), "pending 应提示等待/重试: {hint}");
+
+        assert!(crate::db::notify_health_hint(0, 0, true, None).is_none());
+        let hint = crate::db::notify_health_hint(0, 0, false, None).unwrap();
+        assert!(
+            hint.contains("不会发送通知"),
+            "未配置空队列也应提示: {hint}"
+        );
+    }
+
     #[tokio::test]
     async fn maintenance_prunes_finished_live_sessions_keeps_recording() {
         let file = std::env::temp_dir().join(format!(
@@ -2039,6 +2064,54 @@ pub async fn notify_health_summary(pool: &SqlitePool) -> anyhow::Result<(u64, u6
         failed.max(0) as u64,
         sent.max(0) as u64,
     ))
+}
+
+/// 生成可操作的通知健康提示，供 status/CLI doctor/MCP doctor 共用。
+///
+/// 返回值中的 `hint` 给用户/智能体下一步动作，`latest_failed_channel` 用于
+/// 精确定位是哪条通道未配置或投递失败。规则：
+/// - 未配置任何通道且存在失败记录：优先提示配置邮箱/Server酱。
+/// - 有失败记录：提示清理或重试，并给出最近一条失败通道。
+/// - 有 pending 堆积：提示等待重试或检查网络。
+/// - 全部健康：返回 None。
+pub fn notify_health_hint(
+    pending: u64,
+    failed: u64,
+    configured: bool,
+    latest_failed_channel: Option<&str>,
+) -> Option<String> {
+    if failed > 0 {
+        let channel = latest_failed_channel
+            .filter(|s| !s.is_empty())
+            .unwrap_or("未知");
+        if !configured {
+            return Some(format!(
+                "通知失败 {failed} 条：未配置可用通知通道，请在 config.ini 补齐邮箱(SMTP)或 Server酱 SendKey 后执行 notify-retry 0"
+            ));
+        }
+        return Some(format!(
+            "通知失败 {failed} 条（最近通道：{channel}）：请检查该通道配置/网络，或执行 notify-retry 0 重试；确认无需再发送可执行 notify-prune failed 0 清理"
+        ));
+    }
+    if pending > 0 {
+        return Some(format!(
+            "有 {pending} 条通知等待发送：daemon 会按退避重试，也可检查网络或通知通道配置"
+        ));
+    }
+    if !configured {
+        return Some("通知通道未配置：邮箱/Server酱都为空，当前不会发送通知".to_string());
+    }
+    None
+}
+
+/// 查询最近一条 failed 通知的通道，供健康提示定位配置缺口。
+pub async fn latest_failed_notify_channel(pool: &SqlitePool) -> anyhow::Result<Option<String>> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT channel FROM notify WHERE status='failed' ORDER BY id DESC LIMIT 1")
+            .fetch_optional(pool)
+            .await
+            .context("查询最近失败通知通道")?;
+    Ok(row.map(|r| r.0))
 }
 
 #[cfg(test)]
