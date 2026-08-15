@@ -143,6 +143,37 @@ fn mcp_tools_cover_core_cli_commands() {
     }
 }
 
+/// 批量下载契约：CLI 输出必须带桌面端“下载全部/下载选中”依赖的汇总字段。
+/// 桌面端不再逐条循环调用 download-video，而是解析这里的 queued/errors/
+/// duplicated/skipped_downloaded，字段缺失会让批量按钮的提示和失败统计失效。
+#[test]
+fn batch_download_summary_contract() {
+    let summary = zunzhe_core::download::BatchDownloadSummary {
+        requested: 0,
+        queued: 0,
+        duplicated: 0,
+        skipped_downloaded: 0,
+        errors: 0,
+        task_ids: vec![],
+        error_messages: vec![],
+    };
+    let json = serde_json::to_value(&summary).unwrap();
+    for field in [
+        "requested",
+        "queued",
+        "duplicated",
+        "skipped_downloaded",
+        "errors",
+        "task_ids",
+        "error_messages",
+    ] {
+        assert!(
+            json.get(field).is_some(),
+            "批量下载汇总缺少桌面端依赖字段: {field}"
+        );
+    }
+}
+
 /// 真实进程级崩溃恢复契约：SIGKILL 后单实例锁自动让出，新实例可重获。
 #[cfg(unix)]
 #[test]

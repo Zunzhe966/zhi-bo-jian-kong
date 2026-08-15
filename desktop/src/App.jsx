@@ -637,18 +637,21 @@ export default function App() {
     if (!historySelected.length) return message.warning('请先勾选要下载的视频')
     setHistoryDownloading(true)
     const name = historyBlogger?.name || '批量下载'
-    let ok = 0
-    let fail = 0
-    for (const url of historySelected) {
-      try {
-        const r = await window.desktop.cli('download-video', url, name)
-        r.ok && r.queued ? ok++ : fail++
-      } catch { fail++ }
+    try {
+      const items = historySelected.map((url) => ({ url, name }))
+      const r = await window.desktop.cli('download-videos', JSON.stringify(items))
+      const queued = r.queued || 0
+      const duplicated = r.duplicated || 0
+      const skipped = r.skipped_downloaded || 0
+      const failed = r.errors || 0
+      message[failed ? 'warning' : 'success'](`已加入下载队列：${queued} 个，已存在 ${duplicated} 个，已下载跳过 ${skipped} 个，失败 ${failed} 个。完成后文件在 downloads/短视频/${name}/`)
+      await fetchStatus()
+      await openHistory(historyBlogger)
+    } catch (e) {
+      message.error(String(e.message || e))
+    } finally {
+      setHistoryDownloading(false)
     }
-    setHistoryDownloading(false)
-    message[fail ? 'warning' : 'success'](`已加入下载队列：${ok} 个，失败 ${fail} 个。完成后文件在 downloads/短视频/${name}/`)
-    await fetchStatus()
-    await openHistory(historyBlogger)
   }
 
   const downloadAll = async () => {
@@ -656,18 +659,21 @@ export default function App() {
     if (!todo.length) return message.warning('没有未下载的视频')
     setHistoryDownloading(true)
     const name = historyBlogger?.name || '批量下载'
-    let ok = 0
-    let fail = 0
-    for (const url of todo) {
-      try {
-        const r = await window.desktop.cli('download-video', url, name)
-        r.ok && r.queued ? ok++ : fail++
-      } catch { fail++ }
+    try {
+      const items = todo.map((url) => ({ url, name }))
+      const r = await window.desktop.cli('download-videos', JSON.stringify(items))
+      const queued = r.queued || 0
+      const duplicated = r.duplicated || 0
+      const skipped = r.skipped_downloaded || 0
+      const failed = r.errors || 0
+      message[failed ? 'warning' : 'success'](`已加入下载队列：${queued} 个，已存在 ${duplicated} 个，已下载跳过 ${skipped} 个，失败 ${failed} 个。完成后文件在 downloads/短视频/${name}/`)
+      await fetchStatus()
+      await openHistory(historyBlogger)
+    } catch (e) {
+      message.error(String(e.message || e))
+    } finally {
+      setHistoryDownloading(false)
     }
-    setHistoryDownloading(false)
-    message[fail ? 'warning' : 'success'](`已加入下载队列：${ok} 个，失败 ${fail} 个。完成后文件在 downloads/短视频/${name}/`)
-    await fetchStatus()
-    await openHistory(historyBlogger)
   }
 
   const toggleService = async (start) => {

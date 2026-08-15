@@ -32,6 +32,7 @@ const STATUS_CACHE_TTL_MS = 60000
 const STATUS_INVALIDATING_COMMANDS = new Set([
   'add-live', 'remove-live', 'delete-live', 'record-live',
   'add-video', 'remove-video', 'download-video', 'video-download',
+  'download-videos',
   'process', 'check-videos', 'ensure-services', 'start', 'stop',
   'wizard-done', 'set-app-prefs', 'set-config', 'set-config-bulk',
 ])
