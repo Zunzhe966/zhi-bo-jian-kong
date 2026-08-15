@@ -1,12 +1,13 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   Badge, Button, Empty, Form, Input, InputNumber, message, Modal,
-  Popconfirm, Select, Space, Switch, Table, Tooltip,
+  Popconfirm, Select, Space, Switch, Table, Tag, Tooltip,
 } from 'antd'
 import {
   ControlFilled, DeleteFilled, FolderOpenFilled, MailOutlined,
   PlayCircleFilled, PlusCircleFilled, ReloadOutlined, SettingOutlined, StopFilled,
-  VideoCameraFilled, CloudDownloadOutlined,   FileTextOutlined, UnorderedListOutlined,
+  VideoCameraFilled, CloudDownloadOutlined, FileTextOutlined, UnorderedListOutlined,
+  ClearOutlined, RollbackOutlined,
 } from '@ant-design/icons'
 import douyinIcon from '../assets/douyin.png'
 import kuaishouIcon from '../assets/kuaishou.png'
@@ -171,6 +172,10 @@ export default function App() {
   const [itemSettingsForm] = Form.useForm()
   const [mainTab, setMainTab] = useState('live')
   const [wizardOpen, setWizardOpen] = useState(false)
+  const [notifyOpen, setNotifyOpen] = useState(false)
+  const [notifyLoading, setNotifyLoading] = useState(false)
+  const [notifyEvents, setNotifyEvents] = useState([])
+  const [notifyBusy, setNotifyBusy] = useState(false)
 
   const pickCfg = (section, key, fallback = '') => {
     const v = section?.[key]
@@ -632,6 +637,71 @@ export default function App() {
     }
   }
 
+  const openNotifyPanel = async () => {
+    setNotifyOpen(true)
+    setNotifyLoading(true)
+    try {
+      const r = await window.desktop.cli('notify-list', 'failed', '50')
+      setNotifyEvents(r.notify || [])
+    } catch (e) {
+      message.error(String(e.message || e))
+    } finally {
+      setNotifyLoading(false)
+    }
+  }
+
+  const reloadNotifyPanel = async () => {
+    setNotifyLoading(true)
+    try {
+      const r = await window.desktop.cli('notify-list', 'failed', '50')
+      setNotifyEvents(r.notify || [])
+      await fetchStatus()
+    } catch (e) {
+      message.error(String(e.message || e))
+    } finally {
+      setNotifyLoading(false)
+    }
+  }
+
+  const retryFailedNotify = async () => {
+    setNotifyBusy(true)
+    try {
+      const r = await window.desktop.cli('notify-retry', '0')
+      message.success(`已把 ${r.retried || 0} 条失败通知放回待发送队列，下一轮会自动重试`)
+      await reloadNotifyPanel()
+    } catch (e) {
+      message.error(String(e.message || e))
+    } finally {
+      setNotifyBusy(false)
+    }
+  }
+
+  const pruneFailedNotify = async () => {
+    setNotifyBusy(true)
+    try {
+      const r = await window.desktop.cli('notify-prune', 'failed', '0')
+      message.success(`已清理 ${r.removed || 0} 条失败通知记录`)
+      await reloadNotifyPanel()
+    } catch (e) {
+      message.error(String(e.message || e))
+    } finally {
+      setNotifyBusy(false)
+    }
+  }
+
+  const pruneSentNotify = async () => {
+    setNotifyBusy(true)
+    try {
+      const r = await window.desktop.cli('notify-prune', 'sent', '0')
+      message.success(`已清理 ${r.removed || 0} 条已发送通知记录`)
+      await reloadNotifyPanel()
+    } catch (e) {
+      message.error(String(e.message || e))
+    } finally {
+      setNotifyBusy(false)
+    }
+  }
+
   const onBatchBrowse = async () => {
     const v = await batchForm.validateFields()
     setBatchOpen(false)
@@ -801,13 +871,14 @@ export default function App() {
                   ? `异常（${status?.source_health?.cooling ?? '?'} 个冷却中）`
                   : '未知'}
             </span>
-            <span className={`status-pill ${status?.notify_health?.ok ? 'on' : status?.notify_health?.ok === false ? 'off' : ''}`} title="邮箱/微信等通知通道未配置或有失败记录时，新视频/开播提醒可能收不到">
+            <button type="button" className={`status-pill status-pill-btn ${status?.notify_health?.ok ? 'on' : status?.notify_health?.ok === false ? 'off' : ''}`}
+              title="点击查看失败通知，可重试或清理" onClick={openNotifyPanel}>
               <i className={`dot ${status?.notify_health?.ok ? 'on' : ''}`} />通知 {status?.notify_health?.ok === true
                 ? '正常'
                 : status?.notify_health?.ok === false
                   ? `异常（${status?.notify_health?.failed ?? '?'} 失败）`
                   : '未知'}
-            </span>
+            </button>
           </div>
         </header>
 
@@ -1102,6 +1173,52 @@ export default function App() {
             { title: '时长', dataIndex: 'duration', width: 80, align: 'center',
               render: (d) => (d ? `${Math.floor(d / 60)}:${String(d % 60).padStart(2, '0')}` : '-') },
           ]}
+        />
+      </Modal>
+
+      <Modal
+        title="通知治理"
+        open={notifyOpen}
+        onCancel={() => setNotifyOpen(false)}
+        width={880}
+        footer={[
+          <Button key="close" onClick={() => setNotifyOpen(false)}>关闭</Button>,
+          <Popconfirm key="prune-sent" title="清理所有已发送通知记录？只影响历史列表，不影响已送达" onConfirm={pruneSentNotify}>
+            <Button icon={<ClearOutlined />} loading={notifyBusy}>清理已发送</Button>
+          </Popconfirm>,
+          <Popconfirm key="prune-failed" title="清理所有失败通知记录？将不再保留这些失败提醒" onConfirm={pruneFailedNotify}>
+            <Button danger icon={<DeleteFilled />} loading={notifyBusy}>清理失败记录</Button>
+          </Popconfirm>,
+          <Button key="retry" type="primary" icon={<RollbackOutlined />} loading={notifyBusy} onClick={retryFailedNotify}>
+            重试全部失败通知
+          </Button>,
+        ]}
+      >
+        <p style={{ marginBottom: 12, color: '#666' }}>
+          这里显示最近 50 条失败通知。配置邮箱/微信补齐后点「重试全部失败通知」；
+          不需要的历史失败记录可以清理，避免通知健康一直显示异常。
+        </p>
+        <Table
+          rowKey="id"
+          loading={notifyLoading}
+          dataSource={notifyEvents}
+          pagination={false}
+          size="small"
+          scroll={{ y: 380 }}
+          columns={[
+            { title: 'ID', dataIndex: 'id', width: 70 },
+            { title: '事件', dataIndex: 'event', width: 110,
+              render: (v) => (v === 'live' ? '开播' : v === 'video' ? '新视频' : v || '-') },
+            { title: '主播/博主', dataIndex: 'anchor', width: 140, ellipsis: true },
+            { title: '标题', dataIndex: 'title', ellipsis: true },
+            { title: '渠道', dataIndex: 'channel', width: 100,
+              render: (v) => <Tag color={v === '微信' ? 'green' : v === '邮箱' ? 'blue' : 'default'}>{v || '未知'}</Tag> },
+            { title: '状态', dataIndex: 'status', width: 90,
+              render: (v) => <Tag color={v === 'failed' ? 'red' : v === 'sent' ? 'green' : 'orange'}>{v}</Tag> },
+            { title: '重试', dataIndex: 'attempts', width: 70, align: 'center' },
+            { title: '时间', dataIndex: 'created_at', width: 160 },
+          ]}
+          locale={{ emptyText: '没有失败通知记录，通知链路健康' }}
         />
       </Modal>
     </div>

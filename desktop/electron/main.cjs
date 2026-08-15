@@ -44,6 +44,7 @@ const STATUS_INVALIDATING_COMMANDS = new Set([
   'download-videos',
   'process', 'check-videos', 'ensure-services', 'start', 'stop',
   'wizard-done', 'set-app-prefs', 'set-config', 'set-config-bulk',
+  'notify-retry', 'notify-prune',
 ])
 const isDev = !app.isPackaged && process.env.ELECTRON_DEV === '1'
 

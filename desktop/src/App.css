@@ -176,6 +176,20 @@ body {
 .status-pill.on { border-color: rgba(34, 197, 94, 0.45); color: #bbf7d0; }
 .status-pill.off { opacity: 0.75; }
 
+.status-pill-btn {
+  font: inherit;
+  cursor: pointer;
+  transition: border-color 0.15s, transform 0.15s;
+}
+.status-pill-btn:hover {
+  border-color: rgba(37, 99, 235, 0.6);
+  transform: translateY(-1px);
+}
+.status-pill-btn:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+
 .dot {
   width: 8px;
   height: 8px;
