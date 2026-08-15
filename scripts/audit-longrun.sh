@@ -95,6 +95,11 @@ if rss_records:
     rss_latest_kib = rss_records[-1][1]
     rss_growth_mib = max(0, (rss_latest_kib - rss_baseline_kib)) / 1024
     rss_ok = rss_growth_mib <= 256
+# 磁盘余量门禁：doctor 已报告 disk_free_mb，但验收脚本此前从不检查。磁盘写满
+# 会导致录制失败、日志/DB 写入失败，即使进程和心跳都健康也应判验收不通过。
+# 老版本审计行没有该字段时视为兼容；有数据后按最近一条判定。
+disk_free_mb = last.get("disk_free_mb")
+disk_ok = not isinstance(disk_free_mb, int) or disk_free_mb >= 512
 # 源/通知健康按“最近 30 分钟 + 最新快照”判定，而不是全历史累加：
 # 一条早已修复的历史异常（例如用户清理测试通知、平台恢复）不应永久卡住
 # 24×30 验收；但最近 30 分钟出现过冷却/通知失败仍会被判定为不健康。
@@ -117,7 +122,7 @@ except Exception:
 # 审计日志会按 5MB 轮转，首条可能不在当前文件里；daemon 自报 uptime 是
 # 同一 pid 的连续运行时长，作为轮转后的辅助证据。
 duration_ok = running_secs >= target_secs or uptime_secs >= target_secs
-ok = bool(pid) and duration_ok and gap_ok and recent_ok and source_ok and notify_ok and rss_ok
+ok = bool(pid) and duration_ok and gap_ok and recent_ok and source_ok and notify_ok and rss_ok and disk_ok
 print(json.dumps({
     "ok": ok,
     "pid": pid,
@@ -131,6 +136,8 @@ print(json.dumps({
     "rss_baseline_kib": rss_baseline_kib,
     "rss_latest_kib": rss_latest_kib,
     "rss_growth_mib": round(rss_growth_mib, 1),
+    "disk_free_mb": disk_free_mb,
+    "disk_ok": disk_ok,
     "source_ok": source_ok,
     "notify_ok": notify_ok,
     "source_cooling": last.get("source_cooling", 0),
@@ -206,6 +213,7 @@ print(json.dumps({
   "notify_latest_failed_channel": nh.get("latest_failed_channel"),
   "notify_hint": nh.get("hint"),
   "notify_ok": bool(nh.get("ok", True)),
+  "disk_free_mb": d.get("disk_free_mb"),
 }, ensure_ascii=False))' 2>/dev/null || true)"
 if [ -z "$health" ]; then
   echo "$(date '+%Y-%m-%d %H:%M:%S %z') audit_unparseable" >> "$LOG"

@@ -33,6 +33,7 @@ def audit_line(
     source_ok: bool = True,
     notify_ok: bool = True,
     rss_kib: int | None = None,
+    disk_free_mb: int | None = None,
 ) -> str:
     ts = datetime.datetime.now().astimezone() - datetime.timedelta(seconds=seconds_ago)
     return f'{ts.strftime("%Y-%m-%d %H:%M:%S %z")} ' + json.dumps(
@@ -48,6 +49,7 @@ def audit_line(
             "notify_pending": 0,
             "notify_failed": 0,
             "rss_kib": rss_kib,
+            "disk_free_mb": disk_free_mb,
         },
         ensure_ascii=False,
     )
@@ -178,4 +180,29 @@ rss_ok_file.write_text(
 result = run_verify(rss_ok_file)
 assert result["rss_ok"] is True, result
 
-print("通过：audit-longrun --verify 未满/满30天/缺失/源冷却/历史坏行/最近坏行/pid切换/同pid断档/RSS增长/RSS正常波动场景判定正确")
+# 磁盘余量过低必须拦截验收，防止写满后被“进程活着”掩盖。
+disk_low = tmp / "disk-low.log"
+disk_low.write_text(
+    audit_line(120, 124, disk_free_mb=300)
+    + "\n"
+    + audit_line(60, 124, disk_free_mb=200)
+    + "\n",
+    encoding="utf-8",
+)
+result = run_verify(disk_low)
+assert result["disk_ok"] is False, result
+assert result["disk_free_mb"] == 200, result
+
+# 磁盘余量充足时不能误伤验收。
+disk_ok_file = tmp / "disk-ok.log"
+disk_ok_file.write_text(
+    audit_line(120, 124, disk_free_mb=1024)
+    + "\n"
+    + audit_line(60, 124, disk_free_mb=1020)
+    + "\n",
+    encoding="utf-8",
+)
+result = run_verify(disk_ok_file)
+assert result["disk_ok"] is True, result
+
+print("通过：audit-longrun --verify 未满/满30天/缺失/源冷却/历史坏行/最近坏行/pid切换/同pid断档/RSS增长/RSS正常波动/磁盘不足/磁盘充足场景判定正确")
