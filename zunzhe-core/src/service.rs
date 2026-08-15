@@ -659,6 +659,9 @@ pub fn diagnostics(project_dir: &Path) -> Result<serde_json::Value> {
     // 环境可用（ok）与守护健康（health）分离：即使 daemon 不在跑，doctor
     // 仍应返回环境诊断供修复；health 字段明确告诉调用方“监控本身是否健康”。
     let audit = health_audit(project_dir);
+    // 三个复盘开关是自动复盘是否入队/跳过环节的直接依据；doctor 返回
+    // 机器可读状态，避免用户/智能体在界面里翻配置才知道哪个环节被关闭。
+    let switches = crate::download::PipelineSwitches::load(project_dir);
     Ok(json!({
         "ok": true,
         "rust_daemon": daemon_ok,
@@ -678,6 +681,12 @@ pub fn diagnostics(project_dir: &Path) -> Result<serde_json::Value> {
         "ffmpeg_available": ffmpeg_ok,
         "disk_free_mb": disk,
         "pipeline_python_ok": python_ok,
+        "pipeline_switches": {
+            "transcribe": switches.transcribe,
+            "distill": switches.distill,
+            "clips": switches.clips,
+            "any_enabled": switches.any_enabled(),
+        },
         "hints": hints,
     }))
 }

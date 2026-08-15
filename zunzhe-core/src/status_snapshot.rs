@@ -39,6 +39,7 @@ pub async fn build(project_dir: &Path, pool: &SqlitePool, cfg: &Config) -> Resul
     let heartbeat_ok = service::heartbeat_fresh_public(project_dir);
     let (uptime_secs, uptime_human) = service::daemon_uptime_public(project_dir);
     let video_count = db::count_videos(pool).await?;
+    let switches = crate::download::PipelineSwitches::load(project_dir);
 
     Ok(json!({
         "ok": true,
@@ -47,6 +48,12 @@ pub async fn build(project_dir: &Path, pool: &SqlitePool, cfg: &Config) -> Resul
         "video_watchlist": video_sources,
         "video_count": video_count,
         "email": cfg.email_status(),
+        "pipeline_switches": {
+            "transcribe": switches.transcribe,
+            "distill": switches.distill,
+            "clips": switches.clips,
+            "any_enabled": switches.any_enabled(),
+        },
         "rust_daemon": rust_running,
         "heartbeat_ok": heartbeat_ok,
         "uptime_secs": uptime_secs,
@@ -247,6 +254,22 @@ mod tests {
         assert!(status["heartbeat_ok"].is_boolean());
         assert!(status["uptime_secs"].is_number());
         assert!(status["uptime_human"].is_string());
+        assert_eq!(
+            status["pipeline_switches"]["transcribe"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            status["pipeline_switches"]["distill"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            status["pipeline_switches"]["clips"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            status["pipeline_switches"]["any_enabled"],
+            serde_json::json!(true)
+        );
         assert!(status["notes"].as_array().is_some());
         assert_eq!(status["recording_sessions"], serde_json::json!([]));
         let _ = std::fs::remove_dir_all(&dir);

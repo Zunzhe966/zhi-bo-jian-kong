@@ -18,6 +18,18 @@ fn daemon_heartbeat_and_doctor_contract() {
     assert_eq!(diag["ok"], true);
     assert!(diag.get("disk_free_mb").is_some());
     assert!(diag.get("logs_writable").is_some());
+    // doctor 必须暴露三个复盘开关，界面/智能体无需翻配置就能确认自动复盘
+    // 为何入队/跳过。
+    assert_eq!(
+        diag["pipeline_switches"]["transcribe"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        diag["pipeline_switches"]["distill"],
+        serde_json::json!(true)
+    );
+    assert_eq!(diag["pipeline_switches"]["clips"], serde_json::json!(true));
+    assert!(diag["pipeline_switches"]["any_enabled"].as_bool().is_some());
 
     // 心跳后 pid 不存在时 status 判定为未运行（不能因为心跳新鲜就误判）。
     service::touch_heartbeat(&dir);
