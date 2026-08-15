@@ -207,6 +207,8 @@ pub fn stop_all(project_dir: &Path) -> Result<serde_json::Value> {
 /// 桌面端/兼容层统一入口：Rust daemon 负责直播监控与视频监控，
 /// Python 服务仅在需要时作为兜底，避免重复录制同一路直播。
 pub fn ensure_core(project_dir: &Path) -> Result<serde_json::Value> {
+    #[cfg(target_os = "macos")]
+    sync_launchd_scripts(project_dir);
     // macOS 上 launchd 是 24×30 的正式管理者（KeepAlive 自动拉起）。
     // 若已安装 com.zunzhe.monitor，ensure 优先让 launchd 拉起，避免本进程
     // 直接 spawn 与 launchd 抢单实例锁；否则 launchd 会不断重试并报
@@ -266,6 +268,64 @@ pub fn ensure_core(project_dir: &Path) -> Result<serde_json::Value> {
         "services": {},
         "hints": ensure_core_hints(project_dir)
     }))
+}
+
+/// macOS：把仓库里的 launchd 守护/健康脚本同步到 `~/Library/LaunchAgents`。
+///
+/// `scripts/setup-macos.sh` 只在安装时复制一次，后续代码/脚本更新后如果不
+/// 重跑 setup，launchd 会一直执行旧副本。`ensure_core` 是桌面端/看门狗高频
+/// 入口，在这里做幂等同步，保证长期运行期间守护脚本始终与仓库一致。只同步
+/// 脚本文件，不修改已加载的 plist，也不重启正在运行的 daemon，避免打断
+/// 24×30 同 pid 连续计数。
+#[cfg(target_os = "macos")]
+fn sync_launchd_scripts(project_dir: &Path) {
+    use std::fs;
+
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let launch_agents = std::path::Path::new(&home)
+        .join("Library")
+        .join("LaunchAgents");
+    let repo_scripts = project_dir.join("scripts").join("launchd");
+    let pairs = [
+        (
+            repo_scripts.join("zunzhe-daemon.sh"),
+            launch_agents.join("zunzhe-daemon.sh"),
+        ),
+        (
+            repo_scripts.join("zunzhe-healthcheck.sh"),
+            launch_agents.join("zunzhe-healthcheck.sh"),
+        ),
+        (
+            project_dir.join("scripts").join("ensure-full-access.sh"),
+            launch_agents.join("ensure-full-access.sh"),
+        ),
+        (
+            project_dir.join("scripts").join("audit-longrun.sh"),
+            launch_agents.join("audit-longrun.sh"),
+        ),
+    ];
+    for (src, dst) in pairs {
+        if !src.is_file() {
+            continue;
+        }
+        // 相同内容直接跳过；只有仓库版本更新时才覆盖，避免无谓的写盘/权限错误。
+        let changed = match (fs::read(&src), fs::read(&dst)) {
+            (Ok(src_bytes), Ok(dst_bytes)) => src_bytes != dst_bytes,
+            (Ok(_), Err(_)) => true,
+            (Err(_), _) => false,
+        };
+        if !changed {
+            continue;
+        }
+        let _ = fs::create_dir_all(&launch_agents);
+        if fs::copy(&src, &dst).is_ok()
+            && let Ok(meta) = fs::metadata(&src)
+        {
+            let _ = fs::set_permissions(&dst, meta.permissions());
+        }
+    }
 }
 
 /// macOS：检查 com.zunzhe.monitor 是否已安装到用户 LaunchAgents。
@@ -1060,6 +1120,64 @@ mod tests {
             "~/Projects 不应判定为 TCC 保护路径"
         );
         let _ = desktop;
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sync_launchd_scripts_updates_outdated_copies_only() {
+        let home = std::env::temp_dir().join(format!("zunzhe-home-sync-{}", std::process::id()));
+        let launch_agents = home.join("Library").join("LaunchAgents");
+        let project = std::env::temp_dir().join(format!("zunzhe-repo-sync-{}", std::process::id()));
+        let repo_scripts = project.join("scripts").join("launchd");
+        std::fs::create_dir_all(&repo_scripts).unwrap();
+        std::fs::create_dir_all(&launch_agents).unwrap();
+
+        let daemon_repo = repo_scripts.join("zunzhe-daemon.sh");
+        let daemon_installed = launch_agents.join("zunzhe-daemon.sh");
+        std::fs::write(&daemon_repo, "new daemon\n").unwrap();
+        std::fs::write(&daemon_installed, "old daemon\n").unwrap();
+        std::fs::write(
+            project.join("scripts").join("ensure-full-access.sh"),
+            "guard\n",
+        )
+        .unwrap();
+        std::fs::write(project.join("scripts").join("audit-longrun.sh"), "audit\n").unwrap();
+
+        unsafe { std::env::set_var("HOME", &home) };
+        sync_launchd_scripts(&project);
+        unsafe { std::env::remove_var("HOME") };
+
+        assert_eq!(
+            std::fs::read_to_string(&daemon_installed).unwrap(),
+            "new daemon\n",
+            "旧副本应被仓库版本覆盖"
+        );
+        assert_eq!(
+            std::fs::read_to_string(launch_agents.join("ensure-full-access.sh")).unwrap(),
+            "guard\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(launch_agents.join("audit-longrun.sh")).unwrap(),
+            "audit\n"
+        );
+
+        // 幂等：再次同步不应改写任何文件（mtime 不变）。
+        let before = std::fs::metadata(&daemon_installed)
+            .unwrap()
+            .modified()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        unsafe { std::env::set_var("HOME", &home) };
+        sync_launchd_scripts(&project);
+        unsafe { std::env::remove_var("HOME") };
+        let after = std::fs::metadata(&daemon_installed)
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(before, after, "内容一致时不应反复覆盖");
+
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&project);
     }
 
     #[test]
