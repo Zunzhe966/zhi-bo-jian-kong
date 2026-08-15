@@ -51,6 +51,23 @@ pub async fn build(project_dir: &Path, pool: &SqlitePool, cfg: &Config) -> Resul
             json!({"total": null, "failing": null, "cooling": null, "ok": null})
         }
     };
+    // 通知投递健康：邮箱/微信等通道连续失败或配置缺失时，通知表会堆积
+    // failed/pending；桌面端 status 必须能看到，不能只看“daemon 在跑”。
+    let notify_health = match db::notify_health_summary(pool).await {
+        Ok((pending, failed, sent)) => {
+            let configured = cfg.email_configured() || cfg.push_channels().configured();
+            json!({
+                "pending": pending,
+                "failed": failed,
+                "sent": sent,
+                "configured": configured,
+                "ok": failed == 0 && pending == 0 && configured,
+            })
+        }
+        Err(_) => {
+            json!({"pending": null, "failed": null, "sent": null, "configured": null, "ok": null})
+        }
+    };
 
     Ok(json!({
         "ok": true,
@@ -70,6 +87,7 @@ pub async fn build(project_dir: &Path, pool: &SqlitePool, cfg: &Config) -> Resul
         "uptime_secs": uptime_secs,
         "uptime_human": uptime_human,
         "source_health": source_health,
+        "notify_health": notify_health,
         "services": {
             "live_monitor": {"running": rust_running},
             "video_monitor": {"running": rust_running},
@@ -447,6 +465,39 @@ mod tests {
         );
 
         std::mem::forget(file);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn snapshot_includes_notify_health() {
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-snapshot-notify-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::write(dir.join("config").join("config.ini"), "[推送配置]\n").unwrap();
+        std::fs::write(dir.join("config").join("fupan_config.ini"), "[视频监控]\n").unwrap();
+        let db_path = dir.join("test.db");
+        let pool = crate::db::open_pool(&db_path).await.unwrap();
+        let cfg = crate::config::Config::load(&dir).unwrap();
+        let status = build(&dir, &pool, &cfg).await.unwrap();
+        let nh = &status["notify_health"];
+        assert_eq!(nh["pending"], json!(0));
+        assert_eq!(nh["failed"], json!(0));
+        assert_eq!(nh["configured"], json!(false));
+        assert_eq!(nh["ok"], json!(false));
+
+        let id = crate::db::add_notify(&pool, "video", "博主", "标题", "内容", "微信")
+            .await
+            .unwrap();
+        crate::db::fail_notify(&pool, id).await.unwrap();
+        let status = build(&dir, &pool, &cfg).await.unwrap();
+        assert_eq!(status["notify_health"]["failed"], json!(1));
+        assert_eq!(status["notify_health"]["ok"], json!(false));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -633,6 +633,38 @@ mod maintenance_tests {
     }
 
     #[tokio::test]
+    async fn notify_health_summary_counts_by_status() {
+        let file =
+            std::env::temp_dir().join(format!("zunzhe-notify-health-{}", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let pool = crate::db::open_pool(&file).await.unwrap();
+        for _ in 0..2 {
+            let id = crate::db::add_notify(&pool, "video", "博主", "标题", "内容", "微信")
+                .await
+                .unwrap();
+            crate::db::fail_notify(&pool, id).await.unwrap();
+        }
+        for _ in 0..3 {
+            let id = crate::db::add_notify(&pool, "video", "博主", "标题", "内容", "邮箱")
+                .await
+                .unwrap();
+            crate::db::mark_notify_done(&pool, id).await.unwrap();
+        }
+        let pending = crate::db::add_notify(&pool, "video", "博主", "标题", "内容", "邮箱")
+            .await
+            .unwrap();
+        assert!(pending > 0);
+
+        let (pending_count, failed, sent) = crate::db::notify_health_summary(&pool).await.unwrap();
+        assert_eq!(pending_count, 1);
+        assert_eq!(failed, 2);
+        assert_eq!(sent, 3);
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_file(file.with_extension("db-shm"));
+        let _ = std::fs::remove_file(file.with_extension("db-wal"));
+    }
+
+    #[tokio::test]
     async fn maintenance_prunes_finished_live_sessions_keeps_recording() {
         let file = std::env::temp_dir().join(format!(
             "zunzhe-maintenance-livesess-{}-{}.db",
@@ -1979,6 +2011,34 @@ pub async fn prune_notify(pool: &SqlitePool, status: &str, limit: i64) -> anyhow
     .await
     .context("清理通知记录")?;
     Ok(result.rows_affected())
+}
+
+/// 通知投递健康摘要：`(pending, failed, sent)`，只统计当前表内记录。
+///
+/// 24×30 验收里“通知链路可用”不能只看进程健康：配置缺失或通道连续失败时，
+/// 通知表会堆积 failed/pending 记录，`doctor/status/audit` 需要一眼看到。
+pub async fn notify_health_summary(pool: &SqlitePool) -> anyhow::Result<(u64, u64, u64)> {
+    let counts: Vec<(String, i64)> =
+        sqlx::query_as("SELECT status, COUNT(*) FROM notify GROUP BY status")
+            .fetch_all(pool)
+            .await
+            .context("统计通知状态")?;
+    let mut pending = 0i64;
+    let mut failed = 0i64;
+    let mut sent = 0i64;
+    for (status, count) in counts {
+        match status.as_str() {
+            "pending" => pending = count,
+            "failed" => failed = count,
+            "sent" => sent = count,
+            _ => {}
+        }
+    }
+    Ok((
+        pending.max(0) as u64,
+        failed.max(0) as u64,
+        sent.max(0) as u64,
+    ))
 }
 
 #[cfg(test)]

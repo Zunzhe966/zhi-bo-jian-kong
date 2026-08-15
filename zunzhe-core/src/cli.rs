@@ -798,6 +798,23 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     }),
                 );
             }
+            // 通知投递健康与源健康同样纳入 doctor：邮箱/微信等通道连续失败
+            // 或配置缺失时，通知表会堆积 failed/pending，必须一眼可见。
+            if let Ok((pending, failed, sent)) = db::notify_health_summary(&pool).await
+                && let Some(obj) = diag.as_object_mut()
+            {
+                let configured = cfg.email_configured() || cfg.push_channels().configured();
+                obj.insert(
+                    "notify_health".to_string(),
+                    json!({
+                        "pending": pending,
+                        "failed": failed,
+                        "sent": sent,
+                        "configured": configured,
+                        "ok": failed == 0 && pending == 0 && configured,
+                    }),
+                );
+            }
             println!("{}", serde_json::to_string(&diag)?);
         }
     }

@@ -631,16 +631,15 @@ pub fn diagnostics(project_dir: &Path) -> Result<serde_json::Value> {
     };
     // 邮箱是默认通知通道，doctor 只报 ok 会让人误以为通知已可用；
     // 未配置时把缺失项带进 hints，桌面端/CLI 一眼能看到缺口。
-    let email_hint = crate::config::Config::load(project_dir)
-        .ok()
-        .and_then(|cfg| {
-            let status = cfg.email_status();
-            if status.configured {
-                None
-            } else {
-                Some(status.hint)
-            }
-        });
+    let loaded_cfg = crate::config::Config::load(project_dir).ok();
+    let email_hint = loaded_cfg.as_ref().and_then(|cfg| {
+        let status = cfg.email_status();
+        if status.configured {
+            None
+        } else {
+            Some(status.hint)
+        }
+    });
     let mut hints: Vec<String> = Vec::new();
     if let Some(hint) = pipeline_hint {
         hints.push(hint.to_string());
@@ -662,6 +661,15 @@ pub fn diagnostics(project_dir: &Path) -> Result<serde_json::Value> {
     // 三个复盘开关是自动复盘是否入队/跳过环节的直接依据；doctor 返回
     // 机器可读状态，避免用户/智能体在界面里翻配置才知道哪个环节被关闭。
     let switches = crate::download::PipelineSwitches::load(project_dir);
+    // 通知投递健康摘要：由调用方注入 DB 数据，doctor 只负责把字段原样返回，
+    // 避免这里异步查询破坏同步签名。读取失败时字段为 null，不让 doctor 失败。
+    let notify_health = json!({
+        "configured": loaded_cfg.as_ref().is_some_and(|cfg| cfg.email_configured() || cfg.push_channels().configured()),
+        "pending": null,
+        "failed": null,
+        "sent": null,
+        "ok": null,
+    });
     Ok(json!({
         "ok": true,
         "rust_daemon": daemon_ok,
@@ -687,6 +695,7 @@ pub fn diagnostics(project_dir: &Path) -> Result<serde_json::Value> {
             "clips": switches.clips,
             "any_enabled": switches.any_enabled(),
         },
+        "notify_health": notify_health,
         "hints": hints,
     }))
 }

@@ -567,6 +567,21 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
                     }),
                 );
             }
+            if let Ok((pending, failed, sent)) = db::notify_health_summary(pool).await
+                && let Some(obj) = diag.as_object_mut()
+            {
+                let configured = cfg.email_configured() || cfg.push_channels().configured();
+                obj.insert(
+                    "notify_health".to_string(),
+                    json!({
+                        "pending": pending,
+                        "failed": failed,
+                        "sent": sent,
+                        "configured": configured,
+                        "ok": failed == 0 && pending == 0 && configured,
+                    }),
+                );
+            }
             Ok(serde_json::to_string(&diag)?)
         }
         "wizard_done" => {
