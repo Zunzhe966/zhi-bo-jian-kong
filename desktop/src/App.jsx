@@ -801,6 +801,13 @@ export default function App() {
                   ? `异常（${status?.source_health?.cooling ?? '?'} 个冷却中）`
                   : '未知'}
             </span>
+            <span className={`status-pill ${status?.notify_health?.ok ? 'on' : status?.notify_health?.ok === false ? 'off' : ''}`} title="邮箱/微信等通知通道未配置或有失败记录时，新视频/开播提醒可能收不到">
+              <i className={`dot ${status?.notify_health?.ok ? 'on' : ''}`} />通知 {status?.notify_health?.ok === true
+                ? '正常'
+                : status?.notify_health?.ok === false
+                  ? `异常（${status?.notify_health?.failed ?? '?'} 失败）`
+                  : '未知'}
+            </span>
           </div>
         </header>
 
