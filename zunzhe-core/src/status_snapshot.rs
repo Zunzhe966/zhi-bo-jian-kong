@@ -45,7 +45,9 @@ pub async fn build(project_dir: &Path, pool: &SqlitePool, cfg: &Config) -> Resul
     // 读取失败按“未知”处理，不让状态快照整体失败。
     let source_health = match db::source_health_summary(pool).await {
         Ok((total, failing, cooling)) => {
-            json!({"total": total, "failing": failing, "cooling": cooling, "ok": cooling == 0})
+            // 连续失败（哪怕还没到冷却阈值）也说明源近期不稳定，不能显示“健康”；
+            // 与 doctor/长跑审计的 failing 语义保持一致。
+            json!({"total": total, "failing": failing, "cooling": cooling, "ok": failing == 0 && cooling == 0})
         }
         Err(_) => {
             json!({"total": null, "failing": null, "cooling": null, "ok": null})
@@ -473,6 +475,24 @@ mod tests {
         assert_eq!(
             snapshot["source_health"],
             json!({"total": 0, "failing": 0, "cooling": 0, "ok": true})
+        );
+
+        // 连续失败但未到冷却阈值（1-2 次）也必须判不健康；与 doctor/审计
+        // 的 failing 语义一致，避免桌面端把正在抖动的源显示成“健康”。
+        let failing_url = "https://rss.example.com/failing";
+        crate::db::mark_source_baselined(&pool, failing_url)
+            .await
+            .unwrap();
+        crate::db::bump_source_failures(&pool, failing_url)
+            .await
+            .unwrap();
+        crate::db::bump_source_failures(&pool, failing_url)
+            .await
+            .unwrap();
+        let snapshot = build(&dir, &pool, &cfg).await.unwrap();
+        assert_eq!(
+            snapshot["source_health"],
+            json!({"total": 1, "failing": 1, "cooling": 0, "ok": false})
         );
 
         std::mem::forget(file);

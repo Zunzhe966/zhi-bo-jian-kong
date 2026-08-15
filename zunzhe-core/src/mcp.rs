@@ -563,7 +563,7 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
                         "total": total,
                         "failing": failing,
                         "cooling": cooling,
-                        "ok": cooling == 0,
+                        "ok": failing == 0 && cooling == 0,
                     }),
                 );
             }
