@@ -536,13 +536,42 @@ pub async fn enqueue_pipeline_after_download(
 /// 下载完成与直播录制完成共用同一判断，避免两处逻辑漂移；配置读取失败时
 /// 按“启用”处理，保证配置损坏也不会让自动复盘静默关闭。
 pub fn pipeline_enabled(project_dir: &Path) -> bool {
-    crate::config::Config::load(project_dir)
-        .map(|cfg| {
-            cfg.is_yes_fupan("转写", "是否启用转写(是/否)", true)
-                || cfg.is_yes_fupan("知识提炼", "是否启用知识提炼(是/否)", true)
-                || cfg.is_yes_fupan("切片", "是否启用切片(是/否)", true)
-        })
-        .unwrap_or(true)
+    PipelineSwitches::load(project_dir).any_enabled()
+}
+
+/// 复盘流水线的三个独立开关。
+///
+/// 需求契约：转写/知识提炼/精华切片各自可开可关，关闭的环节完全不运行。
+/// 配置缺失或读取失败时按“启用”处理，保证配置损坏不会让自动复盘静默关闭。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PipelineSwitches {
+    pub transcribe: bool,
+    pub distill: bool,
+    pub clips: bool,
+}
+
+impl PipelineSwitches {
+    pub fn load(project_dir: &Path) -> Self {
+        let cfg = crate::config::Config::load(project_dir);
+        let enabled = |section: &str, key: &str| -> bool {
+            cfg.as_ref()
+                .map(|c| c.is_yes_fupan(section, key, true))
+                .unwrap_or(true)
+        };
+        Self {
+            transcribe: enabled("转写", "是否启用转写(是/否)"),
+            distill: enabled("知识提炼", "是否启用知识提炼(是/否)"),
+            clips: enabled("切片", "是否启用切片(是/否)"),
+        }
+    }
+
+    pub fn any_enabled(&self) -> bool {
+        self.transcribe || self.distill || self.clips
+    }
+
+    pub fn all_disabled(&self) -> bool {
+        !self.any_enabled()
+    }
 }
 
 /// 独立下载队列 worker：不参与 70 秒 tick 护栏，每个任务自身有 600 秒超时，
@@ -800,6 +829,38 @@ mod tests {
         // 配置读取失败：按启用处理，不静默关闭自动复盘。
         std::fs::remove_file(dir.join("config").join("fupan_config.ini")).unwrap();
         assert!(pipeline_enabled(&dir), "配置缺失时应按启用处理");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pipeline_switches_are_independent() {
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-pipeline-indep-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::write(dir.join("config").join("config.ini"), "[推送配置]\n").unwrap();
+        std::fs::write(
+            dir.join("config").join("fupan_config.ini"),
+            "[转写]\n是否启用转写(是/否) = 是\n\
+             [知识提炼]\n是否启用知识提炼(是/否) = 否\n\
+             [切片]\n是否启用切片(是/否) = 否\n",
+        )
+        .unwrap();
+        let switches = PipelineSwitches::load(&dir);
+        assert!(switches.transcribe);
+        assert!(!switches.distill);
+        assert!(!switches.clips);
+        assert!(switches.any_enabled());
+
+        // 配置损坏仍按“启用”兜底，不能让自动复盘静默关闭。
+        std::fs::write(dir.join("config").join("fupan_config.ini"), "bad").unwrap();
+        let switches = PipelineSwitches::load(&dir);
+        assert!(switches.transcribe && switches.distill && switches.clips);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -123,6 +123,14 @@ impl PythonTool {
         }
         let mut cmd = Command::new(&self.python);
         cmd.kill_on_drop(true);
+        // 三个独立开关由 Rust 侧读取并显式传给 Python；关闭的环节直接跳过，
+        // 避免只靠 Python 内部读取配置时两边不一致。
+        let switches = crate::download::PipelineSwitches::load(
+            self.module
+                .parent()
+                .and_then(|p| p.parent())
+                .unwrap_or_else(|| Path::new(".")),
+        );
         // 用 -m 以包方式运行，fupan 内部相对导入才能正常工作。
         cmd.arg("-m")
             .arg("fupan.pipeline")
@@ -130,6 +138,12 @@ impl PythonTool {
             .arg(media_path)
             .arg("--record_name")
             .arg(record_name)
+            .arg("--transcribe")
+            .arg(if switches.transcribe { "是" } else { "否" })
+            .arg("--distill")
+            .arg(if switches.distill { "是" } else { "否" })
+            .arg("--clips")
+            .arg(if switches.clips { "是" } else { "否" })
             .current_dir(
                 self.module
                     .parent()
@@ -383,6 +397,29 @@ mod tests {
         std::fs::write(&venv, "").unwrap();
         let tool = PythonTool::from_project(&dir);
         assert!(tool.python.to_string_lossy().contains(".venv"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rust_switch_parsing_matches_python_defaults() {
+        // Rust 三个开关默认值与 Python fupan/pipeline.py 的默认值必须一致，
+        // 防止 Rust 显式传参后与 Python 内部读取的默认行为产生偏差。
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-switch-contract-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::write(dir.join("config").join("config.ini"), "[推送配置]\n").unwrap();
+        std::fs::write(dir.join("config").join("fupan_config.ini"), "").unwrap();
+        let switches = crate::download::PipelineSwitches::load(&dir);
+        assert!(
+            switches.transcribe && switches.distill && switches.clips,
+            "默认配置下三个复盘开关都应启用"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

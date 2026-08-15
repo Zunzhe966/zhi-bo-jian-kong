@@ -65,7 +65,19 @@ def _resolve_media(media_path: str, timeout: int = 900) -> Path:
     raise FileNotFoundError(f'找不到录制文件: {media_path}')
 
 
-def run_pipeline(media_path: str, record_name: str = '') -> dict:
+def run_pipeline(media_path: str, record_name: str = '',
+                 transcribe: str = '', distill: str = '', clips: str = '') -> dict:
+    """Rust 核心显式传入三个独立开关；为空时读取配置，兼容旧 CLI 直接调用。"""
+    cfg = fupan_config()
+    switches = {
+        'transcribe': is_yes(transcribe or get(cfg, '转写', '是否启用转写(是/否)', '是')),
+        'distill': is_yes(distill or get(cfg, '知识提炼', '是否启用知识提炼(是/否)', '是')),
+        'clips': is_yes(clips or get(cfg, '切片', '是否启用切片(是/否)', '是')),
+    }
+    if not any(switches.values()):
+        # 三个环节全部关闭：不解析媒体、不加载模型，直接返回，符合
+        # “关闭 = 该环节完全不运行”。调用方通常也不会在这种状态入队。
+        return {'status': '复盘流水线全部关闭，跳过'}
     media = _resolve_media(media_path)
 
     record_name = record_name or media.stem
@@ -73,24 +85,36 @@ def run_pipeline(media_path: str, record_name: str = '') -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     summary = {'media': str(media), 'output_dir': str(out_dir)}
 
-    print(f'[1/4] 转写: {media.name}')
-    transcript = transcribe_file(str(media), str(out_dir))
+    transcript = None
+    if switches['transcribe']:
+        print(f'[1/4] 转写: {media.name}')
+        transcript = transcribe_file(str(media), str(out_dir))
+    else:
+        summary['transcribe'] = '跳过'
     if not transcript or not transcript['segments']:
         summary['status'] = '转写为空或未启用，流水线结束'
         print(summary['status'])
         return summary
     summary['segments'] = len(transcript['segments'])
 
-    print('[2/4] 知识提炼')
-    distilled = distill_transcript(transcript, str(out_dir), title=record_name)
+    distilled = None
+    if switches['distill']:
+        print('[2/4] 知识提炼')
+        distilled = distill_transcript(transcript, str(out_dir), title=record_name)
+    else:
+        summary['distill'] = '跳过'
     if not distilled:
         summary['status'] = '未配置大模型接口，已保留转写文本，流水线结束'
         print(summary['status'])
         return summary
     summary['points'] = len(distilled['points'])
 
-    print('[3/4] 精华切片')
-    clips = cut_clips(str(media), distilled['points'], str(out_dir))
+    clips = []
+    if switches['clips']:
+        print('[3/4] 精华切片')
+        clips = cut_clips(str(media), distilled['points'], str(out_dir))
+    else:
+        summary['clips'] = '跳过'
     summary['clips'] = clips
 
     print('[4/4] 邮件通知')
@@ -113,10 +137,15 @@ def main():
     parser.add_argument('--save_type', default='')
     parser.add_argument('--split_video_by_time', default='')
     parser.add_argument('--converts_to_mp4', default='')
+    parser.add_argument('--transcribe', default='')
+    parser.add_argument('--distill', default='')
+    parser.add_argument('--clips', default='')
     args, _unknown = parser.parse_known_args()
     # 主程序传来的 record_name 形如 "序号2 失控进化"，去掉序号前缀
     record_name = re.sub(r'^序号\d+\s*', '', args.record_name).strip()
-    run_pipeline(args.save_file_path, record_name)
+    summary = run_pipeline(args.save_file_path, record_name,
+                           transcribe=args.transcribe, distill=args.distill,
+                           clips=args.clips)
 
 
 if __name__ == '__main__':
