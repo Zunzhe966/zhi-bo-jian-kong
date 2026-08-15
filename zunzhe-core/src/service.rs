@@ -497,6 +497,22 @@ fn core_binary_name() -> &'static str {
 }
 
 pub fn stop_rust_daemon(project_dir: &Path) -> Result<serde_json::Value> {
+    // 由 launchd 管理的 24×30 daemon 不能被普通 `stop` 直接 kill：launchd
+    // KeepAlive 会立刻重新拉起，用户点“停止”只会看到瞬间重启，还会打断同
+    // pid 的长跑验收。停止 launchd 托管服务应显式 unload/bootout；桌面端在
+    // 需要完全停止时应先停 launchd 服务，再调用本函数。这里先探测并保护。
+    #[cfg(target_os = "macos")]
+    if launchd_can_manage(project_dir)
+        && let Some(pid) = rust_daemon_pid(project_dir)
+        && service_pid_by_raw(pid)
+    {
+        return Ok(json!({
+            "ok": true,
+            "rust_daemon": "launchd 管理，未停止",
+            "hint": "daemon 由 launchd（com.zunzhe.monitor）托管，KeepAlive 会自动拉起。如需完全停止，请先执行 launchctl bootout gui/$(id -u)/com.zunzhe.monitor",
+            "protected": true,
+        }));
+    }
     // 只停 Rust daemon 与 Rust ffmpeg 录制进程；不再自动拉起 Python 服务，
     // 否则用户点“停止”反而会启动另一套服务。
     let path = pid_file(project_dir, "zunzhe-core");
@@ -587,18 +603,16 @@ pub fn tail_logs(project_dir: &Path, name: &str, lines: u64) -> serde_json::Valu
 
 /// 检查 Rust 核心 daemon 是否在运行（通过 pid 文件，与 Python 服务同目录）。
 pub fn rust_daemon_alive(project_dir: &Path) -> bool {
+    rust_daemon_pid(project_dir)
+        .map(|pid| service_pid_by_raw(pid) && heartbeat_fresh(project_dir, 30 * 60))
+        .unwrap_or(false)
+}
+
+/// 读取 Rust 核心 daemon pid（不存在/损坏时返回 None）。
+fn rust_daemon_pid(project_dir: &Path) -> Option<u32> {
     let path = pid_file(project_dir, "zunzhe-core");
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return false;
-    };
-    let Ok(pid) = text.trim().parse::<u32>() else {
-        return false;
-    };
-    if !service_pid_by_raw(pid) {
-        return false;
-    }
-    // 心跳文件最近 30 分钟内更新过，避免“进程还在但调度已僵死”的假健康。
-    heartbeat_fresh(project_dir, 30 * 60)
+    let text = std::fs::read_to_string(&path).ok()?;
+    text.trim().parse::<u32>().ok()
 }
 
 /// 移除当前 daemon 的 pid 文件（daemon 优雅退出时调用）。

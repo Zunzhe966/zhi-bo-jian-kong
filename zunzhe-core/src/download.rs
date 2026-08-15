@@ -273,10 +273,11 @@ impl Downloader {
 async fn bilibili_browser_download(project_dir: &Path, url: &str, dir: &Path) -> Option<String> {
     let electron = find_electron(project_dir)?;
     tracing::warn!("B站浏览器下载兜底: electron={}", electron.display());
-    let extract = project_dir
-        .join("desktop")
-        .join("electron")
-        .join("extract-run.cjs");
+    // 独立 .app 随包分发辅助脚本（Resources/extra/electron/extract-run.cjs）；
+    // 源码模式仍用 desktop/electron。
+    let extract = packaged_electron_dir()
+        .map(|dir| dir.join("extract-run.cjs"))
+        .unwrap_or_else(|| project_dir.join("desktop").join("electron").join("extract-run.cjs"));
     if !extract.exists() {
         tracing::warn!("B站浏览器下载兜底不可用: 缺少 {}", extract.display());
         return None;
@@ -426,6 +427,12 @@ fn remove_partial_media(path: &Path, existed_before: bool) {
 }
 
 fn find_electron(project_dir: &Path) -> Option<PathBuf> {
+    if let Ok(exe) = std::env::var("ZUNZHE_ELECTRON_EXE") {
+        let p = PathBuf::from(exe);
+        if p.exists() {
+            return Some(p);
+        }
+    }
     let base = project_dir
         .join("desktop")
         .join("node_modules")
@@ -440,6 +447,13 @@ fn find_electron(project_dir: &Path) -> Option<PathBuf> {
         base.join("electron.exe"),
     ];
     candidates.into_iter().find(|c| c.exists())
+}
+
+/// 独立 .app 随包分发的 Electron 辅助脚本目录（Resources/extra/electron）。
+fn packaged_electron_dir() -> Option<PathBuf> {
+    let dir = std::env::var("ZUNZHE_ELECTRON_RUNNER_DIR").ok()?;
+    let dir = PathBuf::from(dir);
+    dir.is_dir().then_some(dir)
 }
 
 fn find_ffmpeg(project_dir: &Path) -> PathBuf {

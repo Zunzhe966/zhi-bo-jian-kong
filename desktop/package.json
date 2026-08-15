@@ -19,6 +19,20 @@
     "directories": {
       "output": "release"
     },
+    "asar": true,
+    "asarUnpack": [
+      "electron/*.cjs"
+    ],
+    "extraResources": [
+      {
+        "from": "../zunzhe-core/target/release",
+        "to": "extra",
+        "filter": [
+          "zunzhe-core",
+          "zunzhe-core.exe"
+        ]
+      }
+    ],
     "files": [
       "dist/**",
       "electron/**",

@@ -5,8 +5,10 @@
 const path = require('path')
 const fs = require('fs')
 
-const DEFAULT_OUT = path.join(
-  __dirname, '..', '..', 'fupan_output', 'run', 'bilibili_browser_cookies.txt')
+// 打包后 __dirname 在 app.asar 里，不能反推项目根；项目根由主进程 env 注入。
+const DEFAULT_OUT = process.env.ZUNZHE_PROJECT_ROOT
+  ? path.join(process.env.ZUNZHE_PROJECT_ROOT, 'fupan_output', 'run', 'bilibili_browser_cookies.txt')
+  : path.join(__dirname, '..', '..', 'fupan_output', 'run', 'bilibili_browser_cookies.txt')
 
 /**
  * 在隐藏窗口里加载 B站首页，等风控 JS 跑完生成验证 Cookie，再导出。

@@ -1,6 +1,7 @@
 const { app, BrowserWindow, Tray, Menu, globalShortcut, ipcMain, shell, nativeImage, Notification } = require('electron')
 const { protocol, net } = require('electron')
 const path = require('path')
+const os = require('os')
 const { pathToFileURL } = require('url')
 const { spawn } = require('child_process')
 const fs = require('fs')
@@ -8,10 +9,43 @@ const { consumeNotifyQueue } = require('./local-notify.cjs')
 const { healthcheckInvocation } = require('./healthcheck.cjs')
 const { projectLocalUrl } = require('./local-file-url.cjs')
 
-// electron/ 在 desktop/ 下，Rust 核心在项目根目录（再上一级）
-const PROJECT_DIR = path.resolve(__dirname, '..', '..')
+// 源码模式：electron/ 在 desktop/ 下，Rust 核心在项目根目录（再上一级）。
+// 独立 .app 模式：electron-builder 把 zunzhe-core 放进 Contents/Resources/extra，
+// 桌面辅助脚本与 Electron 内核也随包分发，App 不依赖源码目录即可运行。
 const CORE_NAME = process.platform === 'win32' ? 'zunzhe-core.exe' : 'zunzhe-core'
-const RUST_EXE = path.join(PROJECT_DIR, 'zunzhe-core', 'target', 'release', CORE_NAME)
+const APP_RESOURCES = app.isPackaged ? process.resourcesPath : path.resolve(__dirname, '..')
+
+function detectProjectRoot() {
+  if (process.env.ZUNZHE_PROJECT_ROOT) return process.env.ZUNZHE_PROJECT_ROOT
+  const candidates = [
+    path.join(os.homedir(), 'Projects', '尊者监控直播短视频'),
+    path.join(os.homedir(), 'Documents', '尊者监控直播短视频'),
+  ]
+  for (const p of candidates) {
+    if (fs.existsSync(path.join(p, 'config', 'config.ini')) || fs.existsSync(path.join(p, 'config', 'config.ini.example'))) {
+      return p
+    }
+  }
+  return candidates[0]
+}
+
+function resolveProjectDir() {
+  if (!app.isPackaged) return path.resolve(__dirname, '..', '..')
+  // 独立应用仍优先使用正式项目目录：这样可以复用用户已有的监控配置、
+  // 下载/复盘产物，并接入正在跑的 launchd daemon。
+  const root = detectProjectRoot()
+  if (fs.existsSync(path.join(root, 'config', 'config.ini')) || fs.existsSync(path.join(root, 'config', 'config.ini.example'))) {
+    return root
+  }
+  // 项目目录不存在时不能写进只读的 .app 包：退回应用可写数据目录，
+  // Rust 核心会按当前工作目录重新创建 config/downloads/fupan_output。
+  return app.getPath('userData')
+}
+
+const PROJECT_DIR = resolveProjectDir()
+const RUST_EXE = app.isPackaged
+  ? path.join(APP_RESOURCES, 'extra', CORE_NAME)
+  : path.join(PROJECT_DIR, 'zunzhe-core', 'target', 'release', CORE_NAME)
 const RUST_DEBUG_EXE = path.join(PROJECT_DIR, 'zunzhe-core', 'target', 'debug', CORE_NAME)
 const DIST_HTML = path.join(__dirname, '..', 'dist', 'index.html')
 const ASSETS = path.join(__dirname, '..', 'assets')
@@ -123,12 +157,23 @@ function runCli(args) {
   return new Promise((resolve, reject) => {
     const exe = fs.existsSync(RUST_EXE) ? RUST_EXE : RUST_DEBUG_EXE
     if (!fs.existsSync(exe)) {
-      return reject(new Error(`找不到 Rust 核心，请先构建：cd zunzhe-core && cargo build --release\n${RUST_EXE}`))
+      return reject(new Error(`找不到 Rust 核心，请先构建或重新安装应用：\n${RUST_EXE}`))
     }
     const timeoutMs = 30000
     const proc = spawn(exe, args, {
       cwd: PROJECT_DIR,
       windowsHide: true,
+      env: {
+        ...process.env,
+        // 独立 .app 没有 desktop/node_modules：让 Rust 侧用应用自身的
+        // Electron 内核与随包辅助脚本，而不是回退到源码目录。
+        ...(app.isPackaged
+          ? {
+              ZUNZHE_ELECTRON_EXE: process.execPath,
+              ZUNZHE_ELECTRON_RUNNER_DIR: path.join(APP_RESOURCES, 'app.asar.unpacked', 'electron'),
+            }
+          : {}),
+      },
     })
     const timer = setTimeout(() => {
       proc.kill('SIGTERM')
@@ -387,6 +432,7 @@ app.whenReady().then(async () => {
   // B站授权：弹出真实浏览器窗口，用户可选登录；关闭后导出会话 Cookie 供下载会员/高清视频
   ipcMain.handle('bili-login', async () => {
     const { harvestBilibiliCookies, DEFAULT_OUT } = require('./bili-cookie.cjs')
+    process.env.ZUNZHE_PROJECT_ROOT = PROJECT_DIR
     return harvestBilibiliCookies(app, DEFAULT_OUT, true)
   })
 })

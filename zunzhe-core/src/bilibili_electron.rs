@@ -53,10 +53,11 @@ pub async fn run_bilibili_script(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let runner = project_dir
-        .join("desktop")
-        .join("electron")
-        .join("bili-video-list.cjs");
+    // 独立 .app 里没有 desktop/node_modules，主窗口会把辅助脚本目录放进
+    // env；源码/项目目录模式仍用 desktop/electron。找不到时给出明确路径。
+    let runner = packaged_runner_dir()
+        .map(|dir| dir.join("bili-video-list.cjs"))
+        .unwrap_or_else(|| project_dir.join("desktop").join("electron").join("bili-video-list.cjs"));
     if !runner.exists() {
         anyhow::bail!("缺少 B站 Electron 脚本执行器: {}", runner.display());
     }
@@ -344,6 +345,14 @@ fn cleanup_daemon_state_stale_files(run_dir: &Path) {
 }
 
 fn find_electron(project_dir: &Path) -> Option<PathBuf> {
+    // 独立 .app 由主窗口把 process.execPath 传给 Rust CLI，直接用应用自身的
+    // Electron 二进制执行辅助脚本；源码模式回退到 desktop/node_modules。
+    if let Ok(exe) = std::env::var("ZUNZHE_ELECTRON_EXE") {
+        let p = PathBuf::from(exe);
+        if p.exists() {
+            return Some(p);
+        }
+    }
     let base = project_dir
         .join("desktop")
         .join("node_modules")
@@ -358,6 +367,13 @@ fn find_electron(project_dir: &Path) -> Option<PathBuf> {
         base.join("electron.exe"),
     ];
     candidates.into_iter().find(|p| p.exists())
+}
+
+/// 独立 .app 随包分发的辅助脚本目录（Resources/extra/electron）。
+fn packaged_runner_dir() -> Option<PathBuf> {
+    let dir = std::env::var("ZUNZHE_ELECTRON_RUNNER_DIR").ok()?;
+    let dir = PathBuf::from(dir);
+    dir.is_dir().then_some(dir)
 }
 
 #[cfg(test)]
