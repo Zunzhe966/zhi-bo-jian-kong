@@ -81,6 +81,28 @@ assert result["ok"] is True, result
 assert result["target_secs"] == 24 * 3600 * 30, result
 assert result["running_secs"] >= 24 * 3600 * 30, result
 
+# 审计日志按 5MB 轮转会拆成 .1/.2/.3 + 当前文件；--verify 必须合并这些
+# 轮转文件并按时间排序，否则同一 pid 的 30 天证据在轮转后会被误判为未满。
+rot_current = tmp / "rot-30d.log"
+rot_1 = tmp / "rot-30d.log.1"
+rot_2 = tmp / "rot-30d.log.2"
+rot_3 = tmp / "rot-30d.log.3"
+chunk = 14_400  # 10 天每分钟一条
+with rot_3.open("w", encoding="utf-8") as f:
+    for i in range(chunk):
+        f.write(audit_line(24 * 3600 * 30 + 120 - i * 60, 125) + "\n")
+with rot_2.open("w", encoding="utf-8") as f:
+    for i in range(chunk):
+        f.write(audit_line(24 * 3600 * 20 - i * 60, 125) + "\n")
+with rot_1.open("w", encoding="utf-8") as f:
+    for i in range(chunk):
+        f.write(audit_line(24 * 3600 * 10 - i * 60, 125) + "\n")
+rot_current.write_text(audit_line(60, 125) + "\n", encoding="utf-8")
+result = run_verify(rot_current)
+assert result["ok"] is True, result
+assert result["pid"] == 125, result
+assert result["running_secs"] >= 24 * 3600 * 30, result
+
 # 审计日志缺失：返回 ok=false 而不是崩溃。
 missing = run_verify(tmp / "missing.log")
 assert missing["ok"] is False and "error" in missing, missing
@@ -205,4 +227,4 @@ disk_ok_file.write_text(
 result = run_verify(disk_ok_file)
 assert result["disk_ok"] is True, result
 
-print("通过：audit-longrun --verify 未满/满30天/缺失/源冷却/历史坏行/最近坏行/pid切换/同pid断档/RSS增长/RSS正常波动/磁盘不足/磁盘充足场景判定正确")
+print("通过：audit-longrun --verify 未满/满30天/跨轮转30天/缺失/源冷却/历史坏行/最近坏行/pid切换/同pid断档/RSS增长/RSS正常波动/磁盘不足/磁盘充足场景判定正确")

@@ -38,24 +38,33 @@ import json, subprocess, sys, datetime
 path = sys.argv[1]
 rust_bin = sys.argv[2]
 records = []
-with open(path, encoding="utf-8") as f:
-    for line in f:
-        line = line.strip()
-        if not line:
-            continue
-        # 行格式：时间 JSON；异常行/轮转前的旧格式不参与判定。
-        try:
-            # 实际行是 "2026-08-15 09:24:25 +0800 {...}"，时间占三段，
-            # JSON 从第一个 "{" 开始，不能按单个空格拆分。
-            ts = line[:25]
-            raw = line[25:].strip()
-            # 日志时间格式是 "2026-08-15 09:24:25 +0800"，
-            # Python 的 fromisoformat 需要把时区空格换成 "T" 才能解析。
-            ts = datetime.datetime.fromisoformat(ts.replace(" ", "T", 1))
-            rec = json.loads(raw)
-            records.append((ts, rec))
-        except Exception:
-            continue
+paths = [path] + [f"{path}.{i}" for i in range(1, 6)]
+for log_path in paths:
+    try:
+        f = open(log_path, encoding="utf-8")
+    except OSError:
+        continue
+    with f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            # 行格式：时间 JSON；异常行/轮转前的旧格式不参与判定。
+            try:
+                # 实际行是 "2026-08-15 09:24:25 +0800 {...}"，时间占三段，
+                # JSON 从第一个 "{" 开始，不能按单个空格拆分。
+                ts = line[:25]
+                raw = line[25:].strip()
+                # 日志时间格式是 "2026-08-15 09:24:25 +0800"，
+                # Python 的 fromisoformat 需要把时区空格换成 "T" 才能解析。
+                ts = datetime.datetime.fromisoformat(ts.replace(" ", "T", 1))
+                rec = json.loads(raw)
+                records.append((ts, rec))
+            except Exception:
+                continue
+# 轮转文件按时间自然先后排列：`mv` 只会整文件后移，不跨文件重复，排序后
+# 才能把跨轮转的同一 pid 心跳连成连续时间线。
+records.sort(key=lambda item: item[0])
 if not records:
     print('{"ok":false,"error":"审计日志无可解析记录"}')
     sys.exit(0)
