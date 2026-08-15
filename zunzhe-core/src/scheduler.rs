@@ -23,6 +23,26 @@ use crate::watchlist::Watchlist;
 /// 50 秒护栏仍能兜底网络卡顿。
 const SCHEDULER_VIDEO_WINDOW: u32 = 30;
 
+/// 视频源并发检查上限。
+///
+/// 直播检查已经并发，但视频源此前是串行遍历：一个源被 B站 412/RSSHub 403
+/// 或网络卡住 50 秒，后面所有源都会被拖住，多源时整轮很容易撞上 70 秒
+/// tick 护栏。这里给视频源同样加上有界并发（默认 4 路），平台抖动只影响
+/// 自己，不阻塞其它博主；上限取小值避免几十个源同时打平台把风控打得更严。
+const SCHEDULER_VIDEO_CONCURRENCY: usize = 4;
+
+/// 一个视频源检查结果：网络/平台/时区等问题在单源内消化，不中断整轮。
+struct SourceCheckOutcome {
+    source_url: String,
+    name: String,
+    item_download: Option<bool>,
+    videos: Result<Vec<crate::model::VideoMeta>>,
+    timed_out: bool,
+}
+
+/// 并发检查队列里的一个待检视频源：`(URL, 博主名, 下载偏好)`。
+type PendingVideoSource = (String, String, Option<bool>);
+
 /// 周期维护时清理 B站 Electron 协议残留文件（payload/stderr/status）。
 ///
 /// 调度轮次不跑 Electron，但旧版本/手动诊断可能留下临时文件；daemon 每 6 小时
@@ -581,51 +601,25 @@ async fn tick(
         .collect();
     let auto_download = config.is_yes_fupan("视频监控", "自动下载新视频(是/否)", true);
     let notify_enabled = config.is_yes_fupan("复盘邮件", "发现新视频时发送通知(是/否)", true);
-    let item_count = items.len();
+    let (outcomes, skipped_in_concurrent) = check_video_sources_concurrent(
+        pool,
+        project_dir,
+        items,
+        SCHEDULER_VIDEO_CONCURRENCY,
+        platform::resolve_with_project_dir,
+    )
+    .await?;
+    skipped_cooldown += skipped_in_concurrent;
     // 所有源共用同一个“已知视频”集合，只在第一个成功源前查询一次；
     // 后面的源复用这份快照，避免 10 个源每轮全量扫描 10 次 videos 表。
     let mut known_ids: Option<std::collections::HashSet<String>> = None;
-    for (source_url, name, item_download) in items {
-        // B站风控/网络故障不是一次就能恢复；连续失败后给该源冷却时间，
-        // 避免每轮都走完整的官方+RSSHub+yt-dlp 兜底链，既拖慢 daemon 又
-        // 更容易加重 412。连续失败 3 次起冷却 15 分钟，指数增长，上限 2 小时；
-        // 任何一次成功立即清零，不会把刚恢复的源误判成“还在故障”。
-        let (source_fails, last_failed_at) = db::source_failure_state(pool, &source_url).await?;
-        if source_fails >= 3 {
-            let now = chrono::Local::now().timestamp();
-            let cooldown = source_cooldown_secs(source_fails);
-            if source_cooldown_active(now, last_failed_at, cooldown) {
-                info!(
-                    "source {source_url} 连续失败 {source_fails} 次，冷却 {} 分钟",
-                    cooldown / 60
-                );
-                skipped_cooldown += 1;
-                continue;
-            }
-        }
-        let adapter = platform::resolve_with_project_dir(&source_url, project_dir);
-        // 首次基线未建立时仍然检查；B站空间接口 403 等失败要明确返回错误，
-        // 不能把“0 条视频”当成成功，避免用户误以为监控已正常工作。
-        // 每个视频源最多 50 秒：B站官方/RSSHub/yt-dlp 多重兜底可能叠加较久，
-        // 单源卡住不能拖垮整个 daemon 轮次。
-        match tokio::time::timeout(
-            Duration::from_secs(50),
-            adapter.list_videos(&source_url, SCHEDULER_VIDEO_WINDOW),
-        )
-        .await
-        {
-            Ok(Err(e)) => {
-                error!("source {source_url} check failed: {e:#}");
-                let fails = db::bump_source_failures(pool, &source_url)
-                    .await
-                    .unwrap_or(0);
-                info!("source {source_url} 失败冷却计数: {fails}");
-                if item_count == 1 {
-                    // 单源且是用户手动 check-videos：把失败直接暴露，便于排查。
-                    return Err(anyhow::anyhow!("视频监控源检查失败 {source_url}: {e:#}"));
-                }
-            }
-            Ok(Ok(videos)) => {
+    let only_source = outcomes.len() == 1;
+    for outcome in outcomes {
+        let source_url = outcome.source_url;
+        let name = outcome.name;
+        let item_download = outcome.item_download;
+        match outcome.videos {
+            Ok(videos) => {
                 // 成功即清零冷却状态；即使本轮返回空，只要平台接口明确成功，
                 // 也说明网络/风控已恢复，不应继续被旧失败计数拖累。
                 let _ = db::reset_source_failures(pool, &source_url).await;
@@ -693,14 +687,22 @@ async fn tick(
                 }
                 checked += 1;
             }
-            Err(_) => {
-                error!("source {source_url} check timeout (50s)");
+            Err(e) => {
+                if outcome.timed_out {
+                    error!("source {source_url} check timeout (50s)");
+                } else {
+                    error!("source {source_url} check failed: {e:#}");
+                }
                 let fails = db::bump_source_failures(pool, &source_url)
                     .await
                     .unwrap_or(0);
                 info!("source {source_url} 失败冷却计数: {fails}");
-                if item_count == 1 {
-                    return Err(anyhow::anyhow!("视频监控源检查超时（50 秒）: {source_url}"));
+                if only_source {
+                    // 单源且是用户手动 check-videos：把失败直接暴露，便于排查。
+                    if outcome.timed_out {
+                        return Err(anyhow!("视频监控源检查超时（50 秒）: {source_url}"));
+                    }
+                    return Err(anyhow!("视频监控源检查失败 {source_url}: {e:#}"));
                 }
             }
         }
@@ -713,6 +715,121 @@ async fn tick(
         notify_retried: notified_retry,
         skipped_cooldown,
     })
+}
+
+/// 有界并发检查视频源，结果按列表顺序返回。
+///
+/// 每个源使用自己的适配器与 50 秒总超时；并发上限防止几十个源同时打平台。
+/// 冷却逻辑仍然保留：失败 >=3 次的源在并发检查前跳过，避免冷却源继续占用
+/// 并发槽位。任何单源错误/超时只进入 Outcome，由调用方统一记失败次数。
+async fn check_video_sources_concurrent<F>(
+    pool: &SqlitePool,
+    project_dir: &Path,
+    items: Vec<(String, String, Option<bool>)>,
+    concurrency: usize,
+    resolve: F,
+) -> Result<(Vec<SourceCheckOutcome>, usize)>
+where
+    F: Fn(&str, &Path) -> Box<dyn platform::Platform> + Clone + Send + Sync + 'static,
+{
+    let concurrency = concurrency.max(1);
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let mut pending: Vec<(usize, PendingVideoSource)> = Vec::with_capacity(items.len());
+    let mut skipped_cooldown = 0usize;
+    for (idx, item) in items.into_iter().enumerate() {
+        let (source_url, name, item_download) = item;
+        // B站风控/网络故障不是一次就能恢复；连续失败后给该源冷却时间，
+        // 避免每轮都走完整的官方+RSSHub+yt-dlp 兜底链，既拖慢 daemon 又
+        // 更容易加重 412。连续失败 3 次起冷却 15 分钟，指数增长，上限 2 小时；
+        // 任何一次成功立即清零，不会把刚恢复的源误判成“还在故障”。
+        let (source_fails, last_failed_at) = db::source_failure_state(pool, &source_url).await?;
+        if source_fails >= 3 {
+            let now = chrono::Local::now().timestamp();
+            let cooldown = source_cooldown_secs(source_fails);
+            if source_cooldown_active(now, last_failed_at, cooldown) {
+                info!(
+                    "source {source_url} 连续失败 {source_fails} 次，冷却 {} 分钟",
+                    cooldown / 60
+                );
+                skipped_cooldown += 1;
+                continue;
+            }
+        }
+        pending.push((idx, (source_url, name, item_download)));
+    }
+
+    let mut handles = Vec::with_capacity(pending.len());
+    for (idx, (source_url, name, item_download)) in pending.iter() {
+        let sem = semaphore.clone();
+        let project_dir = project_dir.to_path_buf();
+        let resolve = resolve.clone();
+        let source_url = source_url.clone();
+        let name = name.clone();
+        let item_download = *item_download;
+        handles.push((
+            idx,
+            tokio::spawn(async move {
+                let _permit = sem.acquire_owned().await.expect("信号量不会关闭");
+                let adapter = resolve(&source_url, &project_dir);
+                // 首次基线未建立时仍然检查；B站空间接口 403 等失败要明确返回错误，
+                // 不能把“0 条视频”当成成功，避免用户误以为监控已正常工作。
+                // 每个视频源最多 50 秒：B站官方/RSSHub/yt-dlp 多重兜底可能叠加较久，
+                // 单源卡住不能拖垮整个 daemon 轮次。
+                match tokio::time::timeout(
+                    Duration::from_secs(50),
+                    adapter.list_videos(&source_url, SCHEDULER_VIDEO_WINDOW),
+                )
+                .await
+                {
+                    Ok(videos) => SourceCheckOutcome {
+                        source_url,
+                        name,
+                        item_download,
+                        videos,
+                        timed_out: false,
+                    },
+                    Err(_) => {
+                        let err = anyhow!("视频监控源检查超时（50 秒）: {source_url}");
+                        SourceCheckOutcome {
+                            source_url,
+                            name,
+                            item_download,
+                            videos: Err(err),
+                            timed_out: true,
+                        }
+                    }
+                }
+            }),
+        ));
+    }
+
+    let mut outcomes = Vec::with_capacity(handles.len());
+    for (idx, handle) in handles {
+        let item = match handle.await {
+            Ok(item) => item,
+            Err(e) => {
+                // 单个源任务 panic 不能让整轮 tick 崩溃；按失败记一次并继续。
+                let (source_url, name, item_download) = pending
+                    .iter()
+                    .find(|(i, _)| *i == *idx)
+                    .map(|(_, item)| item.clone())
+                    .unwrap_or_default();
+                SourceCheckOutcome {
+                    source_url,
+                    name,
+                    item_download,
+                    videos: Err(anyhow!("视频监控源检查任务 panic: {e}")),
+                    timed_out: false,
+                }
+            }
+        };
+        outcomes.push((idx, item));
+    }
+    outcomes.sort_by_key(|(idx, _)| *idx);
+    Ok((
+        outcomes.into_iter().map(|(_, item)| item).collect(),
+        skipped_cooldown,
+    ))
 }
 
 /// 供 CLI check-videos 复用的一轮检查。
@@ -1060,6 +1177,112 @@ mod tests {
             !source_cooldown_active(now, now - 60, 0),
             "无冷却时永远允许"
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_video_checks_isolate_slow_source() {
+        use std::time::Duration;
+
+        struct SlowPlatform;
+        struct FastPlatform;
+
+        impl platform::Platform for SlowPlatform {
+            fn name(&self) -> &'static str {
+                "slow"
+            }
+
+            fn list_videos<'a>(
+                &'a self,
+                _url: &'a str,
+                _count: u32,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = anyhow::Result<Vec<crate::model::VideoMeta>>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    Err(anyhow!("慢源超时"))
+                })
+            }
+        }
+
+        impl platform::Platform for FastPlatform {
+            fn name(&self) -> &'static str {
+                "fast"
+            }
+
+            fn list_videos<'a>(
+                &'a self,
+                url: &'a str,
+                _count: u32,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = anyhow::Result<Vec<crate::model::VideoMeta>>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                let url = url.to_string();
+                Box::pin(async move {
+                    Ok(vec![crate::model::VideoMeta {
+                        id: format!("fast-{url}"),
+                        platform: "test".into(),
+                        url: url.clone(),
+                        title: "fast".into(),
+                        cover: String::new(),
+                        published_at: "2026-08-15".into(),
+                        duration: 0,
+                    }])
+                })
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "zunzhe-video-conc-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db_file = root.join("test.db");
+        let pool = crate::db::open_pool(&db_file).await.unwrap();
+        db::init_db(&pool).await.unwrap();
+
+        let (outcomes, _skipped) = check_video_sources_concurrent(
+            &pool,
+            &root,
+            vec![
+                ("slow-url".to_string(), "慢源".to_string(), None),
+                ("fast-url".to_string(), "快源".to_string(), None),
+            ],
+            2,
+            move |url, _| {
+                if url == "slow-url" {
+                    Box::new(SlowPlatform)
+                } else {
+                    Box::new(FastPlatform)
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcomes.len(), 2);
+        assert!(
+            outcomes[0].videos.is_err(),
+            "慢源失败应作为单源错误保留，不吞掉"
+        );
+        assert!(
+            outcomes[1].videos.is_ok(),
+            "快源不应被慢源阻塞：并发上限 2 时两者同时执行"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
