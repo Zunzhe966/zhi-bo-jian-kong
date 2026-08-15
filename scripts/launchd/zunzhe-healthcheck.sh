@@ -59,7 +59,13 @@ mkdir -p "$LOG_DIR"
 rotate_if_large() {
   local file="$1"
   local max_bytes="${2:-5242880}"
-  if [ -f "$file" ] && [ "$(stat -f%z "$file" 2>/dev/null || echo 0)" -ge "$max_bytes" ]; then
+  local size
+  if [ -f "$file" ]; then
+    size="$(stat -f%z "$file" 2>/dev/null || stat -c%s "$file" 2>/dev/null || echo 0)"
+  else
+    size=0
+  fi
+  if [ "$size" -ge "$max_bytes" ]; then
     for i in 5 4 3 2 1; do
       if [ -f "$file.$i" ]; then
         mv -f "$file.$i" "$file.$((i+1))" 2>/dev/null || true
