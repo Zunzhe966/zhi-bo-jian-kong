@@ -19,6 +19,8 @@ fi
 LOG="$ROOT/logs/zunzhe-core.watchdog.log"
 mkdir -p "$(dirname "$LOG")"
 
+AUDIT_LOG="$ROOT/logs/zunzhe-core.audit.log"
+
 # 桌面端 watchdog 每分钟追加一行；按大小轮转并保留最近 5 份，避免
 # 24×30 期间只靠桌面端运行时日志无限增长。
 rotate_if_large() {
@@ -61,6 +63,40 @@ fi
 
 printf '%s pid=%s rust_daemon=%s heartbeat_ok=%s\n' \
   "$now" "${pid:-none}" "$daemon_ok" "$heartbeat_ok" >> "$LOG"
+
+# 与 audit-longrun.sh / check-rust-daemon.ps1 对齐：把 doctor 的
+# source_health / notify_health 字段写入审计日志，让桌面端看门狗和 Windows
+# 看门狗有相同可审计指标；解析失败只记一行异常，不阻塞健康判定。
+printf '%s' "$status" | python3 -c 'import json,sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("audit_unparseable")
+    sys.exit(0)
+h = d.get("health_audit") or {}
+sh = d.get("source_health") or {}
+nh = d.get("notify_health") or {}
+print(json.dumps({
+    "health": bool(d.get("health", h.get("ok", False))),
+    "daemon_ok": bool(d.get("daemon_ok", d.get("rust_daemon", h.get("daemon_ok", False)))),
+    "heartbeat_ok": bool(d.get("heartbeat_ok", h.get("heartbeat_ok", False))),
+    "pid": h.get("pid") or d.get("rust_pid"),
+    "rss_kib": h.get("rss_kib"),
+    "uptime_secs": h.get("uptime_secs", d.get("uptime_secs", 0)),
+    "heartbeat_age_secs": h.get("last_heartbeat_age_secs"),
+    "heartbeat_lines": h.get("heartbeat_lines", 0),
+    "consecutive_heartbeats": h.get("consecutive_heartbeats", 0),
+    "log_gap_secs": h.get("log_gap_secs"),
+    "source_total": sh.get("total", 0),
+    "source_failing": sh.get("failing", 0),
+    "source_cooling": sh.get("cooling", 0),
+    "source_ok": bool(sh.get("ok", True)),
+    "notify_pending": nh.get("pending", 0),
+    "notify_failed": nh.get("failed", 0),
+    "notify_latest_failed_channel": nh.get("latest_failed_channel"),
+    "notify_hint": nh.get("hint"),
+    "notify_ok": bool(nh.get("ok", True)),
+}, ensure_ascii=False))' >> "$AUDIT_LOG" 2>/dev/null || echo "$now audit_unparseable" >> "$AUDIT_LOG"
 
 if [ "$daemon_ok" = "false" ] || [ "$heartbeat_ok" = "false" ]; then
   echo "$now daemon unhealthy, calling ensure-services" >> "$LOG"
