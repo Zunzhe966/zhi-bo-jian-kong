@@ -34,7 +34,7 @@ if [ "$VERIFY" = "--verify" ]; then
   AUDIT_LOG="${VERIFY_LOG:-$LOG}"
   [ -f "$AUDIT_LOG" ] || { echo '{"ok":false,"error":"审计日志不存在"}' ; exit 0; }
   python3 - "$AUDIT_LOG" "$RUST_BIN" <<'PY'
-import json, subprocess, sys, datetime
+import json, os, subprocess, sys, datetime
 path = sys.argv[1]
 rust_bin = sys.argv[2]
 records = []
@@ -120,21 +120,39 @@ notify_ok = bool(last.get("notify_ok", True)) and all(
     rec.get("notify_ok", True) for ts, rec in records if ts >= last_ts - recent_window
 )
 uptime_secs = 0
-try:
-    diag = json.loads(subprocess.check_output(
-        [rust_bin, "doctor"], cwd=path if False else None,
-        stderr=subprocess.DEVNULL, timeout=10,
-    ).decode("utf-8", "replace"))
-    uptime_secs = int(diag.get("uptime_secs") or 0)
-except Exception:
-    pass
+doctor_pid = None
+# 测试环境可注入 doctor pid，避免真实 daemon pid 与合成审计行不一致；
+# 生产环境不设置该变量，走真实 doctor 作为当前实例证据。
+test_doctor_pid = os.environ.get("ZUNZHE_VERIFY_DOCTOR_PID")
+if test_doctor_pid is not None:
+    try:
+        doctor_pid = int(test_doctor_pid)
+    except ValueError:
+        doctor_pid = None
+else:
+    try:
+        diag = json.loads(subprocess.check_output(
+            [rust_bin, "doctor"], cwd=None,
+            stderr=subprocess.DEVNULL, timeout=10,
+        ).decode("utf-8", "replace"))
+        uptime_secs = int(diag.get("uptime_secs") or 0)
+        doctor_pid = diag.get("health_audit", {}).get("pid")
+    except Exception:
+        pass
 # 审计日志会按 5MB 轮转，首条可能不在当前文件里；daemon 自报 uptime 是
 # 同一 pid 的连续运行时长，作为轮转后的辅助证据。
 duration_ok = running_secs >= target_secs or uptime_secs >= target_secs
+# 当前 daemon 是验收对象：审计日志 pid 与 doctor pid 不一致时，说明最近
+# 发生过热切换/重启，不能拿旧 pid 的累计时长当“当前实例已跑满 24×30”。
+pid_aligned = not doctor_pid or pid == doctor_pid
+if not pid_aligned:
+    duration_ok = False
 ok = bool(pid) and duration_ok and gap_ok and recent_ok and source_ok and notify_ok and rss_ok and disk_ok
 print(json.dumps({
     "ok": ok,
     "pid": pid,
+    "doctor_pid": doctor_pid,
+    "pid_aligned": pid_aligned,
     "running_secs": int(running_secs),
     "uptime_secs": uptime_secs,
     "target_secs": target_secs,
