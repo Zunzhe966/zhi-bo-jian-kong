@@ -104,8 +104,22 @@ def full_access_entry():
     }
 
 
-def repair_thread(tid):
+def normalize_tid(raw):
+    # 桌面端路由键可能带 host 前缀（local%3A<thread-id>），认领/权限表里则是
+    # 纯 thread-id。归一化后再去修复，避免带前缀键永远查不到权限条目。
+    if not isinstance(raw, str):
+        return ""
+    tid = raw
+    if "%3A" in tid:
+        tid = tid.rsplit("%3A", 1)[-1]
+    elif ":" in tid:
+        tid = tid.rsplit(":", 1)[-1]
+    return tid
+
+
+def repair_thread(raw_tid):
     global changed
+    tid = normalize_tid(raw_tid)
     if not tid:
         return
     flat_key = "heartbeat-thread-permissions-by-id." + tid
@@ -142,7 +156,13 @@ try:
         processes = json.load(f)
 except (OSError, json.JSONDecodeError):
     processes = []
+if isinstance(processes, dict):
+    processes = processes.get("processes", [])
+if not isinstance(processes, list):
+    processes = []
 for process in processes:
+    if not isinstance(process, dict):
+        continue
     cwd = process.get("cwd") or ""
     for root in candidate_roots:
         if os.path.abspath(cwd).startswith(root):
@@ -168,18 +188,23 @@ if isinstance(assignment_map, dict):
 for key, route in container.items():
     if not key.startswith("thread-tab-routes-v1:"):
         continue
-    tid = key[len("thread-tab-routes-v1:"):]
     if not isinstance(route, dict):
         continue
-    for route_entry in route.get("routes") or []:
+    routes = route.get("routes")
+    if not isinstance(routes, list):
+        continue
+    for route_entry in routes:
         if not isinstance(route_entry, dict):
             continue
-        cwd = route_entry.get("params", {}).get("cwd") or ""
+        params = route_entry.get("params")
+        if not isinstance(params, dict):
+            continue
+        cwd = params.get("cwd") or ""
         if not cwd:
             continue
         for root in candidate_roots:
             if os.path.abspath(cwd).startswith(root):
-                repair_thread(tid)
+                repair_thread(key[len("thread-tab-routes-v1:"):])
                 break
 
 # host 级默认：新任务从“完全访问 + 永不审批”继承，避免只有当前任务被修好、
