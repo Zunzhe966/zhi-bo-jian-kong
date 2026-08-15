@@ -357,6 +357,7 @@ async fn bilibili_browser_download(project_dir: &Path, url: &str, dir: &Path) ->
     // 造成“下载成功但上一个文件永久丢失”。这里先探测已存在文件，给重复标题
     // 追加 `_2/_3` 序号，确保每次下载都写到独立文件。
     let output_file = unique_media_path(dir, &title, "mp4");
+    let output_existed_before = output_file.exists();
     let ffmpeg = find_ffmpeg(project_dir);
     let mut args = vec![
         "-y".to_string(),
@@ -396,17 +397,32 @@ async fn bilibili_browser_download(project_dir: &Path, url: &str, dir: &Path) ->
     let child = ManagedChild::spawn(&mut cmd).ok()?;
     let output = match child.wait_with_output(Duration::from_secs(600)).await {
         Ok(output) => output,
-        Err(ChildError::Timeout) | Err(ChildError::Io(_)) => return None,
+        Err(ChildError::Timeout) | Err(ChildError::Io(_)) => {
+            remove_partial_media(&output_file, output_existed_before);
+            return None;
+        }
     };
     if !output.status.success()
         || !std::fs::metadata(&output_file)
             .map(|m| m.is_file())
             .unwrap_or(false)
     {
+        remove_partial_media(&output_file, output_existed_before);
         None
     } else {
         Some(output_file.display().to_string())
     }
+}
+
+/// ffmpeg 写入失败/超时后清理本轮产生的半截文件。
+///
+/// `existed_before` 为 true 时表示目标在 ffmpeg 启动前已存在，绝不删除；
+/// 只有确认是“本轮新生成”的文件才清理，避免把用户原有文件误删。
+fn remove_partial_media(path: &Path, existed_before: bool) {
+    if existed_before {
+        return;
+    }
+    let _ = std::fs::remove_file(path);
 }
 
 fn find_electron(project_dir: &Path) -> Option<PathBuf> {
@@ -890,6 +906,29 @@ mod tests {
         let third = unique_media_path(&dir, "标题", "mp4");
         assert_eq!(third, dir.join("标题_3.mp4"), "已有 _2 时应继续追加 _3");
         assert!(first.exists() && second.exists(), "旧文件不能被覆盖删除");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_partial_media_keeps_pre_existing_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-partial-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fresh = dir.join("fresh.mp4");
+        std::fs::write(&fresh, b"partial").unwrap();
+        remove_partial_media(&fresh, false);
+        assert!(!fresh.exists(), "本轮新生成的半截文件应被清理");
+
+        let old = dir.join("old.mp4");
+        std::fs::write(&old, b"old").unwrap();
+        remove_partial_media(&old, true);
+        assert!(old.exists(), "启动前已存在的文件不能被清理");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
