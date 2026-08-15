@@ -93,6 +93,16 @@ try {
     heartbeat_lines = if ($null -ne $audit.heartbeat_lines) { [int]$audit.heartbeat_lines } else { 0 }
     consecutive_heartbeats = if ($null -ne $audit.consecutive_heartbeats) { [int]$audit.consecutive_heartbeats } else { 0 }
     log_gap_secs = if ($null -ne $audit.log_gap_secs) { $audit.log_gap_secs } else { $null }
+    disk_free_mb = if ($null -ne $diag.disk_free_mb) { [long]$diag.disk_free_mb } else { $null }
+    source_total = if ($null -ne $sourceHealth.total) { [int]$sourceHealth.total } else { 0 }
+    source_failing = if ($null -ne $sourceHealth.failing) { [int]$sourceHealth.failing } else { 0 }
+    source_cooling = if ($null -ne $sourceHealth.cooling) { [int]$sourceHealth.cooling } else { 0 }
+    source_ok = if ($null -ne $sourceHealth.ok) { [bool]$sourceHealth.ok } else { $true }
+    notify_pending = if ($null -ne $notifyHealth.pending) { [int]$notifyHealth.pending } else { 0 }
+    notify_failed = if ($null -ne $notifyHealth.failed) { [int]$notifyHealth.failed } else { 0 }
+    notify_latest_failed_channel = if ($null -ne $notifyHealth.latest_failed_channel) { $notifyHealth.latest_failed_channel } else { $null }
+    notify_hint = if ($null -ne $notifyHealth.hint) { $notifyHealth.hint } else { $null }
+    notify_ok = if ($null -ne $notifyHealth.ok) { [bool]$notifyHealth.ok } else { $true }
   }
   Add-Content -Path $AuditLog -Value "$now $(ConvertTo-Json -InputObject $auditLine -Compress -Depth 4)"
 } catch {

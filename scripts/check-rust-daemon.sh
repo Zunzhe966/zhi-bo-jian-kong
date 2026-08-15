@@ -96,6 +96,7 @@ print(json.dumps({
     "notify_latest_failed_channel": nh.get("latest_failed_channel"),
     "notify_hint": nh.get("hint"),
     "notify_ok": bool(nh.get("ok", True)),
+    "disk_free_mb": d.get("disk_free_mb"),
 }, ensure_ascii=False))' >> "$AUDIT_LOG" 2>/dev/null || echo "$now audit_unparseable" >> "$AUDIT_LOG"
 
 if [ "$daemon_ok" = "false" ] || [ "$heartbeat_ok" = "false" ]; then
