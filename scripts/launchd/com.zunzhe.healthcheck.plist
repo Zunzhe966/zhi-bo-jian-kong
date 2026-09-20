@@ -8,7 +8,7 @@
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>/Users/zhangxuetao/Library/LaunchAgents/zunzhe-healthcheck.sh</string>
+    <string>__HOME__/Library/LaunchAgents/zunzhe-healthcheck.sh</string>
   </array>
   <key>StartInterval</key>
   <integer>60</integer>
@@ -20,8 +20,8 @@
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
   </dict>
   <key>StandardOutPath</key>
-  <string>/Users/zhangxuetao/Library/Logs/zunzhe/zunzhe-healthcheck.log</string>
+  <string>__LOG_DIR__/zunzhe-healthcheck.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/zhangxuetao/Library/Logs/zunzhe/zunzhe-healthcheck.err.log</string>
+  <string>__LOG_DIR__/zunzhe-healthcheck.err.log</string>
 </dict>
 </plist>

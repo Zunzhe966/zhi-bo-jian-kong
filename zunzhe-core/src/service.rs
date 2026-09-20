@@ -31,7 +31,7 @@ pub struct HealthAudit {
 /// 会丢掉同 pid 的最早起点，uptime 变成“最近一段”而不是“本实例全程”。
 /// 轮转方向是 `.3` 最旧、当前文件最新，按该顺序拼接后上层可统一按时间排序。
 pub fn read_uptime_logs(project_dir: &Path) -> String {
-    let dir = project_dir.join("logs");
+    let dir = crate::paths::logs(project_dir);
     let base = dir.join("zunzhe-core.uptime.log");
     let mut parts = Vec::new();
     for idx in (1..=3).rev() {
@@ -211,7 +211,7 @@ pub fn ensure_started(project_dir: &Path) -> Result<serde_json::Value> {
             json!(format!("已启动 pid={}", child.id())),
         );
     }
-    Ok(json!({"ok": true, "services": services, "logs": project_dir.join("logs")}))
+    Ok(json!({"ok": true, "services": services, "logs": crate::paths::logs(project_dir)}))
 }
 
 #[allow(dead_code)] // 保留显式 Python 兜底入口，CLI/MCP 默认不再自动调用
@@ -234,6 +234,12 @@ pub fn stop_all(project_dir: &Path) -> Result<serde_json::Value> {
 pub fn ensure_core(project_dir: &Path) -> Result<serde_json::Value> {
     #[cfg(target_os = "macos")]
     sync_launchd_scripts(project_dir);
+    // 看门狗是“崩溃自愈”的唯一执行者，但它自己不在 monitor 的 KeepAlive
+    // 保护范围内 —— 一旦被 bootout 或 bootstrap 曾失败，它不会再回来，
+    // 而 daemon 会继续健康运行，静默丧失自愈能力。ensure_core 是桌面端/
+    // 看门狗/CLI 的公共入口，在这里顺带把它挂回去。
+    #[cfg(target_os = "macos")]
+    ensure_healthcheck_loaded(project_dir);
     // macOS 上 launchd 是 24×30 的正式管理者（KeepAlive 自动拉起）。
     // 若已安装 com.zunzhe.monitor，ensure 优先让 launchd 拉起，避免本进程
     // 直接 spawn 与 launchd 抢单实例锁；否则 launchd 会不断重试并报
@@ -309,6 +315,11 @@ fn sync_launchd_scripts(project_dir: &Path) {
     let Some(home) = std::env::var_os("HOME") else {
         return;
     };
+    // launchd 会先打开 StandardOutPath / StandardErrorPath，再执行守护脚本；
+    // 目录不存在时任务在脚本运行前就失败，守护脚本里的 mkdir 也救不回来。
+    if let Err(e) = fs::create_dir_all(crate::paths::logs(project_dir)) {
+        tracing::warn!("创建 launchd 日志目录失败: {e:#}");
+    }
     let launch_agents = std::path::Path::new(&home)
         .join("Library")
         .join("LaunchAgents");
@@ -330,26 +341,68 @@ fn sync_launchd_scripts(project_dir: &Path) {
             project_dir.join("scripts").join("audit-longrun.sh"),
             launch_agents.join("audit-longrun.sh"),
         ),
+        (
+            project_dir.join("scripts").join("render-launchd-plists.sh"),
+            launch_agents.join("render-launchd-plists.sh"),
+        ),
     ];
     for (src, dst) in pairs {
-        if !src.is_file() {
+        sync_file_if_changed(&src, &dst);
+    }
+
+    // plist 也属于仓库安装物：升级用户如果只同步脚本，仍会继承旧的
+    // ~/Library/Logs/zunzhe 标准流路径。这里只渲染模板并替换文件，不
+    // launchctl unload/load，避免打断当前 daemon 的同 pid 长跑；新路径在
+    // 下一次系统重启/服务重载时生效。
+    let project_dir_text = project_dir.to_string_lossy();
+    for name in ["com.zunzhe.monitor.plist", "com.zunzhe.healthcheck.plist"] {
+        let src = repo_scripts.join(name);
+        let Ok(template) = fs::read_to_string(&src) else {
             continue;
-        }
-        // 相同内容直接跳过；只有仓库版本更新时才覆盖，避免无谓的写盘/权限错误。
-        let changed = match (fs::read(&src), fs::read(&dst)) {
-            (Ok(src_bytes), Ok(dst_bytes)) => src_bytes != dst_bytes,
-            (Ok(_), Err(_)) => true,
-            (Err(_), _) => false,
         };
-        if !changed {
+        // plist 模板使用 __PROJECT_DIR__ / __LOG_DIR__，与 setup-macos.sh 的
+        // 渲染规则一致；日志目录单独解析，用户把它换到别的盘后 stdout/stderr
+        // 也会跟着走。对不是模板的文件保持原样，避免测试/第三方脚本被替换。
+        if !template.contains("__PROJECT_DIR__") && !template.contains("__LOG_DIR__") {
             continue;
         }
-        let _ = fs::create_dir_all(&launch_agents);
-        if fs::copy(&src, &dst).is_ok()
-            && let Ok(meta) = fs::metadata(&src)
-        {
-            let _ = fs::set_permissions(&dst, meta.permissions());
+        let home_text = std::path::Path::new(&home).to_string_lossy();
+        let log_dir_text = crate::paths::logs(project_dir);
+        let log_dir_text = log_dir_text.to_string_lossy();
+        let rendered = template
+            .replace("__PROJECT_DIR__", &project_dir_text)
+            .replace("__LOG_DIR__", &log_dir_text)
+            .replace("__HOME__", &home_text);
+        let dst = launch_agents.join(name);
+        let changed = fs::read_to_string(&dst)
+            .map(|existing| existing != rendered)
+            .unwrap_or(true);
+        if changed {
+            let _ = fs::create_dir_all(&launch_agents);
+            let _ = fs::write(&dst, rendered);
         }
+    }
+}
+
+/// 内容变化时复制文件；相同则跳过，避免无谓写盘/权限错误。
+#[cfg(target_os = "macos")]
+fn sync_file_if_changed(src: &Path, dst: &Path) {
+    use std::fs;
+    if !src.is_file() {
+        return;
+    }
+    let changed = match (fs::read(src), fs::read(dst)) {
+        (Ok(src_bytes), Ok(dst_bytes)) => src_bytes != dst_bytes,
+        (Ok(_), Err(_)) => true,
+        (Err(_), _) => false,
+    };
+    if !changed {
+        return;
+    }
+    if fs::copy(src, dst).is_ok()
+        && let Ok(meta) = fs::metadata(src)
+    {
+        let _ = fs::set_permissions(dst, meta.permissions());
     }
 }
 
@@ -371,6 +424,84 @@ fn launchd_monitor_installed() -> bool {
 #[cfg(target_os = "macos")]
 fn launchd_can_manage(project_dir: &Path) -> bool {
     launchd_monitor_installed() && !is_tcc_protected_path(project_dir)
+}
+
+/// macOS：com.zunzhe.healthcheck 看门狗是否已安装到用户 LaunchAgents。
+#[cfg(target_os = "macos")]
+fn launchd_healthcheck_installed() -> bool {
+    let path = std::path::Path::new(&std::env::var("HOME").unwrap_or_default())
+        .join("Library")
+        .join("LaunchAgents")
+        .join("com.zunzhe.healthcheck.plist");
+    path.is_file()
+}
+
+/// macOS：com.zunzhe.healthcheck 是否已加载进当前用户的 launchd domain。
+///
+/// 只看 plist 文件存在是不够的：任务可能被 `launchctl bootout` 卸掉、
+/// 因为上一次 bootstrap 失败而从没加载过、或被用户在系统设置里停用。
+/// 这些情况下看门狗**完全不会运行**，而 monitor 侧的 KeepAlive 对此
+/// 一无所知 —— 整个“崩溃自愈”能力会静默归零。
+#[cfg(target_os = "macos")]
+fn launchd_healthcheck_loaded() -> bool {
+    let uid = unsafe { libc::getuid() };
+    std::process::Command::new("launchctl")
+        .args(["print", &format!("gui/{uid}/com.zunzhe.healthcheck")])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+/// macOS：确保看门狗任务已加载，掉线时重新挂上。
+///
+/// 幂等：已加载就直接返回，不做无谓的 bootout/bootstrap，避免打断
+/// 看门狗自己的分钟节奏。项目位于 TCC 保护目录时不做尝试 —— 那种
+/// 情况下 bootstrap 必然失败，反复重试只会刷日志。
+#[cfg(target_os = "macos")]
+fn ensure_healthcheck_loaded(project_dir: &Path) {
+    if is_tcc_protected_path(project_dir) || !launchd_healthcheck_installed() {
+        return;
+    }
+    if launchd_healthcheck_loaded() {
+        return;
+    }
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let plist = std::path::Path::new(&home)
+        .join("Library")
+        .join("LaunchAgents")
+        .join("com.zunzhe.healthcheck.plist");
+    let uid = unsafe { libc::getuid() };
+    let domain = format!("gui/{uid}");
+    // 别信 status()：受限环境（沙箱/无 TCC 授权的终端）下 launchctl 会
+    // 打 "Bootstrap failed: 5: Input/output error" 却仍返回 0。只有
+    // print 能证明任务真的在 domain 里，所以最后一律回查一次。
+    let mut ok = std::process::Command::new("launchctl")
+        .args(["bootstrap", &domain])
+        .arg(&plist)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+        && launchd_healthcheck_loaded();
+    if !ok {
+        // 新旧两套 launchctl API 在一些 macOS 版本上互斥，bootstrap
+        // 失败时用 load -w 兜底（load 在较老系统上仍然有效）。
+        let _ = std::process::Command::new("launchctl")
+            .arg("load")
+            .arg("-w")
+            .arg(&plist)
+            .status();
+        ok = launchd_healthcheck_loaded();
+    }
+    if ok {
+        tracing::info!("看门狗 com.zunzhe.healthcheck 未加载，已重新挂上");
+    } else {
+        tracing::warn!(
+            "看门狗 com.zunzhe.healthcheck 未加载且自动挂载失败；\
+             请在「终端.app」执行 scripts/restore-launchd.sh"
+        );
+    }
 }
 
 /// 项目是否位于 macOS TCC 保护目录（桌面/文稿）。
@@ -424,13 +555,23 @@ pub fn start_rust_daemon(project_dir: &Path, interval_secs: u64) -> Result<serde
     {
         stop_rust_daemon(project_dir)?;
         // 等旧进程退出、内核释放锁，避免下面 spawn 出的新实例立刻抢锁失败。
+        // 这里只探测“锁是否已被让出”：拿到后立即 drop，不能把锁留在父进程手里。
+        let mut released = false;
         for _ in 0..50 {
-            // 这里只探测“锁是否已被让出”：拿到后立即 drop，不能把锁留在父进程手里。
             if crate::daemon_lock::DaemonLock::try_acquire(project_dir)?.is_none() {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             } else {
+                released = true;
                 break;
             }
+        }
+        // 5 秒内旧进程仍未让出锁时，继续 spawn 只会让新实例抢锁失败并立刻退出，
+        // 调用方随后看到的是误导性的“启动超时 / 立即退出”。这里显式给出根因。
+        if !released {
+            bail!(
+                "停止旧 daemon 后 5 秒内单实例锁仍未释放，可能有残留进程占锁；\
+                 请检查 fupan_output/run/zunzhe-core.lock 与 logs/zunzhe-core.log"
+            );
         }
     }
     let exe = project_dir
@@ -447,7 +588,7 @@ pub fn start_rust_daemon(project_dir: &Path, interval_secs: u64) -> Result<serde
     if !exe.exists() {
         bail!("找不到 Rust 核心二进制: {}", exe.display());
     }
-    let log_dir = project_dir.join("logs");
+    let log_dir = crate::paths::logs(project_dir);
     std::fs::create_dir_all(&log_dir)?;
     let log_file = log_dir.join("zunzhe-core.log");
     rotate_log(&log_file, 5);
@@ -464,6 +605,20 @@ pub fn start_rust_daemon(project_dir: &Path, interval_secs: u64) -> Result<serde
         .stdin(std::process::Stdio::null())
         .stdout(log_handle.try_clone().context("复制日志句柄失败")?)
         .stderr(log_handle);
+    // 监控目标全部是国内直连站点（B站等），daemon 继承父进程的代理环境变量
+    // 反而致命：代理软件退出后端口失效，所有出网请求（reqwest 直播检测、
+    // yt-dlp 下载）都会卡在 Connection refused，整站监控静默瘫痪数小时。
+    // spawn 前显式剥离全部代理变量，保证 daemon 永远直连。
+    for var in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ] {
+        cmd.env_remove(var);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -536,10 +691,7 @@ pub fn stop_rust_daemon(project_dir: &Path) -> Result<serde_json::Value> {
 
 /// 兜底清理：读取 fupan_output/run/rust_live/ 下录制 pid 文件，逐个结束。
 fn cleanup_rust_recordings(project_dir: &Path) {
-    let dir = project_dir
-        .join("fupan_output")
-        .join("run")
-        .join("rust_live");
+    let dir = crate::paths::run_dir(&project_dir).join("rust_live");
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
     };
@@ -581,7 +733,7 @@ pub fn status(project_dir: &Path) -> Result<serde_json::Value> {
 
 /// 读取后台服务日志末尾若干行（兼容 Python tail-logs）。
 pub fn tail_logs(project_dir: &Path, name: &str, lines: u64) -> serde_json::Value {
-    let log = project_dir.join("logs").join(format!("{name}.log"));
+    let log = crate::paths::logs(project_dir).join(format!("{name}.log"));
     if !log.exists() {
         return json!({"ok": true, "name": name, "path": log.display().to_string(),
                       "content": "（暂无日志）"});
@@ -662,10 +814,7 @@ pub fn touch_heartbeat(project_dir: &Path) {
 }
 
 fn heartbeat_file(project_dir: &Path) -> std::path::PathBuf {
-    project_dir
-        .join("fupan_output")
-        .join("run")
-        .join("zunzhe-core.heartbeat")
+    crate::paths::run_dir(&project_dir).join("zunzhe-core.heartbeat")
 }
 
 fn heartbeat_fresh(project_dir: &Path, max_age_secs: u64) -> bool {
@@ -713,8 +862,8 @@ pub fn rotate_log_if_large(log: &Path, max_keep: usize, max_bytes: u64) {
 
 /// 诊断项：供桌面端/CLI 快速判断“为什么监控没在跑”。
 pub fn diagnostics(project_dir: &Path) -> Result<serde_json::Value> {
-    let log_dir = project_dir.join("logs");
-    let run_dir = project_dir.join("fupan_output").join("run");
+    let log_dir = crate::paths::logs(project_dir);
+    let run_dir = crate::paths::run_dir(&project_dir);
     let heartbeat_ok = heartbeat_fresh(project_dir, 30 * 60);
     let daemon_ok = rust_daemon_alive(project_dir);
     let disk = disk_free_bytes(project_dir);
@@ -962,10 +1111,7 @@ pub fn python_binary_available(python: &Path) -> bool {
 }
 
 fn pid_file(project_dir: &Path, name: &str) -> std::path::PathBuf {
-    project_dir
-        .join("fupan_output")
-        .join("run")
-        .join(format!("{name}.pid"))
+    crate::paths::run_dir(&project_dir).join(format!("{name}.pid"))
 }
 
 fn write_pid(project_dir: &Path, name: &str, pid: u32) {
@@ -983,10 +1129,7 @@ pub fn write_rust_daemon_pid(project_dir: &Path, pid: u32) {
 
 /// 录制进程 pid 落盘（fupan_output/run/rust_live/<url-hash>.pid），供停止兜底清理。
 pub fn write_rust_live_pid(project_dir: &Path, url: &str, pid: u32) {
-    let dir = project_dir
-        .join("fupan_output")
-        .join("run")
-        .join("rust_live");
+    let dir = crate::paths::run_dir(&project_dir).join("rust_live");
     let _ = std::fs::create_dir_all(&dir);
     let name = rust_live_pid_name(url);
     let _ = crate::config::atomic_write(&dir.join(format!("{name}.pid")), pid.to_string());
@@ -994,9 +1137,7 @@ pub fn write_rust_live_pid(project_dir: &Path, url: &str, pid: u32) {
 
 /// 删除某个直播地址对应的录制 pid 文件，供会话结束、启动失败或兜底清理使用。
 pub fn remove_rust_live_pid(project_dir: &Path, url: &str) {
-    let path = project_dir
-        .join("fupan_output")
-        .join("run")
+    let path = crate::paths::run_dir(&project_dir)
         .join("rust_live")
         .join(format!("{}.pid", rust_live_pid_name(url)));
     let _ = std::fs::remove_file(path);
@@ -1084,13 +1225,31 @@ fn kill_process(pid: u32) {
 mod tests {
     use super::*;
 
+    /// 测试进程是单进程多线程：`std::env::set_var` 改的是全局环境，
+    /// 一个测试把 HOME 指向临时目录、另一个测试正读 HOME 解析日志路径，
+    /// 就会互相踩（实测表现为 health_audit 偶发取不到 started 行）。
+    /// 所有动 HOME 的测试都必须先拿这把锁串行化。
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// 在受锁保护的作用域内临时替换 HOME，作用域结束自动还原。
+    fn with_home<R>(home: &std::path::Path, f: impl FnOnce() -> R) -> R {
+        let guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", home) };
+        let out = f();
+        match saved {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        drop(guard);
+        out
+    }
+
     #[test]
     fn rust_live_pid_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("zunzhe-rust-live-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::isolated_project("rust-live-pid");
         write_rust_live_pid(&dir, "https://live.bilibili.com/320", 12345);
-        let pid_dir = dir.join("fupan_output").join("run").join("rust_live");
+        let pid_dir = crate::paths::run_dir(&dir).join("rust_live");
         let file = std::fs::read_dir(&pid_dir)
             .unwrap()
             .next()
@@ -1170,6 +1329,13 @@ mod tests {
         let repo_scripts = project.join("scripts").join("launchd");
         std::fs::create_dir_all(&repo_scripts).unwrap();
         std::fs::create_dir_all(&launch_agents).unwrap();
+        std::fs::create_dir_all(project.join("config")).unwrap();
+        let custom_logs = project.join("custom-logs");
+        std::fs::write(
+            project.join("config").join("config.ini"),
+            format!("[路径设置]\n日志目录 = {}\n", custom_logs.display()),
+        )
+        .unwrap();
 
         let daemon_repo = repo_scripts.join("zunzhe-daemon.sh");
         let daemon_installed = launch_agents.join("zunzhe-daemon.sh");
@@ -1181,10 +1347,23 @@ mod tests {
         )
         .unwrap();
         std::fs::write(project.join("scripts").join("audit-longrun.sh"), "audit\n").unwrap();
+        std::fs::write(
+            project.join("scripts").join("render-launchd-plists.sh"),
+            "render plists\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo_scripts.join("com.zunzhe.monitor.plist"),
+            "StandardOutPath __LOG_DIR__/zunzhe-core.log\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo_scripts.join("com.zunzhe.healthcheck.plist"),
+            "StandardOutPath __LOG_DIR__/zunzhe-healthcheck.log\n",
+        )
+        .unwrap();
 
-        unsafe { std::env::set_var("HOME", &home) };
-        sync_launchd_scripts(&project);
-        unsafe { std::env::remove_var("HOME") };
+        with_home(&home, || sync_launchd_scripts(&project));
 
         assert_eq!(
             std::fs::read_to_string(&daemon_installed).unwrap(),
@@ -1199,6 +1378,30 @@ mod tests {
             std::fs::read_to_string(launch_agents.join("audit-longrun.sh")).unwrap(),
             "audit\n"
         );
+        assert_eq!(
+            std::fs::read_to_string(launch_agents.join("render-launchd-plists.sh")).unwrap(),
+            "render plists\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(launch_agents.join("com.zunzhe.monitor.plist")).unwrap(),
+            format!(
+                "StandardOutPath {}/zunzhe-core.log\n",
+                custom_logs.display()
+            ),
+            "plist 模板必须渲染成当前日志目录"
+        );
+        assert_eq!(
+            std::fs::read_to_string(launch_agents.join("com.zunzhe.healthcheck.plist")).unwrap(),
+            format!(
+                "StandardOutPath {}/zunzhe-healthcheck.log\n",
+                custom_logs.display()
+            ),
+            "健康检查 plist 模板必须渲染成当前日志目录"
+        );
+        assert!(
+            custom_logs.is_dir(),
+            "同步 launchd 时必须预创建配置的日志目录"
+        );
 
         // 幂等：再次同步不应改写任何文件（mtime 不变）。
         let before = std::fs::metadata(&daemon_installed)
@@ -1206,17 +1409,73 @@ mod tests {
             .modified()
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
-        unsafe { std::env::set_var("HOME", &home) };
-        sync_launchd_scripts(&project);
-        unsafe { std::env::remove_var("HOME") };
+        with_home(&home, || sync_launchd_scripts(&project));
         let after = std::fs::metadata(&daemon_installed)
             .unwrap()
             .modified()
             .unwrap();
         assert_eq!(before, after, "内容一致时不应反复覆盖");
+        let plist_before = std::fs::metadata(launch_agents.join("com.zunzhe.monitor.plist"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        with_home(&home, || sync_launchd_scripts(&project));
+        let plist_after = std::fs::metadata(launch_agents.join("com.zunzhe.monitor.plist"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(plist_before, plist_after, "plist 内容一致时不应反复覆盖");
 
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&project);
+    }
+
+    /// 看门狗掉线自愈的判定必须保守：缺 plist / TCC 保护目录时都不能
+    /// 去碰 launchctl —— 否则每轮 ensure 都会刷一次失败日志。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ensure_healthcheck_loaded_is_noop_without_plist() {
+        let home = std::env::temp_dir().join(format!("zunzhe-hc-noplist-{}", std::process::id()));
+        std::fs::create_dir_all(home.join("Library").join("LaunchAgents")).unwrap();
+        let project = home.join("Projects").join("尊者监控直播短视频");
+        std::fs::create_dir_all(&project).unwrap();
+
+        // 没装 plist：应静默返回，不产生任何副作用。
+        with_home(&home, || {
+            assert!(!launchd_healthcheck_installed(), "未安装时应判定为未安装");
+            ensure_healthcheck_loaded(&project);
+        });
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// TCC 保护目录下即使 plist 存在也不能尝试 bootstrap。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ensure_healthcheck_loaded_skips_tcc_protected_project() {
+        let home = std::env::temp_dir().join(format!("zunzhe-hc-tcc-{}", std::process::id()));
+        let agents = home.join("Library").join("LaunchAgents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(agents.join("com.zunzhe.healthcheck.plist"), "x\n").unwrap();
+        // 放在 Desktop 下 → 应被识别为 TCC 保护路径。
+        let project = home.join("Desktop").join("尊者监控直播短视频");
+        std::fs::create_dir_all(&project).unwrap();
+
+        with_home(&home, || {
+            assert!(
+                launchd_healthcheck_installed(),
+                "plist 存在时应判定为已安装"
+            );
+            assert!(
+                is_tcc_protected_path(&project),
+                "Desktop 下应判定为 TCC 保护路径"
+            );
+            // 关键：不能 panic、不能真的去 bootstrap。
+            ensure_healthcheck_loaded(&project);
+        });
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -1497,17 +1756,9 @@ mod tests {
 
     #[test]
     fn health_audit_reports_daemon_and_heartbeat_and_rss() {
-        let dir = std::env::temp_dir().join(format!(
-            "zunzhe-health-audit-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("logs")).unwrap();
-        std::fs::create_dir_all(dir.join("fupan_output").join("run")).unwrap();
+        let dir = crate::test_support::isolated_project("health-audit");
+        std::fs::create_dir_all(crate::paths::logs(&dir)).unwrap();
+        std::fs::create_dir_all(crate::paths::run_dir(&dir)).unwrap();
 
         // 心跳与 pid 都不存在：审计必须明确不健康，而不是报空健康。
         let audit = health_audit(&dir);
@@ -1522,7 +1773,7 @@ mod tests {
         touch_heartbeat(&dir);
         let started = chrono::Local::now() - chrono::Duration::seconds(125);
         std::fs::write(
-            dir.join("logs").join("zunzhe-core.uptime.log"),
+            crate::paths::logs(&dir).join("zunzhe-core.uptime.log"),
             format!(
                 "{} started pid={}\n{} pid={} rust_daemon=true heartbeat_ok=true\n",
                 started.format("%Y-%m-%d %H:%M:%S %z"),

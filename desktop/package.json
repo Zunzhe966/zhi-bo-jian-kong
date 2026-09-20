@@ -1,10 +1,11 @@
 {
   "name": "live-review-desktop",
-  "version": "1.1.0",
+  "version": "1.4.5",
   "description": "尊者直播监控桌面界面",
   "main": "electron/main.cjs",
   "author": "Zunzhe",
   "scripts": {
+    "test": "node scripts/run-electron-tests.cjs",
     "icons": "node scripts/make-icons.cjs",
     "dev": "vite",
     "build": "npm run icons && vite build",
@@ -19,25 +20,34 @@
     "directories": {
       "output": "release"
     },
-    "asar": true,
-    "asarUnpack": [
-      "electron/*.cjs"
-    ],
-    "extraResources": [
-      {
-        "from": "../zunzhe-core/target/release",
-        "to": "extra",
-        "filter": [
-          "zunzhe-core",
-          "zunzhe-core.exe"
-        ]
-      }
-    ],
     "files": [
       "dist/**",
       "electron/**",
       "assets/**",
-      "package.json"
+      "package.json",
+      "!node_modules/**",
+      "!electron/*.bak-*",
+      "!electron/*.test.cjs",
+      "!electron/_*test*.cjs"
+    ],
+    "extraResources": [
+      {
+        "from": "../zunzhe-core/target/release/zunzhe-core",
+        "to": "bin/zunzhe-core"
+      },
+      {
+        "from": "../ffmpeg/ffmpeg",
+        "to": "ffmpeg/ffmpeg"
+      },
+      {
+        "from": "../config-template",
+        "to": "config",
+        "filter": [
+          "*.ini",
+          "*.json",
+          "*.example"
+        ]
+      }
     ],
     "win": {
       "target": [
@@ -56,7 +66,7 @@
         "zip"
       ],
       "category": "public.app-category.video",
-      "icon": "assets/icon.png"
+      "icon": "assets/icon.icns"
     },
     "portable": {
       "artifactName": "尊者直播监控-${version}-便携版.exe"
