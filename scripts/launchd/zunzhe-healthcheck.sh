@@ -53,14 +53,21 @@ fi
 
 # mkdir 失败不再致命：TCC 拒绝时回退到真实可写目录，绝不让看门狗
 # 因为「日志写不进去」而整体失效。
+#
+# 注意：探测本身不能产生 stderr。`... > "$dir/probe" 2>/dev/null` 这种写法
+# 在 TCC 拒绝时，**重定向阶段**就已经报错，2>/dev/null 只在命令执行后生效，
+# 拦不住它 —— 结果每次探测都往 launchd 的 StandardErrorPath 吐一行，等于
+# 把刚修好的日志噪音又加回来。所以先 mkdir 拿到退出码，再用 [ -w ] 判断，
+# 全程没有会被拒绝的写操作。
 LOG_DIR_USABLE=true
-if ! mkdir -p "$LOG_DIR" 2>/dev/null || ! : > "$LOG_DIR/.write-probe" 2>/dev/null; then
+if ! mkdir -p "$LOG_DIR" 2>/dev/null || [ ! -w "$LOG_DIR" ]; then
   LOG_DIR_USABLE=false
   FALLBACK="$HOME/Library/Logs/zunzhe"
   mkdir -p "$FALLBACK" 2>/dev/null || true
   LOG_DIR="$FALLBACK"
 fi
-rm -f "$LOG_DIR/.write-probe" 2>/dev/null || true
+readonly LOG_DIR_USABLE
+export LOG_DIR_USABLE
 
 # 后续 guard/audit/doctor 的输出统一落到 LOG_DIR。
 mkdir -p "$ROOT/logs" 2>/dev/null || true
