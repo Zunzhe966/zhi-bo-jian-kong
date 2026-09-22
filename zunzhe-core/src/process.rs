@@ -56,7 +56,7 @@ impl ManagedChild {
             Ok(Ok(output)) => Ok(output),
             Ok(Err(e)) => Err(ChildError::Io(e)),
             Err(_) => {
-                terminate_process(pid);
+                terminate_process(pid).await;
                 Err(ChildError::Timeout)
             }
         }
@@ -69,7 +69,7 @@ impl ManagedChild {
             Ok(Ok(status)) => Ok(status),
             Ok(Err(e)) => Err(ChildError::Io(e)),
             Err(_) => {
-                terminate_process(pid);
+                terminate_process(pid).await;
                 Err(ChildError::Timeout)
             }
         }
@@ -122,14 +122,19 @@ pub fn tasklist_csv_has_pid(output: &str, pid: u32) -> bool {
 
 /// 终止一个子进程树。Unix 下要求该进程由 `ManagedChild::spawn` 启动并成为独立
 /// 进程组；Windows 下通过 taskkill /T 终止子进程树。
-pub fn terminate_process(pid: Option<u32>) {
+pub async fn terminate_process(pid: Option<u32>) {
     let Some(pid) = pid else {
         return;
     };
-    terminate_process_by_id(pid);
+    terminate_process_by_id(pid).await;
 }
 
-fn terminate_process_by_id(pid: u32) {
+/// 先 SIGTERM 让子进程优雅收尾，等 500ms 若仍存活再 SIGKILL 整个进程组。
+///
+/// 从 async 上下文调用，必须用 `tokio::time::sleep`：`std::thread::sleep`
+/// 会阻塞整个 tokio worker 线程 500ms，在命令超时清理时直接挤压其它
+/// 并发任务的运行时间。
+async fn terminate_process_by_id(pid: u32) {
     #[cfg(unix)]
     {
         if pid == 0 || pid > i32::MAX as u32 {
@@ -138,7 +143,7 @@ fn terminate_process_by_id(pid: u32) {
         unsafe {
             let _ = libc::kill(-(pid as i32), libc::SIGTERM);
         }
-        std::thread::sleep(Duration::from_millis(500));
+        tokio::time::sleep(Duration::from_millis(500)).await;
         unsafe {
             let _ = libc::kill(-(pid as i32), libc::SIGKILL);
         }

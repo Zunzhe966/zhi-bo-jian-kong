@@ -13,10 +13,30 @@ def _format_ts(seconds: float) -> str:
     return f'{h:02d}:{m:02d}:{s:02d}'
 
 
+def _has_audio_stream(media_path: str) -> bool:
+    """用 PyAV（faster-whisper 同款解码器）探测文件是否含音频轨。"""
+    try:
+        import av
+        with av.open(media_path) as container:
+            return len(container.streams.audio) > 0
+    except Exception as e:
+        # 打不开的文件同样无法转写，但要把原因说清楚而不是让上层收到
+        # 晦涩的解码异常。
+        print(f'媒体文件无法解码: {media_path}: {e}')
+        return False
+
+
 def transcribe_file(media_path: str, output_dir: str) -> dict | None:
     """转写单个文件，输出 转写.json / 转写.txt，返回 segments 数据。"""
     cfg = fupan_config()
     if not is_yes(get(cfg, '转写', '是否启用转写(是/否)', '是')):
+        return None
+
+    # 预检音频轨：yt-dlp 中断残留的单流文件（如 标题.f30077.mp4）只有视频轨，
+    # 直接喂给 faster-whisper 会在 PyAV 解码处抛 IndexError: tuple index out
+    # of range——报错信息完全看不出真实原因。这里提前给出明确结论。
+    if not _has_audio_stream(media_path):
+        print(f'跳过转写：文件没有音频轨（可能是下载中断残留的残缺文件）: {media_path}')
         return None
 
     mirror = get(cfg, '转写', 'hf镜像')

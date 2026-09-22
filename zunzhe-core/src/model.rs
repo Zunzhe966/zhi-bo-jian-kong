@@ -51,6 +51,8 @@ pub struct Task {
     pub status: String,
     pub attempts: i64,
     pub payload: String,
+    pub last_error: String,
+    pub next_retry_at: String,
     pub created_at: String,
     pub updated_at: String,
 }

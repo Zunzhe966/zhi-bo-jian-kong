@@ -37,18 +37,32 @@ CREATE INDEX IF NOT EXISTS idx_videos_anchor ON videos(anchor);
 
 COVER_CACHE_DIR = FUPAN_DIR / 'covers'
 
+# 建表只需成功执行一次；之后每次调用都重跑 executescript(SCHEMA) 纯属浪费
+# （CREATE TABLE IF NOT EXISTS 仍要走一遍解析+取写锁，在这个库被 CLI/下载/
+# 列表多处并发访问时，无谓的写锁会抬高 database is locked 的概率）。
+_schema_ready = False
+
 
 def _connect() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    # 这个库会被旧 Python CLI 与下载/列表调用并发访问；默认 5 秒等待太短，
+    # 且 DELETE 日志模式在读写交错时更容易让用户看到 database is locked。
+    # 与 Rust 主库保持一致：等待 15 秒，并让 SQLite 使用 WAL。
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.execute('PRAGMA journal_mode=WAL')
+    conn.execute('PRAGMA synchronous=NORMAL')
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def init_db() -> None:
+    global _schema_ready
+    COVER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    if _schema_ready:
+        return
     with _connect() as conn:
         conn.executescript(SCHEMA)
-    COVER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    _schema_ready = True
 
 
 def _now() -> str:
@@ -163,15 +177,21 @@ def cache_cover(cover_url: str, video_id: str) -> str:
 
 
 def attach_downloaded(videos: list[dict], source_url: str = '', anchor: str = '') -> list[dict]:
-    """给列表批量附上 downloaded 标记（与库中记录比对）。"""
+    """给列表批量附上 downloaded 标记（与库中记录比对）。
+
+    封面缓存路径也用 dict 一次建好：旧实现对每个视频都 next(...) 线性扫描
+    整个 known 列表，视频一多（几百条）就是 O(n²)，而这里恰好在「点开主播
+    详情/刷新列表」的热路径上，会肉眼可见地卡顿。
+    """
     init_db()
     known = get_videos(source_url=source_url, anchor=anchor)
-    map_id = {v['id']: v['downloaded'] for v in known}
+    map_id = {str(v['id']): v['downloaded'] for v in known}
+    map_cover = {str(v['id']): v['cover_cache'] for v in known}
     out = []
     for v in videos:
-        vid = v.get('id') or v.get('guid') or v.get('url')
+        vid = str(v.get('id') or v.get('guid') or v.get('url') or '')
         row = dict(v)
-        row['downloaded'] = 1 if map_id.get(str(vid)) else 0
-        row['cover_cache'] = next((k['cover_cache'] for k in known if str(k['id']) == str(vid)), '')
+        row['downloaded'] = 1 if map_id.get(vid) else 0
+        row['cover_cache'] = map_cover.get(vid, '')
         out.append(row)
     return out

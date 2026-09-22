@@ -20,6 +20,9 @@ async fn main() -> anyhow::Result<()> {
         }));
         let _ = tracing_subscriber::fmt()
             .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+            // extension 的 stdout 是 JSON-RPC 协议通道；任何普通日志混进去都会
+            // 让桌面端把日志当协议行解析并直接报错。日志必须显式走 stderr。
+            .with_writer(std::io::stderr)
             .try_init();
     }
 

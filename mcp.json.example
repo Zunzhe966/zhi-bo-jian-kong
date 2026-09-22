@@ -1,14 +1,6 @@
 {
   "mcpServers": {
-    "zunzhe-core": {
-      "command": "<项目绝对路径>/zunzhe-core/target/release/zunzhe-core",
-      "args": ["mcp"],
-      "cwd": "<项目绝对路径>",
-      "env": {
-        "RUST_LOG": "info"
-      }
-    },
-    "zunzhe-python-fallback": {
+    "live-monitor": {
       "command": "<项目绝对路径>/.venv/bin/python",
       "args": ["-m", "fupan.mcp_server"],
       "cwd": "<项目绝对路径>"

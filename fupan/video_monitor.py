@@ -15,7 +15,8 @@ from pathlib import Path
 
 import httpx
 
-from .settings import CONFIG_DIR, FUPAN_DIR, PROJECT_DIR, fupan_config, get, is_yes
+from .settings import (CONFIG_DIR, DOWNLOADS_DIR, FUPAN_DIR, PROJECT_DIR,
+                       fupan_config, get, is_yes)
 from .notify import send_new_video_alert
 from .pipeline import run_pipeline
 from . import bili_browser
@@ -25,7 +26,9 @@ from .video_library import (upsert_video, mark_downloaded, attach_downloaded,
 
 STATE_FILE = FUPAN_DIR / '视频监控状态.json'
 # 短视频与直播录像同在 downloads 下：downloads/短视频/主播名/日期_标题.mp4
-VIDEO_DOWNLOAD_ROOT = PROJECT_DIR / 'downloads' / '短视频'
+# 落点跟随 [路径设置]：以前写死 PROJECT_DIR/'downloads'，产物根改到别处后
+# 这条链路会把下载/查重/去重全指向一个已经不存在的老目录。
+VIDEO_DOWNLOAD_ROOT = DOWNLOADS_DIR / '短视频'
 UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36')
 

@@ -13,7 +13,51 @@ if (-not (Test-Path $RustBin)) {
   exit 1
 }
 
-$LogDir = Join-Path $Root 'logs'
+$ConfigFile = Join-Path $Root 'config\config.ini'
+if (-not (Test-Path $ConfigFile)) { $ConfigFile = Join-Path $Root 'config\config.ini.example' }
+$MediaRoot = ''
+$ConfiguredLogDir = ''
+$ConfiguredFupanDir = ''
+if (Test-Path $ConfigFile) {
+  $InPaths = $false
+  foreach ($line in Get-Content $ConfigFile) {
+    if ($line -match '^\s*\[(.+?)\]\s*$') { $InPaths = ($Matches[1] -eq '路径设置'); continue }
+    if ($InPaths -and $line -match '^\s*产物根目录\s*=\s*(.*)$') { $MediaRoot = $Matches[1].Trim(); continue }
+    if ($InPaths -and $line -match '^\s*日志目录\s*=\s*(.*)$') { $ConfiguredLogDir = $Matches[1].Trim(); continue }
+    if ($InPaths -and $line -match '^\s*复盘输出目录\s*=\s*(.*)$') { $ConfiguredFupanDir = $Matches[1].Trim(); continue }
+  }
+}
+if ([string]::IsNullOrWhiteSpace($MediaRoot)) {
+  $MediaRoot = Join-Path $HOME 'Documents\尊者产物'
+} elseif ($MediaRoot -eq '~') {
+  $MediaRoot = $HOME
+} elseif ($MediaRoot.StartsWith('~/')) {
+  $MediaRoot = Join-Path $HOME $MediaRoot.Substring(2)
+} elseif (-not [IO.Path]::IsPathRooted($MediaRoot)) {
+  $MediaRoot = Join-Path $Root $MediaRoot
+}
+if ([string]::IsNullOrWhiteSpace($ConfiguredLogDir)) {
+  $LogDir = Join-Path $MediaRoot 'logs'
+} elseif ($ConfiguredLogDir -eq '~') {
+  $LogDir = $HOME
+} elseif ($ConfiguredLogDir.StartsWith('~/')) {
+  $LogDir = Join-Path $HOME $ConfiguredLogDir.Substring(2)
+} elseif (-not [IO.Path]::IsPathRooted($ConfiguredLogDir)) {
+  $LogDir = Join-Path $Root $ConfiguredLogDir
+} else {
+  $LogDir = $ConfiguredLogDir
+}
+if ([string]::IsNullOrWhiteSpace($ConfiguredFupanDir)) {
+  $FupanDir = Join-Path $MediaRoot 'fupan_output'
+} elseif ($ConfiguredFupanDir -eq '~') {
+  $FupanDir = $HOME
+} elseif ($ConfiguredFupanDir.StartsWith('~/')) {
+  $FupanDir = Join-Path $HOME $ConfiguredFupanDir.Substring(2)
+} elseif (-not [IO.Path]::IsPathRooted($ConfiguredFupanDir)) {
+  $FupanDir = Join-Path $Root $ConfiguredFupanDir
+} else {
+  $FupanDir = $ConfiguredFupanDir
+}
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 $Log = Join-Path $LogDir 'zunzhe-core.watchdog.log'
 $AuditLog = Join-Path $LogDir 'zunzhe-core.audit.log'
@@ -30,7 +74,7 @@ function Rotate-IfLarge {
 }
 Rotate-IfLarge $Log
 Rotate-IfLarge $AuditLog
-$PidFile = Join-Path $Root 'fupan_output\run\zunzhe-core.pid'
+$PidFile = Join-Path $FupanDir 'run\zunzhe-core.pid'
 $Pid = if (Test-Path $PidFile) { (Get-Content -Raw $PidFile).Trim() } else { 'none' }
 
 $status = & $RustBin doctor 2>$null | Out-String

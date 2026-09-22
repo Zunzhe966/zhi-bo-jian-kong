@@ -11,8 +11,80 @@ use crate::config::Config;
 use crate::process::{ChildError, ManagedChild};
 use crate::service::python_binary_available;
 
-/// 列出 fupan_output/<主播>/<场次>/ 下的复盘产物（与 Python notes 对齐）。
-pub fn list_notes(fupan_dir: &Path, name_filter: &str) -> Result<Vec<serde_json::Value>> {
+/// 产物根下的系统目录名：这些不是主播目录，扫描产物时必须跳过。
+pub(crate) const NON_ANCHOR_DIRS: &[&str] = &[
+    "database",
+    "logs",
+    "downloads",
+    "fupan_output",
+    "covers",
+    "run",
+];
+
+/// 媒体文件后缀：用于识别场次目录里的视频/音频本体。
+pub(crate) const MEDIA_SUFFIXES: &[&str] = &[
+    "mp4", "ts", "mkv", "flv", "mov", "webm", "mp3", "m4a", "wav",
+];
+
+/// 列出全部转写产物（含绝对路径）——智能体找文件就靠它。
+///
+/// 新布局（产品手册第 3 章）：扫 `{media_root}/{主播}/{直播|短视频}/{场次}/`，
+/// 此时 anchor 字段是真正的主播名（一级目录铁律 R2）。
+/// 旧布局（`fupan_output/{名字}/{场次}/`，目录合并迁移前的历史产物）一并列出，
+/// kind 标为「旧布局」，保证迁移完成前智能体仍能找到旧文件。
+pub fn list_notes(
+    media_root: &Path,
+    fupan_dir: &Path,
+    name_filter: &str,
+) -> Result<Vec<serde_json::Value>> {
+    let mut results = Vec::new();
+    // 新布局
+    if media_root.exists() {
+        let mut anchors: Vec<PathBuf> = std::fs::read_dir(media_root)
+            .map_err(anyhow::Error::from)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        anchors.sort();
+        for anchor_dir in anchors {
+            let anchor = anchor_dir
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if anchor.starts_with('.') || NON_ANCHOR_DIRS.contains(&anchor.as_str()) {
+                continue;
+            }
+            if !name_filter.is_empty() && anchor != name_filter {
+                continue;
+            }
+            for kind in ["直播", "短视频"] {
+                let kind_dir = anchor_dir.join(kind);
+                if !kind_dir.is_dir() {
+                    continue;
+                }
+                let mut sessions: Vec<PathBuf> = std::fs::read_dir(&kind_dir)
+                    .map_err(anyhow::Error::from)?
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .filter(|p| p.is_dir())
+                    .collect();
+                sessions.sort();
+                for session_dir in sessions {
+                    if let Some(entry) = scan_session_dir(&anchor, &session_dir, kind) {
+                        results.push(entry);
+                    }
+                }
+            }
+        }
+    }
+    // 旧布局（迁移前的历史产物）
+    results.extend(list_notes_legacy(fupan_dir, name_filter)?);
+    Ok(results)
+}
+
+/// 旧布局扫描：fupan_output/{名字}/{场次}/（目录合并前的历史形态）。
+fn list_notes_legacy(fupan_dir: &Path, name_filter: &str) -> Result<Vec<serde_json::Value>> {
     let mut results = Vec::new();
     if !fupan_dir.exists() {
         return Ok(results);
@@ -50,45 +122,68 @@ pub fn list_notes(fupan_dir: &Path, name_filter: &str) -> Result<Vec<serde_json:
             {
                 continue;
             }
-            let mut entry = serde_json::Map::new();
-            entry.insert("anchor".into(), anchor.clone().into());
-            entry.insert(
-                "session".into(),
-                session_dir
-                    .file_name()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_default()
-                    .into(),
-            );
-            let mut clips = Vec::new();
-            if let Ok(entries) = std::fs::read_dir(&session_dir) {
-                for f in entries.flatten() {
-                    let name = f.file_name().to_string_lossy().to_string();
-                    let path = f.path();
-                    if name.ends_with(".复盘笔记.md") {
-                        entry.insert("notes_file".into(), path.display().to_string().into());
-                    } else if name.ends_with(".转写.txt") {
-                        entry.insert("transcript_file".into(), path.display().to_string().into());
-                    } else if name.ends_with(".知识点.json") {
-                        entry.insert("points_file".into(), path.display().to_string().into());
-                    } else if path.is_dir()
-                        && name == "精华切片"
-                        && let Ok(inner) = std::fs::read_dir(&path)
-                    {
-                        clips = inner
-                            .flatten()
-                            .map(|c| c.path().display().to_string().into())
-                            .collect();
-                    }
-                }
+            if let Some(entry) = scan_session_dir(&anchor, &session_dir, "旧布局") {
+                results.push(entry);
             }
-            if !clips.is_empty() {
-                entry.insert("clips".into(), serde_json::Value::Array(clips));
-            }
-            results.push(serde_json::Value::Object(entry));
         }
     }
     Ok(results)
+}
+
+/// 扫描一个场次/视频目录，汇总里面的媒体本体与转写产物。
+/// 只有媒体、没有任何复盘产物（笔记/转写/知识点/切片）的目录不算「复盘产物」，
+/// 返回 None——否则下载完成但还没转写的几百个目录会把 notes_list 淹没。
+fn scan_session_dir(anchor: &str, session_dir: &Path, kind: &str) -> Option<serde_json::Value> {
+    let mut entry = serde_json::Map::new();
+    entry.insert("anchor".into(), anchor.into());
+    entry.insert(
+        "session".into(),
+        session_dir
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default()
+            .into(),
+    );
+    entry.insert("kind".into(), kind.into());
+    let mut clips = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(session_dir) {
+        for f in entries.flatten() {
+            let name = f.file_name().to_string_lossy().to_string();
+            let path = f.path();
+            if name.ends_with(".复盘笔记.md") {
+                entry.insert("notes_file".into(), path.display().to_string().into());
+            } else if name.ends_with(".转写.txt") {
+                entry.insert("transcript_file".into(), path.display().to_string().into());
+            } else if name.ends_with(".知识点.json") {
+                entry.insert("points_file".into(), path.display().to_string().into());
+            } else if path.is_dir()
+                && name == "精华切片"
+                && let Ok(inner) = std::fs::read_dir(&path)
+            {
+                clips = inner
+                    .flatten()
+                    .map(|c| c.path().display().to_string().into())
+                    .collect();
+            } else if path.is_file()
+                && !entry.contains_key("media_file")
+                && path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| MEDIA_SUFFIXES.contains(&e.to_ascii_lowercase().as_str()))
+                    .unwrap_or(false)
+            {
+                entry.insert("media_file".into(), path.display().to_string().into());
+            }
+        }
+    }
+    if !clips.is_empty() {
+        entry.insert("clips".into(), serde_json::Value::Array(clips));
+    }
+    let has_product = entry.contains_key("notes_file")
+        || entry.contains_key("transcript_file")
+        || entry.contains_key("points_file")
+        || entry.contains_key("clips");
+    has_product.then_some(serde_json::Value::Object(entry))
 }
 
 /// Python AI 工具层路径（转写/提炼/切片）。
@@ -155,29 +250,76 @@ impl PythonTool {
             .stderr(Stdio::piped());
         let child = ManagedChild::spawn(&mut cmd)
             .with_context(|| format!("启动复盘流水线失败: {}", self.python.display()))?;
-        let output = match child.wait_with_output(Duration::from_secs(3600)).await {
+        // Python 子进程内部也要有上限，避免 worker 超时后残骸继续跑；两者
+        // 共用同一个配置值，默认 6 小时，长视频不再被旧 60 分钟硬砍。
+        let project_dir = self
+            .module
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap_or_else(|| Path::new("."));
+        let timeout_secs = Config::load(project_dir)
+            .map(|cfg| cfg.pipeline_timeout_secs())
+            .unwrap_or(6 * 3600);
+        let output = match child
+            .wait_with_output(Duration::from_secs(timeout_secs))
+            .await
+        {
             Ok(output) => output,
             Err(ChildError::Io(e)) => return Err(e).context("读取复盘流水线输出失败"),
             Err(ChildError::Timeout) => {
-                anyhow::bail!("复盘流水线超时（60 分钟），已终止整个进程组")
+                anyhow::bail!("复盘流水线超时（{timeout_secs} 秒），已终止整个进程组")
             }
         };
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !output.status.success() {
+            // 500 字符会在 Python traceback 的关键异常行之前截断，导致
+            // “看似网络错误实为媒体文件问题”这类误诊。放宽到 4000。
             anyhow::bail!(
                 "复盘流水线退出码 {}: {}",
                 output.status,
-                stderr.chars().take(500).collect::<String>()
+                stderr.chars().take(4000).collect::<String>()
             );
         }
+        let incomplete_note = validate_pipeline_summary(&stdout)?;
         Ok(PipelineSummary {
             ok: true,
             media: media_path.to_string(),
             record_name: record_name.to_string(),
             output_tail: stdout.chars().take(800).collect::<String>(),
+            incomplete_note,
         })
     }
+}
+
+/// 校验 Python 流水线的结构化摘要。退出码 0 只说明脚本没有崩溃，不代表复盘
+/// 真正完成；例如“转写为空/未启用”也会以 0 返回。没有摘要时保持兼容旧脚本，
+/// 有摘要且状态不是“完成”时必须作为失败处理。
+fn validate_pipeline_summary(stdout: &str) -> Result<Option<String>> {
+    let Some(line) = stdout
+        .lines()
+        .rev()
+        .find(|line| line.trim().starts_with("{\"pipeline_summary\""))
+    else {
+        return Ok(None);
+    };
+    let value: serde_json::Value =
+        serde_json::from_str(line.trim()).context("解析 Python 复盘流水线摘要失败")?;
+    let status = value
+        .get("pipeline_summary")
+        .and_then(|summary| summary.get("status"))
+        .and_then(|status| status.as_str())
+        .unwrap_or("复盘流水线未返回完成状态");
+    if status != "完成" {
+        // 转写已经落盘、只是后续提炼没配置，不是转写失败；由 worker 标 done
+        // 并把说明保留给前端。真正的转写为空/无音频仍由 Python 返回同一类
+        // 未完成状态，界面会显示“转写为空或未启用”，不会伪造成功文件。
+        if status.contains("未配置大模型接口") && status.contains("已保留转写文本") {
+            return Ok(Some(status.to_string()));
+        }
+        anyhow::bail!("{status}");
+    }
+    Ok(None)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -186,6 +328,7 @@ pub struct PipelineSummary {
     pub media: String,
     pub record_name: String,
     pub output_tail: String,
+    pub incomplete_note: Option<String>,
 }
 
 /// 便捷入口：从 Config 构造并运行。
@@ -211,12 +354,13 @@ pub async fn run_pipeline_by_project(
 }
 
 /// 独立复盘队列 worker：处理 kind="process" 的任务（下载完成后自动转写/提炼/切片）。
-/// 不参与 70 秒 tick 护栏，单个任务最多 60 分钟；失败重试 3 次后标 failed。
+/// 不参与 70 秒 tick 护栏；每个任务超时从 `[复盘] 任务超时秒数` 即时读取，
+/// 失败重试 3 次后标 failed。
 pub async fn run_pipeline_worker(
     pool: SqlitePool,
     project_dir: PathBuf,
     mut stop: tokio::sync::watch::Receiver<bool>,
-    task_timeout: Duration,
+    _task_timeout: Duration,
     poll_interval: Duration,
 ) -> anyhow::Result<()> {
     let recovered = crate::db::recover_processing_by_kind(&pool, "process")
@@ -238,6 +382,11 @@ pub async fn run_pipeline_worker(
                 idle += 1;
             }
         }
+        // 配置热更新后，下一轮任务立即使用新上限；旧进程启动参数只作为
+        // 兼容占位，避免调用方需要同时维护两份超时状态。
+        let task_timeout = Config::load(&project_dir)
+            .map(|cfg| Duration::from_secs(cfg.pipeline_timeout_secs()))
+            .unwrap_or(_task_timeout);
         match drain_process_tasks(&pool, &project_dir, task_timeout, &stop).await {
             Ok(done) => {
                 if done > 0 {
@@ -299,7 +448,13 @@ async fn run_single_process_task(
     timeout_duration: Duration,
 ) -> bool {
     if task.kind != "process" {
-        let _ = crate::db::update_task_status(pool, task.id, "failed").await;
+        let _ = crate::db::record_task_failure(
+            pool,
+            task.id,
+            &format!("任务类型错误：期望 process，实际 {}", task.kind),
+            "failed",
+        )
+        .await;
         return false;
     }
     let outcome = tokio::time::timeout(
@@ -308,12 +463,18 @@ async fn run_single_process_task(
     )
     .await;
     match outcome {
-        Ok(Ok(_)) => crate::db::update_task_status(pool, task.id, "done")
-            .await
-            .is_ok(),
+        Ok(Ok(summary)) => {
+            let result = if let Some(note) = &summary.incomplete_note {
+                crate::db::complete_task_with_note(pool, task.id, note).await
+            } else {
+                crate::db::update_task_status(pool, task.id, "done").await
+            };
+            result.is_ok()
+        }
         Ok(Err(e)) => {
+            let reason = format!("{e:#}");
             tracing::warn!(
-                "复盘任务 id={} 失败（attempts={}）: {e:#}",
+                "复盘任务 id={} 失败（attempts={}）: {reason}",
                 task.id,
                 task.attempts
             );
@@ -322,10 +483,11 @@ async fn run_single_process_task(
             } else {
                 "pending"
             };
-            let _ = crate::db::update_task_status(pool, task.id, next).await;
+            let _ = crate::db::record_task_failure(pool, task.id, &reason, next).await;
             false
         }
         Err(_) => {
+            let reason = format!("复盘任务超时（attempts={}）", task.attempts);
             tracing::warn!(
                 "复盘任务 id={} 超时（attempts={}），已显式结束本轮",
                 task.id,
@@ -336,7 +498,7 @@ async fn run_single_process_task(
             } else {
                 "pending"
             };
-            let _ = crate::db::update_task_status(pool, task.id, next).await;
+            let _ = crate::db::record_task_failure(pool, task.id, &reason, next).await;
             false
         }
     }
@@ -423,6 +585,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn pipeline_summary_with_empty_transcription_is_rejected() {
+        // Python 流水线可能以退出码 0 返回“转写为空/未启用”。桥接层不能把
+        // 这种没有产物的状态当作成功，否则任务显示 done 却没有文件。
+        let output = concat!(
+            "[1/4] 转写: sample.mp4\n",
+            "转写为空或未启用，流水线结束\n",
+            "{\"pipeline_summary\":{\"status\":\"转写为空或未启用，流水线结束\"}}\n",
+        );
+        let err = validate_pipeline_summary(output).unwrap_err();
+        assert!(
+            err.to_string().contains("转写为空或未启用"),
+            "应保留 Python 给出的未完成原因: {err:#}"
+        );
+    }
+
+    #[test]
+    fn pipeline_summary_completed_is_accepted() {
+        let output = concat!(
+            "[4/4] 邮件通知\n",
+            "复盘完成，输出目录: /tmp/out\n",
+            "{\"pipeline_summary\":{\"status\":\"完成\"}}\n",
+        );
+        assert_eq!(validate_pipeline_summary(output).unwrap(), None);
+    }
+
+    #[test]
+    fn pipeline_summary_without_llm_is_a_completed_transcription_note() {
+        let output = concat!(
+            "[2/4] 知识提炼\n",
+            "未配置大模型接口，已保留转写文本，流水线结束\n",
+            "{\"pipeline_summary\":{\"status\":\"未配置大模型接口，已保留转写文本，流水线结束\"}}\n",
+        );
+        let note = validate_pipeline_summary(output).unwrap();
+        assert_eq!(
+            note.as_deref(),
+            Some("未配置大模型接口，已保留转写文本，流水线结束")
+        );
+    }
+
     #[tokio::test]
     async fn pipeline_worker_marks_stuck_task_failed() {
         let file = std::env::temp_dir().join(format!(
@@ -434,6 +636,7 @@ mod tests {
                 .as_nanos()
         ));
         let pool = crate::db::open_pool(&file).await.unwrap();
+        crate::db::init_db(&pool).await.unwrap();
         let id = crate::db::enqueue_task(&pool, "process", "/tmp/不存在.mp4", "测试")
             .await
             .unwrap();
@@ -486,6 +689,7 @@ mod tests {
                 .as_nanos()
         ));
         let pool = crate::db::open_pool(&file).await.unwrap();
+        crate::db::init_db(&pool).await.unwrap();
         let id = crate::db::enqueue_task(&pool, "process", "/tmp/不存在.mp4", "测试")
             .await
             .unwrap();

@@ -61,8 +61,15 @@ async def _resolve_kuaishou(url: str) -> dict:
     from src.spider import get_kuaishou_stream_data, get_kuaishou_stream_data2
     from src.stream import get_kuaishou_stream_url
 
+    # 优先用公开页面解析（__INITIAL_STATE__，免登录免签名、已验证稳定可用），
+    # 再尝试 byUser API 作为补充（该 API 易被 IP 风控，页面解析更可靠）。
     if '/u/' in url:
-        raw = await get_kuaishou_stream_data2(url)
+        raw = await get_kuaishou_stream_data(url)
+        if not raw or raw.get('type') != 2:
+            try:
+                raw = await get_kuaishou_stream_data2(url)
+            except Exception:
+                raw = raw or {'type': 2, 'is_live': False, 'anchor_name': ''}
     else:
         raw = await get_kuaishou_stream_data(url)
     result = await get_kuaishou_stream_url(raw, '原画')

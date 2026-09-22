@@ -370,10 +370,7 @@ impl<'a> Notifier<'a> {
             return;
         }
 
-        let path = project_dir
-            .join("fupan_output")
-            .join("run")
-            .join("pending_notify.json");
+        let path = crate::paths::run_dir(project_dir).join("pending_notify.json");
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -563,7 +560,7 @@ pub async fn send_serverchan(sendkey: &str, title: &str, content: &str) -> bool 
         return false;
     }
     let url = format!("https://sctapi.ftqq.com/{sendkey}.send");
-    let client = reqwest::Client::builder()
+    let client = crate::net::client_builder()
         .timeout(Duration::from_secs(15))
         .build();
     let Ok(client) = client else {
@@ -602,7 +599,7 @@ pub async fn send_pushplus(token: &str, title: &str, content: &str) -> bool {
     if token.is_empty() {
         return false;
     }
-    let client = reqwest::Client::builder()
+    let client = crate::net::client_builder()
         .timeout(Duration::from_secs(15))
         .build();
     let Ok(client) = client else {
@@ -634,7 +631,7 @@ pub async fn send_bark(api: &str, title: &str, content: &str) -> bool {
     if api.is_empty() {
         return false;
     }
-    let client = reqwest::Client::builder()
+    let client = crate::net::client_builder()
         .timeout(Duration::from_secs(15))
         .build();
     let Ok(client) = client else {
@@ -677,7 +674,7 @@ pub async fn send_ntfy(api: &str, title: &str, content: &str) -> bool {
     if api.is_empty() {
         return false;
     }
-    let client = reqwest::Client::builder()
+    let client = crate::net::client_builder()
         .timeout(Duration::from_secs(15))
         .build();
     let Ok(client) = client else {
@@ -794,24 +791,13 @@ mod tests {
     #[test]
     fn local_notify_ids_are_unique_within_same_millisecond() {
         // 桌面端按 id 去重；同一毫秒多条通知若 id 碰撞，用户只会看到一条。
-        let dir = std::env::temp_dir().join(format!(
-            "zunzhe-notify-id-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(dir.join("config")).unwrap();
+        let dir = crate::test_support::isolated_project("notify-id");
         crate::app_prefs::write_app_prefs(&dir, &serde_json::json!({})).unwrap();
         Notifier::queue_local(&dir, "标题1", "内容1");
         Notifier::queue_local(&dir, "标题2", "内容2");
         Notifier::queue_local(&dir, "标题3", "内容3");
 
-        let path = dir
-            .join("fupan_output")
-            .join("run")
-            .join("pending_notify.json");
+        let path = crate::paths::run_dir(&dir).join("pending_notify.json");
         let items: Vec<serde_json::Value> =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let ids: Vec<String> = items
@@ -828,23 +814,12 @@ mod tests {
     fn local_notify_ids_use_monotonic_sequence_even_after_reset() {
         // 进程内计数器不会因系统时钟回拨而回退；连续调用 5 次，id 后缀必须
         // 严格递增，避免桌面端按 id 去重时把新通知误判成旧通知。
-        let dir = std::env::temp_dir().join(format!(
-            "zunzhe-notify-seq-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(dir.join("config")).unwrap();
+        let dir = crate::test_support::isolated_project("notify-seq");
         crate::app_prefs::write_app_prefs(&dir, &serde_json::json!({})).unwrap();
         for i in 1..=5 {
             Notifier::queue_local(&dir, &format!("标题{i}"), &format!("内容{i}"));
         }
-        let path = dir
-            .join("fupan_output")
-            .join("run")
-            .join("pending_notify.json");
+        let path = crate::paths::run_dir(&dir).join("pending_notify.json");
         let items: Vec<serde_json::Value> =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let suffixes: Vec<u64> = items
@@ -873,17 +848,9 @@ mod tests {
         // 可能正好看到旧文件或新文件，绝不能看到半截 JSON。此契约测试模拟
         // 一个陈旧残留临时文件与一次正常追加，最终 JSON 必须是合法数组且
         // 包含全部通知。
-        let dir = std::env::temp_dir().join(format!(
-            "zunzhe-notify-atomic-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(dir.join("config")).unwrap();
+        let dir = crate::test_support::isolated_project("notify-atomic");
         crate::app_prefs::write_app_prefs(&dir, &serde_json::json!({})).unwrap();
-        let run = dir.join("fupan_output").join("run");
+        let run = crate::paths::run_dir(&dir);
         std::fs::create_dir_all(&run).unwrap();
         let queue = run.join("pending_notify.json");
         Notifier::queue_local(&dir, "标题1", "内容1");

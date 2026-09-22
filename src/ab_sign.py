@@ -452,3 +452,46 @@ def ab_sign(url_search_params: str, user_agent: str) -> str:
         generate_rc4_bb_str(url_search_params, user_agent, window_env_str),
         "s4"
     ) + "="
+
+
+def main():
+    """命令行入口：生成抖音 a_bogus 签名。
+    用法:
+      python ab_sign.py --params "device_platform=webapp&aid=6383&..."
+                         [--ua "Mozilla/5.0 ..."]
+    若省略 --params，则使用一个可复制的抖音 aweme/post 标准参数串示例。
+    """
+    import argparse
+    parser = argparse.ArgumentParser(description='生成抖音 a_bogus 签名')
+    parser.add_argument('--params', default='',
+                        help='URL 查询参数字符串(key=value&key=value)')
+    parser.add_argument('--ua', default=(
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36'),
+        help='User-Agent 字符串')
+    parser.add_argument('--example', action='store_true',
+                        help='输出一个 aweme/post 标准参数串示例')
+    args = parser.parse_args()
+
+    if args.example:
+        print('device_platform=webapp&aid=6383&channel=channel_pc_web'
+              '&update_version_code=170400&pc_client_type=1&pc_libra_divert=Mac'
+              '&support_h265=1&support_dash=0&version_code=170400&version_name=17.4.0'
+              '&cookie_enabled=true&platform=PC&downlink=10&effective_type=4g'
+              '&round_trip_time=300&sec_user_id=<SEC_UID>&max_cursor=0&count=18'
+              '&publish_video_strategy_type=2')
+        return
+
+    params = args.params or (
+        'device_platform=webapp&aid=6383&channel=channel_pc_web'
+        '&update_version_code=170400&pc_client_type=1&version_code=170400'
+        '&version_name=17.4.0&cookie_enabled=true&platform=PC&downlink=10'
+        '&effective_type=4g&round_trip_time=300&sec_user_id=<SEC_UID>'
+        '&max_cursor=0&count=18'
+    )
+    sig = ab_sign(params, args.ua)
+    print(sig)
+
+
+if __name__ == '__main__':
+    main()

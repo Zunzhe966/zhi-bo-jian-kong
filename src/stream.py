@@ -161,7 +161,7 @@ async def get_kuaishou_stream_url(json_data: dict, video_quality: str) -> dict:
 
     result = {
         "type": 2,
-        "anchor_name": json_data['anchor_name'],
+        "anchor_name": json_data.get('anchor_name', ''),
         "is_live": live_status,
     }
 

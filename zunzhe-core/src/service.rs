@@ -691,7 +691,7 @@ pub fn stop_rust_daemon(project_dir: &Path) -> Result<serde_json::Value> {
 
 /// 兜底清理：读取 fupan_output/run/rust_live/ 下录制 pid 文件，逐个结束。
 fn cleanup_rust_recordings(project_dir: &Path) {
-    let dir = crate::paths::run_dir(&project_dir).join("rust_live");
+    let dir = crate::paths::run_dir(project_dir).join("rust_live");
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
     };
@@ -733,7 +733,29 @@ pub fn status(project_dir: &Path) -> Result<serde_json::Value> {
 
 /// 读取后台服务日志末尾若干行（兼容 Python tail-logs）。
 pub fn tail_logs(project_dir: &Path, name: &str, lines: u64) -> serde_json::Value {
-    let log = crate::paths::logs(project_dir).join(format!("{name}.log"));
+    let file_name = if name.ends_with(".log") {
+        name.to_string()
+    } else {
+        format!("{name}.log")
+    };
+    let configured = crate::paths::logs(project_dir).join(&file_name);
+    // 升级前的 launchd 把 stdout/stderr 接到 ~/Library/Logs/zunzhe；
+    // 新路径生效后旧文件不会自动搬走。读取时只做历史兼容：优先当前配置
+    // 目录，只有当前文件不存在时才回退旧标准目录。写入仍只走 paths::logs，
+    // 不能让这里成为第二套日志落盘逻辑。
+    let legacy = std::env::var_os("HOME").map(PathBuf::from).map(|home| {
+        home.join("Library")
+            .join("Logs")
+            .join("zunzhe")
+            .join(&file_name)
+    });
+    let log = if configured.exists() {
+        configured
+    } else if let Some(legacy) = legacy.filter(|path| path.exists()) {
+        legacy
+    } else {
+        configured
+    };
     if !log.exists() {
         return json!({"ok": true, "name": name, "path": log.display().to_string(),
                       "content": "（暂无日志）"});
@@ -751,6 +773,60 @@ pub fn tail_logs(project_dir: &Path, name: &str, lines: u64) -> serde_json::Valu
         .join("\n");
     json!({"ok": true, "name": name, "path": log.display().to_string(),
            "content": tail, "lines": tail.lines().count()})
+}
+
+/// 解析一条日志在“配置目录”和旧 launchd 目录中的真实来源。
+///
+/// 这只做只读探测，不迁移、不复制、不创建文件。`tail_logs` 的历史回退必须
+/// 和 doctor/桌面端的可见路径使用同一套判断，否则界面会显示配置目录，而
+/// 用户实际看到的是 `~/Library/Logs/zunzhe` 里的旧 daemon 日志。
+fn resolve_log_source(project_dir: &Path, file_name: &str) -> serde_json::Value {
+    let configured = crate::paths::logs(project_dir).join(file_name);
+    let legacy = std::env::var_os("HOME").map(PathBuf::from).map(|home| {
+        home.join("Library")
+            .join("Logs")
+            .join("zunzhe")
+            .join(file_name)
+    });
+    let (resolved, source) = if configured.exists() {
+        (configured.clone(), "configured")
+    } else if let Some(path) = legacy.as_ref().filter(|path| path.exists()) {
+        (path.clone(), "legacy_fallback")
+    } else {
+        (configured.clone(), "missing")
+    };
+    json!({
+        "configured": configured.display().to_string(),
+        "legacy": legacy.map(|path| path.display().to_string()),
+        "resolved": resolved.display().to_string(),
+        "source": source,
+        "exists": resolved.exists(),
+    })
+}
+
+/// 日志路径诊断：让 UI、CLI 和 MCP 的 doctor 都能看到“配置目录 / 旧目录 /
+/// 当前实际读取文件”是否一致。仅当主错误日志和标准输出都来自配置目录时才
+/// 记为一致；否则给出可操作提示，但不让 doctor 整体失败。
+pub fn log_paths_diagnostics(project_dir: &Path) -> serde_json::Value {
+    let primary = resolve_log_source(project_dir, "zunzhe-core.log");
+    let error = resolve_log_source(project_dir, "zunzhe-core.err.log");
+    let configured = crate::paths::logs(project_dir);
+    let consistent = primary["source"] == "configured" && error["source"] == "configured";
+    let hint = if consistent {
+        None
+    } else {
+        Some(
+            "当前 daemon 日志仍由旧 launchd plist 写入历史目录；重新加载 \
+             com.zunzhe.monitor 后才会统一到配置日志目录。",
+        )
+    };
+    json!({
+        "configured_dir": configured.display().to_string(),
+        "primary": primary,
+        "error": error,
+        "consistent": consistent,
+        "hint": hint,
+    })
 }
 
 /// 检查 Rust 核心 daemon 是否在运行（通过 pid 文件，与 Python 服务同目录）。
@@ -814,7 +890,7 @@ pub fn touch_heartbeat(project_dir: &Path) {
 }
 
 fn heartbeat_file(project_dir: &Path) -> std::path::PathBuf {
-    crate::paths::run_dir(&project_dir).join("zunzhe-core.heartbeat")
+    crate::paths::run_dir(project_dir).join("zunzhe-core.heartbeat")
 }
 
 fn heartbeat_fresh(project_dir: &Path, max_age_secs: u64) -> bool {
@@ -863,7 +939,7 @@ pub fn rotate_log_if_large(log: &Path, max_keep: usize, max_bytes: u64) {
 /// 诊断项：供桌面端/CLI 快速判断“为什么监控没在跑”。
 pub fn diagnostics(project_dir: &Path) -> Result<serde_json::Value> {
     let log_dir = crate::paths::logs(project_dir);
-    let run_dir = crate::paths::run_dir(&project_dir);
+    let run_dir = crate::paths::run_dir(project_dir);
     let heartbeat_ok = heartbeat_fresh(project_dir, 30 * 60);
     let daemon_ok = rust_daemon_alive(project_dir);
     let disk = disk_free_bytes(project_dir);
@@ -906,6 +982,10 @@ pub fn diagnostics(project_dir: &Path) -> Result<serde_json::Value> {
     // 环境可用（ok）与守护健康（health）分离：即使 daemon 不在跑，doctor
     // 仍应返回环境诊断供修复；health 字段明确告诉调用方“监控本身是否健康”。
     let audit = health_audit(project_dir);
+    let log_paths = log_paths_diagnostics(project_dir);
+    if let Some(hint) = log_paths["hint"].as_str() {
+        hints.push(hint.to_string());
+    }
     // 三个复盘开关是自动复盘是否入队/跳过环节的直接依据；doctor 返回
     // 机器可读状态，避免用户/智能体在界面里翻配置才知道哪个环节被关闭。
     let switches = crate::download::PipelineSwitches::load(project_dir);
@@ -930,6 +1010,7 @@ pub fn diagnostics(project_dir: &Path) -> Result<serde_json::Value> {
         "daemon_ok": audit.daemon_ok,
         "health": audit.ok,
         "health_audit": audit,
+        "log_paths": log_paths,
         "uptime_secs": uptime_secs,
         "uptime_human": uptime_human,
         "logs_writable": log_dir.is_dir() || std::fs::create_dir_all(&log_dir).is_ok(),
@@ -1111,7 +1192,7 @@ pub fn python_binary_available(python: &Path) -> bool {
 }
 
 fn pid_file(project_dir: &Path, name: &str) -> std::path::PathBuf {
-    crate::paths::run_dir(&project_dir).join(format!("{name}.pid"))
+    crate::paths::run_dir(project_dir).join(format!("{name}.pid"))
 }
 
 fn write_pid(project_dir: &Path, name: &str, pid: u32) {
@@ -1129,7 +1210,7 @@ pub fn write_rust_daemon_pid(project_dir: &Path, pid: u32) {
 
 /// 录制进程 pid 落盘（fupan_output/run/rust_live/<url-hash>.pid），供停止兜底清理。
 pub fn write_rust_live_pid(project_dir: &Path, url: &str, pid: u32) {
-    let dir = crate::paths::run_dir(&project_dir).join("rust_live");
+    let dir = crate::paths::run_dir(project_dir).join("rust_live");
     let _ = std::fs::create_dir_all(&dir);
     let name = rust_live_pid_name(url);
     let _ = crate::config::atomic_write(&dir.join(format!("{name}.pid")), pid.to_string());
@@ -1137,7 +1218,7 @@ pub fn write_rust_live_pid(project_dir: &Path, url: &str, pid: u32) {
 
 /// 删除某个直播地址对应的录制 pid 文件，供会话结束、启动失败或兜底清理使用。
 pub fn remove_rust_live_pid(project_dir: &Path, url: &str) {
-    let path = crate::paths::run_dir(&project_dir)
+    let path = crate::paths::run_dir(project_dir)
         .join("rust_live")
         .join(format!("{}.pid", rust_live_pid_name(url)));
     let _ = std::fs::remove_file(path);
@@ -1480,9 +1561,8 @@ mod tests {
 
     #[test]
     fn heartbeat_and_diagnostics_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("zunzhe-heartbeat-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("fupan_output").join("run")).unwrap();
+        let dir = crate::test_support::isolated_project("heartbeat-diagnostics");
+        std::fs::create_dir_all(crate::paths::run_dir(&dir)).unwrap();
         assert!(!rust_daemon_alive(&dir));
         touch_heartbeat(&dir);
         let status = status(&dir).unwrap();
@@ -1495,6 +1575,39 @@ mod tests {
         assert!(diag["run_dir_writable"].as_bool().unwrap());
         assert_eq!(diag["uptime_secs"].as_u64(), Some(0));
         assert_eq!(diag["uptime_human"].as_str(), Some(""));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diagnostics_reports_legacy_log_fallback() {
+        let dir = crate::test_support::isolated_project("legacy-log-diagnostics");
+        let home = dir.join("home");
+        let legacy_dir = home.join("Library").join("Logs").join("zunzhe");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::write(legacy_dir.join("zunzhe-core.log"), "legacy stdout\n").unwrap();
+        std::fs::write(legacy_dir.join("zunzhe-core.err.log"), "legacy stderr\n").unwrap();
+
+        let diag = with_home(&home, || diagnostics(&dir).unwrap());
+
+        assert_eq!(diag["log_paths"]["consistent"], false);
+        assert_eq!(
+            diag["log_paths"]["primary"]["source"],
+            serde_json::json!("legacy_fallback")
+        );
+        assert_eq!(
+            diag["log_paths"]["error"]["source"],
+            serde_json::json!("legacy_fallback")
+        );
+        assert_eq!(
+            diag["log_paths"]["primary"]["resolved"],
+            serde_json::json!(legacy_dir.join("zunzhe-core.log").display().to_string())
+        );
+        assert!(
+            diag["log_paths"]["hint"]
+                .as_str()
+                .is_some_and(|hint| hint.contains("旧 launchd")),
+            "漂移时必须给出可操作提示: {diag}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1664,14 +1777,13 @@ mod tests {
 
     #[test]
     fn daemon_uptime_parses_started_line() {
-        let dir = std::env::temp_dir().join(format!("zunzhe-uptime-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("logs")).unwrap();
-        std::fs::create_dir_all(dir.join("fupan_output").join("run")).unwrap();
+        let dir = crate::test_support::isolated_project("uptime");
+        std::fs::create_dir_all(crate::paths::logs(&dir)).unwrap();
+        std::fs::create_dir_all(crate::paths::run_dir(&dir)).unwrap();
         write_rust_daemon_pid(&dir, 424242);
         let started = chrono::Local::now() - chrono::Duration::seconds(125);
         std::fs::write(
-            dir.join("logs").join("zunzhe-core.uptime.log"),
+            crate::paths::logs(&dir).join("zunzhe-core.uptime.log"),
             format!(
                 "{} started pid=424242\n{} pid=424242 rust_daemon=true heartbeat_ok=true\n",
                 started.format("%Y-%m-%d %H:%M:%S %z"),
@@ -1689,20 +1801,12 @@ mod tests {
     fn daemon_uptime_tolerates_corrupt_log() {
         // 日志可能被外部工具/磁盘异常写坏；uptime 只是诊断展示，绝不能因为
         // 正则或时间解析失败让 status/doctor 崩溃。
-        let dir = std::env::temp_dir().join(format!(
-            "zunzhe-uptime-corrupt-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("logs")).unwrap();
-        std::fs::create_dir_all(dir.join("fupan_output").join("run")).unwrap();
+        let dir = crate::test_support::isolated_project("uptime-corrupt");
+        std::fs::create_dir_all(crate::paths::logs(&dir)).unwrap();
+        std::fs::create_dir_all(crate::paths::run_dir(&dir)).unwrap();
         write_rust_daemon_pid(&dir, 424242);
         std::fs::write(
-            dir.join("logs").join("zunzhe-core.uptime.log"),
+            crate::paths::logs(&dir).join("zunzhe-core.uptime.log"),
             "这不是有效时间戳 started pid=424242\nbroken line\n",
         )
         .unwrap();
@@ -1717,22 +1821,14 @@ mod tests {
         // 24×30 期间 uptime 日志会被 daemon 启动时轮转；如果医生只看当前
         // 文件，跨轮转后就会把“本实例全程”误算成“最近一段”。这里模拟
         // 启动行落在 .1 历史里、当前文件只剩心跳，验证能合并出正确时长。
-        let dir = std::env::temp_dir().join(format!(
-            "zunzhe-uptime-rotated-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("logs")).unwrap();
-        std::fs::create_dir_all(dir.join("fupan_output").join("run")).unwrap();
+        let dir = crate::test_support::isolated_project("uptime-rotated");
+        std::fs::create_dir_all(crate::paths::logs(&dir)).unwrap();
+        std::fs::create_dir_all(crate::paths::run_dir(&dir)).unwrap();
         write_rust_daemon_pid(&dir, 424242);
 
         let started = chrono::Local::now() - chrono::Duration::seconds(9000);
         std::fs::write(
-            dir.join("logs").join("zunzhe-core.uptime.log.1"),
+            crate::paths::logs(&dir).join("zunzhe-core.uptime.log.1"),
             format!(
                 "{} started pid=424242\n",
                 started.format("%Y-%m-%d %H:%M:%S %z")
@@ -1740,7 +1836,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
-            dir.join("logs").join("zunzhe-core.uptime.log"),
+            crate::paths::logs(&dir).join("zunzhe-core.uptime.log"),
             format!(
                 "{} pid=424242 rust_daemon=true heartbeat_ok=true\n",
                 chrono::Local::now().format("%Y-%m-%d %H:%M:%S %z")
@@ -1812,19 +1908,11 @@ mod tests {
 
     #[test]
     fn health_audit_tolerates_corrupt_uptime_log() {
-        let dir = std::env::temp_dir().join(format!(
-            "zunzhe-health-corrupt-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("logs")).unwrap();
-        std::fs::create_dir_all(dir.join("fupan_output").join("run")).unwrap();
+        let dir = crate::test_support::isolated_project("health-corrupt");
+        std::fs::create_dir_all(crate::paths::logs(&dir)).unwrap();
+        std::fs::create_dir_all(crate::paths::run_dir(&dir)).unwrap();
         std::fs::write(
-            dir.join("logs").join("zunzhe-core.uptime.log"),
+            crate::paths::logs(&dir).join("zunzhe-core.uptime.log"),
             b"\xff\xfe\x00",
         )
         .unwrap();
@@ -1839,17 +1927,9 @@ mod tests {
 
     #[test]
     fn health_audit_started_at_only_matches_current_pid() {
-        let dir = std::env::temp_dir().join(format!(
-            "zunzhe-health-started-pid-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("logs")).unwrap();
-        std::fs::create_dir_all(dir.join("fupan_output").join("run")).unwrap();
+        let dir = crate::test_support::isolated_project("health-started-pid");
+        std::fs::create_dir_all(crate::paths::logs(&dir)).unwrap();
+        std::fs::create_dir_all(crate::paths::run_dir(&dir)).unwrap();
 
         // 合并读取后日志里既有旧实例的 started 行，也有当前实例的启动行；
         // started_at 必须指向当前 pid，而不是被历史行带偏。
@@ -1858,7 +1938,7 @@ mod tests {
         let old_start = chrono::Local::now() - chrono::Duration::days(20);
         let new_start = chrono::Local::now() - chrono::Duration::seconds(60);
         std::fs::write(
-            dir.join("logs").join("zunzhe-core.uptime.log"),
+            crate::paths::logs(&dir).join("zunzhe-core.uptime.log"),
             format!(
                 "{} started pid=111\n{} started pid=424242\n{} pid=424242 rust_daemon=true heartbeat_ok=true\n",
                 old_start.format("%Y-%m-%d %H:%M:%S %z"),

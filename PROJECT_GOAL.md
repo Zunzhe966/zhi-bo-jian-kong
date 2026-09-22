@@ -1,135 +1,169 @@
-# 尊者直播监控 — 项目目标（上下文恢复锚点）
+# 项目目标与现状（上下文恢复锚点）
 
-> 本文件是项目的"北极星"。任何一次会话开始、或上下文丢失时，先读本文件，
-> 再看 `需求梳理与Rust重构方案.md`（需求与设计）和 `git status`（进度），
-> 然后从"当前阶段"继续。
+> 📌 **产品定义以 [`项目宪法.md`](./项目宪法.md) 为准。**
+> 本文件是**进度与已交付能力清单**，不承担产品定义职责。
 
-## 运行权限基线（不可漂移）
-
-本项目的 Codex 运行配置锚定在 `.codex/config.toml`，固定为：
-
-- `approval_policy = "never"`：不向用户弹审批。
-- `default_permissions = ":danger-full-access"`：默认完全访问。
-- 项目目录标记为 `trusted`，保证本地读写与网络访问不受限制。
-
-如果桌面对话右上角的模式显示不是“完全访问”，通常是因为某个 Codex 对话被单独选择了“工作区/只读”等模式，或应用更新后重新创建了会话。恢复方法：打开该任务的权限/模式选择器，切回“完全访问”；或确认项目根目录下 `.codex/config.toml` 仍保持上面的三行配置，然后重启该任务。不要依赖其他任务或临时配置来覆盖本项目的基线。
+---
 
 ## 一、项目是什么
 
+个人自用的多平台**直播监控 · 短视频监控 · 转写落盘 · MCP 智能体接入**工具。
+macOS 优先，兼容 Windows。内容仅本地保存。
+
 - GitHub 私有仓库：`Zunzhe966/zun-zhe-zhi-bo-jian-kong`
-- 正式本地路径：`/Users/zhangxuetao/Projects/尊者监控直播短视频`
-- 桌面旧副本：`/Users/zhangxuetao/Desktop/尊者监控直播短视频`（仅保留待确认清理）
-- 技术栈（现状）：Python 3.14 + main.py（录制引擎）+ fupan/（复盘层）+ Electron 桌面端 + MCP/CLI
+- **正式路径（唯一真身）**：`/Volumes/A区/尊者监控直播短视频`（外置盘）
+- `~/Projects/尊者监控直播短视频` = **符号链接** → 上面那个（2026-09-17 建立）
+- `~/Desktop/尊者监控直播短视频` = **已不存在**
 
-## 二、最终目标
+---
 
-**Rust 重构核心 daemon（zunzhe-core），Python 保留为 AI 工具层，现有 Python 版保持可用，分阶段替换。**
+## 二、目标架构
 
-目标架构：
 ```
-界面层    Electron 界面（保留，接口对接 daemon）
-Rust 核心  zunzhe-core daemon（tokio + sqlx/SQLite + reqwest + clap + tracing）
+界面层    Electron 桌面端（desktop/）
+                │ IPC（调 Rust 二进制）
+核心层    Rust daemon  zunzhe-core
   ├─ 调度器 + 主播生命周期状态机
-  ├─ SQLite：anchors / videos / notify / tasks
+  ├─ SQLite：videos / tasks / notify / live_states / monitor_baseline ...
   ├─ Platform trait（bilibili / douyin / kuaishou ... 每平台一适配器）
   ├─ 下载队列（单/批量/全部，失败重试，成功标记 downloaded）
-  ├─ 复盘流水线桥接（调 Python 子进程）
+  ├─ 直播监控（Rust 原生 B站 / Python 链路 抖音快手）
   ├─ 通知总线（邮箱默认 + 每主播覆盖 + 本地兜底）
+  ├─ 复盘流水线桥接（spawn Python 子进程）
   ├─ 训练数据导出（JSONL）
-  └─ MCP Server + JSON CLI（命令集与 Python 版一致）
-Python 工具层  faster-whisper / LLM 提炼 / ffmpeg 切片 / yt-dlp 兜底
+  └─ MCP Server + JSON CLI（43 工具）
+                │ spawn 子进程
+工具层    Python  fupan/
+  └─ faster-whisper 转写 / ffmpeg 切片 / 邮件 / 平台解析
 ```
 
-## 三、核心需求（用户澄清后）
+**核心设计**：daemon 是主控，Python 是被调度的工具层。
+**边界**：软件不接大模型 API（见宪法第 1 条）。
+
+---
+
+## 三、核心需求
 
 1. 个人自用，非工业级，但底层按可靠设计
-2. 平台：**macOS 优先（现在就能跑）**，兼容 Windows，未来 Linux/云服务器
-3. 直播监控：多平台开播检测 + 自动录制
-4. 复盘流水线：转写/提炼/切片**三个独立开关**（全局+每主播可覆盖）
-5. 通知：开播→邮箱；发视频→邮箱；每主播可覆盖（微信/不通知）；本地兜底
-6. **需求A**：博主已发布视频浏览+选择性下载（标题/封面/日期/时长/是否已下载，单选/批量/全部）
-7. **需求B**：训练数据沉淀（转写+知识点结构化保存，导出 JSONL）
+2. 平台：**macOS 优先**，兼容 Windows，未来 Linux/云服务器
+3. **直播监控**：多平台开播检测 + 自动录制
+4. **短视频监控**：博主发布视频监控 + 选择性下载（标题/封面/日期/时长/已下载标记）
+5. **转写**：本地 whisper，带时间戳，落盘到固定目录
+6. **MCP 控制面**：智能体通过 MCP 控制本软件，并通过 `notes_list` 找到转写文件
+7. **通知**：开播→邮箱；发视频→邮箱；每主播可覆盖；本地兜底
+8. 训练数据沉淀（转写文本结构化保存 + 导出 JSONL）
 
-## 四、阶段与验收（当前进度）
+---
 
-| 阶段 | 内容 | 状态 |
+## 四、已交付能力（实测）
+
+### 4.1 Rust 核心
+
+- 全量测试通过；`cargo clippy -D warnings` 零告警
+- SQLite 持久化、崩溃可恢复、任务失败有上限有退避
+- 单一数据库权威：`<产物根>/database/zunzhe-core.db`
+- 路径全部可配置：`zunzhe-core/src/paths.rs`（唯一事实来源）
+  - 改造前产物写死在项目目录；现在由 `[路径设置] 产物根目录` 决定
+  - `paths` 命令是**纯只读**：只解析配置返回路径，不建目录、不改数据库
+
+### 4.2 平台适配
+
+- B站：官方 WBI 接口 + RSSHub + yt-dlp 三级兜底
+- B站下载：优先 Electron 浏览器内核提直链，失败回退 yt-dlp
+- 抖音 / 快手：Python 链路 `fupan/live_resolve.py`（直播免登录）
+- 投稿监控带失败冷却：连续失败 3 次起冷却 15 分钟、指数增长上限 2 小时
+
+### 4.3 Cookie / 授权链路
+
+- B站 cookie 三级按序使用：用户配置 → 桌面端浏览器授权 → 匿名 buvid 设备 cookie
+- 桌面端「B站授权」导出 `fupan_output/run/bilibili_browser_cookies.txt`
+- **cookie 落点约定**：禁止用 `__dirname` 推导（打包态会写进 app.asar 污染签名）。
+  统一走 `ZUNZHE_RUN_DIR` → `ZUNZHE_PROJECT_ROOT` → `__dirname`（仅开发态）
+
+### 4.4 复盘流水线
+
+| 步 | 动作 | 状态 |
 |---|---|---|
-| 前置 | 仓库克隆、跨平台修复、ffmpeg官方源、测试/CI修复、配置模板、图谱、需求文档 | ✅ 已完成 |
-| A | macOS 全链路：ffmpeg 装好、doctor 通过、CLI/MCP 可用 | ✅ 已完成 |
-| B | 历史视频浏览+选择性下载（封面/已下载标记/批量/全部） | ✅ 已完成 |
-| C | 训练数据导出 JSONL | ✅ 已完成 |
-| D | 通知简化（邮箱默认+覆盖+兜底） | ✅ 已完成 |
-| E | Rust 骨架 zunzhe-core（cargo/schema/CLI 对齐/Platform trait/BilibiliAdapter） | ✅ 已完成 |
-| G | QQ 邮箱通知链路：配置助手/状态诊断/老项目迁移/桌面端一键填入 | ✅ 已完成（授权码需用户提供） |
-| F | 交付：git 提交、文档图谱更新、三平台 CI、汇报 | 🔄 部分完成（代码与文档已交付；三平台 CI 被 GitHub 账户计费拦截，24×30 长跑未满） |
+| 1/4 | 转写（本地 whisper） | ✅ **正常工作，已产出 201 个 `.转写.txt`** |
+| 2/4 | 知识提炼（外部大模型 API） | ⚠️ **设计偏差，见宪法第 3 条** |
+| 3/4 | 精华切片 | 卡在第2步之后 |
+| 4/4 | 邮件通知 | 卡在第2步之后 |
 
-### Rust 三平台 CI
-- `.github/workflows/rust-core.yml` 会在 push/PR 时对 `zunzhe-core` 在
-  macOS / Windows / Ubuntu 三平台跑 `cargo fmt --check`、`clippy -D warnings`、
-  `cargo test --all-targets`、release 构建与 CLI 契约冒烟，作为“三平台可编译运行”
-  的自动化证据。
-- 当前真实状态：GitHub Actions 账户计费未恢复，三平台 CI 全部 `not started`；
-  本机 macOS 全量回归已绿（210 passed + 1 ignored + 7 集成契约）；Windows/Linux
-  已用 Zig 0.16 完成交叉链接（`check-cross-zig.sh`），Linux 另有 Docker 真实
-  构建与 `run-daemon --once` 实跑验证。
+实测：58 分钟 B站视频在纯 CPU + `small` 模型下约 26 分钟完成转写，
+生成 98,097 字节 `.转写.txt` + 179,736 字节 `.转写.json`（1551 分段，时长 3517.24 秒）。
 
-### Rust 重构（zunzhe-core）已交付能力
+### 4.5 MCP 控制面
 
-- M0-M17 全部完成并通过 `cargo test --all-targets`（210 passed + 1 ignored + 7
-  集成契约测试）+ `cargo clippy --all-targets -D warnings` + `cargo fmt --check`
-- M13 组装收尾：macOS 守护脚本、launchd 模板、使用说明、图谱更新
-- CLI/MCP 命令与 Python 版对齐；SQLite 持久化、崩溃可恢复、任务失败只记日志不拖垮 daemon
-- CLI/MCP 已对齐 `delete-live / set-notify / ensure-services / tail-logs /
-  get-app-prefs / set-app-prefs / wizard-done`，直播列表同时兼容
-  `画质,URL,备注` 与 `URL,备注,画质` 两种旧格式
-- 桌面端 Electron 已改为调用 Rust 核心二进制（优先 release、缺省 debug），
-  `status` 同时返回 `rust_daemon` 与兼容的 `services` 字段，服务按钮/守护
-  只看 Rust daemon，不再启动 Python 双跑
-- 桌面端历史视频封面经受限制的 `local-file://` 协议读取项目内缓存；渲染
-  进程不再直连 `file://` 本地路径，路径穿越/越权读取一律拒绝
-- 视频监控支持监控列表/偏好/服务管理，首次监控只记录基线，之后只对新视频通知/下载
-- 下载成功后自动入队复盘（独立后台 worker，转写/提炼/切片），录制结束同样自动复盘；
-  复盘队列按 kind 独立认领/恢复，失败 3 次落定 failed，不再无限循环
-- 平台适配器：B站官方 WBI 接口 + RSSHub + yt-dlp 三级兜底；B站下载优先 Electron
-  浏览器内核提取直链，失败再回退 yt-dlp；抖音/快手走 RSSHub 或 yt-dlp
-- 供应链：ffmpeg 已从蓝奏云改为官方源（Windows=BtbN GitHub + SHA-256、
-  macOS=Homebrew/evermeet.cx 官方静态构建 + 大小校验、Linux=系统包管理器）；
-  视频/直播内容下载只走平台官方地址，不经过第三方网盘中转
-- 原子写临时文件名加入纳秒时间戳，崩溃残留不再阻塞后续写入；桌面端通知
-  队列对原子替换窗口可容错，seen 文件原子写，邮箱状态只报真实缺失项；
-  `setup-macos.sh` 自动安装 launchd 守护 + 60 秒健康看门狗
-- B站投稿监控带失败冷却：连续失败 3 次起冷却 15 分钟、指数增长上限 2 小时，
-  成功即清零；yt-dlp 同一 Cookie 组失败后等待 5 秒再重试，减少 412 风控
-- B站 Cookie 链路：用户配置 Cookie、桌面端浏览器授权 Cookie、匿名 buvid 设备
-  Cookie 自动按序使用，间歇 412 会重试并切换；桌面端「B站授权」导出的
-  `fupan_output/run/bilibili_browser_cookies.txt` 已接入下载、投稿列表、Electron
-  直链提取与直播检测
-- 已知待补：邮箱授权码需用户提供；未配置任何 B站 Cookie 时，平台风控（352/412）
-  仍可能要求先完成桌面端「B站授权」或在 `config/fupan_config.ini` 的
-  `[视频监控] b站cookie` 填入浏览器 Cookie
-- Rust daemon 统一接管直播+视频监控；`start` 不再并行启动 Python 视频监控，
-  `stop` 不自动拉起 Python 兜底（避免双跑与“停不掉”）
-- 验证环境遗留的 Python `video_monitor` 进程已清理；桌面端若再次出现“双跑”，
-  先查 `desktop/electron/main.cjs` 的 `ensure-services` 调用是否命中旧 Python CLI
-- 24×30 长跑：daemon 由 launchd KeepAlive 托管，健康审计每分钟落盘
-  `logs/zunzhe-core.audit.log`；当前 `pid=25141` 持续心跳，但 30 天累计
-  验收尚未完成。最终验收以“同一 pid 连续心跳 + RSS 稳定 + 日志无断档 +
-  三平台 CI 全绿”为准。
-- 数据库单一权威：CLI/daemon/MCP 统一使用 `项目根/zunzhe-core.db`；历史
-  `zunzhe-core/zunzhe-core.db` 已合并归档，不得再作为第二套状态打开。
+- 43 个工具，源码契约 `zunzhe-core/tests/control_plane_contract.rs` 断言
+- 控制面清单：`.神经总账/控制面.json`
+- 实测 `notes_list` 返回 216 场次、201 个转写文件绝对路径
 
-## 五、关键约定
+### 4.6 服务与看门狗
+
+- launchd `com.zunzhe.monitor`（`KeepAlive`）+ `com.zunzhe.healthcheck`（每分钟）
+- 重启职责只归一条链路：launchd `KeepAlive` + `scripts/check-rust-daemon.sh`
+  - Electron `serviceWatchdog` **不得自己再调 `ensure-services`**
+    （历史上三套互踩，一天 57 次重启）
+- `service.rs::ensure_core()` 会调 `ensure_healthcheck_loaded()`（幂等），
+  防止"唯一会自愈的组件自己没人守护"
+
+### 4.7 更新机制
+
+- 更新源 = `<产物根>/releases/`，全离线无服务器
+- 设计铁律：**只换程序，永不碰数据目录**
+- 实现：`desktop/electron/update-run.cjs`；界面侧栏「检查更新」按钮
+- 发版：`bash scripts/publish-release.sh --build`
+- 安装：`bash scripts/install-app-safe.sh`（顺序钉死为 停→锁处理→校验→备份→换→起→验）
+
+### 4.8 安全
+
+- Electron 沙箱 + IPC 白名单 + 预加载隔离
+- 本地文件走受限制的 `local-file://` 协议，渲染进程不直连 `file://`
+- CLI 命令注入：`Command::arg` 列表化传参，无拼 shell
+- 供应链：ffmpeg 从官方源下载 + SHA-256 校验
+
+---
+
+## 五、当前待处理
+
+### 5.1 产品定义偏差（唯一实质性代码问题）
+
+`fupan/pipeline.py:123-126` 把"智能体该干的第2步"设成流水线硬门槛。
+见 `项目宪法.md` 第 3 条。**待用户点头，未批准不许动。**
+
+### 5.2 打包落后于源码
+
+| 层 | 时间 | 内容 |
+|---|---|---|
+| app 内前端 | — | `index-Bajs-e4L.js`（旧） |
+| `dist/` 前端 | 2026-09-21 09:03 | `index-CaocZset.js`（**未打进 app**） |
+| `app.asar` | 2026-09-20 16:07 | 落后 |
+
+⇒ 使用中的 app 不含最新源码。需重新打包安装。
+
+### 5.3 转写覆盖率
+
+216 场次中 201 有转写文件，**15 个缺失**。
+
+---
+
+## 六、关键约定
 
 - 所有改动先在 macOS 实测通过再提交
-- CLI/MCP 命令集冻结，与 Python 版一致
 - 改动即提交（git），保持工作区清晰
-- 图谱重生成：`graphify . --update`（输出 graphify-out/）
-- 训练数据格式：JSONL，一行一条知识点记录（含时间戳/主播/日期/元数据）
+- 图谱重生成：`graphify . --update`（输出 `graphify-out/`）
+- 训练数据格式：JSONL，一行一条（含时间戳/主播/日期/元数据）
+- **文档纪律见宪法第 6 条**：权威文档只有 `项目宪法.md`，历史文档只读
 
-## 六、上下文丢失恢复步骤
+---
 
-1. 读本文件
-2. 读 `需求梳理与Rust重构方案.md`
+## 七、上下文丢失恢复步骤
+
+1. **读 `项目宪法.md`**（产品定义 + 实测事实 + 禁止事项）
+2. 读本文件（进度与已交付能力）
 3. `git status` 看未提交改动
-4. 看 `graphify-out/GRAPH_REPORT.md` 了解代码结构
-5. 从"当前阶段"继续（见上表 🔄 标记）
+4. `pgrep -fl "run-daemon"` 看 daemon
+5. `zunzhe-core/target/release/zunzhe-core doctor` 看环境
+6. 从「当前待处理」继续
+
+**不要读 `历史/` 目录里的文件当依据。**

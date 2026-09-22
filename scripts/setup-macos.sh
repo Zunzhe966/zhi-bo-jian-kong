@@ -43,8 +43,9 @@ export PATH="$HOME/.cargo/bin:$PATH"
 # 第二重兜底，但不会在 launchd 反复失败时误报成功。
 LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
 mkdir -p "$LAUNCH_AGENTS"
-# 启动/健康脚本复制到 LaunchAgents：launchd 直接执行 LaunchAgents 下的脚本，
-# 脚本用 plist WorkingDirectory 解析项目根。
+# 启动/健康脚本复制到 LaunchAgents：launchd 直接执行 LaunchAgents 下的脚本。
+# 不设置 WorkingDirectory，避免 launchd 在启动 /bin/bash 前读取旧路径并产生
+# getcwd/chdir 噪音；启动脚本自行探测项目根并 cd。
 cp scripts/launchd/zunzhe-daemon.sh "$LAUNCH_AGENTS/zunzhe-daemon.sh"
 cp scripts/launchd/zunzhe-healthcheck.sh "$LAUNCH_AGENTS/zunzhe-healthcheck.sh"
 cp scripts/ensure-full-access.sh "$LAUNCH_AGENTS/ensure-full-access.sh"
@@ -52,9 +53,11 @@ chmod +x "$LAUNCH_AGENTS/zunzhe-daemon.sh" "$LAUNCH_AGENTS/zunzhe-healthcheck.sh
 chmod +x "$LAUNCH_AGENTS/ensure-full-access.sh"
 cp scripts/audit-longrun.sh "$LAUNCH_AGENTS/audit-longrun.sh"
 chmod +x "$LAUNCH_AGENTS/audit-longrun.sh"
+# plist 里的日志路径使用项目根/日志目录占位符，安装时渲染成绝对路径；
+# 不把当前用户名/桌面目录硬编码进仓库文件。
 PROJECT_DIR="$(pwd)"
-sed "s|__PROJECT_DIR__|$PROJECT_DIR|g" scripts/launchd/com.zunzhe.monitor.plist > "$LAUNCH_AGENTS/com.zunzhe.monitor.plist"
-cp scripts/launchd/com.zunzhe.healthcheck.plist "$LAUNCH_AGENTS/com.zunzhe.healthcheck.plist"
+bash scripts/render-launchd-plists.sh "$PROJECT_DIR" "$LAUNCH_AGENTS"
+
 case "$(pwd)" in
   "$HOME/Desktop/"*)
     echo "[setup] 当前项目在 $HOME/Desktop：macOS TCC 会阻止 launchd 稳定运行。"

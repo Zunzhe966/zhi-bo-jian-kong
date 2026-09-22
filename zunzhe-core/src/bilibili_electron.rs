@@ -30,12 +30,24 @@ pub async fn run_bilibili_script(
     env: &[(&str, String)],
     timeout: Duration,
 ) -> Result<ElectronResult> {
+    run_electron_script(project_dir, script, env, timeout, "bili-video-list.cjs").await
+}
+
+/// 通用 Electron 脚本执行器：与 `run_bilibili_script` 共用同一套临时文件协议、
+/// 互斥锁和重试逻辑，仅 runner 脚本名不同（如抖音 `douyin-video-list.cjs`）。
+pub async fn run_electron_script(
+    project_dir: &Path,
+    script: &str,
+    env: &[(&str, String)],
+    timeout: Duration,
+    runner_name: &str,
+) -> Result<ElectronResult> {
     // 整个 Electron 生命周期（含重试）持锁，避免并发实例互相干扰。
     let _guard = ELECTRON_LOCK.lock().await;
     // 进程内锁只能挡住同一 daemon 的并发轮次；CLI、桌面端和 daemon 是不同进程，
     // 必须再用跨进程文件锁串行化，否则多个 Chromium 实例会互相挤掉 userData/profile。
     let _cross_process_lock = acquire_cross_process_lock(project_dir, timeout).await?;
-    let run_dir = project_dir.join("fupan_output").join("run");
+    let run_dir = crate::paths::run_dir(project_dir);
     std::fs::create_dir_all(&run_dir)
         .with_context(|| format!("创建运行目录失败: {}", run_dir.display()))?;
     // 旧版本 Electron 脚本失败/中断时会留下 payload/stderr 文件；长年 24×30
@@ -56,10 +68,15 @@ pub async fn run_bilibili_script(
     // 独立 .app 里没有 desktop/node_modules，主窗口会把辅助脚本目录放进
     // env；源码/项目目录模式仍用 desktop/electron。找不到时给出明确路径。
     let runner = packaged_runner_dir()
-        .map(|dir| dir.join("bili-video-list.cjs"))
-        .unwrap_or_else(|| project_dir.join("desktop").join("electron").join("bili-video-list.cjs"));
+        .map(|dir| dir.join(runner_name))
+        .unwrap_or_else(|| {
+            project_dir
+                .join("desktop")
+                .join("electron")
+                .join(runner_name)
+        });
     if !runner.exists() {
-        anyhow::bail!("缺少 B站 Electron 脚本执行器: {}", runner.display());
+        anyhow::bail!("缺少 Electron 脚本执行器: {}", runner.display());
     }
     // 独立 Electron 进程默认使用全新的临时 userData，必须显式注入已授权 Cookie，
     // 否则桌面端“B站授权”只在主窗口会话生效，列表/直链提取仍然匿名 412。
@@ -100,7 +117,12 @@ pub async fn run_bilibili_script(
             cmd.env(key, value);
         }
         cmd.env("FUPAN_SCRIPT_FILE", &payload_path)
-            .env("FUPAN_STATUS_FILE", &status_path);
+            .env("FUPAN_STATUS_FILE", &status_path)
+            // 把真实的运行目录一并交给 Electron 脚本：打包态下脚本的
+            // `__dirname` 落在 app.asar 内，任何相对 `__dirname` 推导出来的
+            // 产物路径都会写进应用包（`Contents/Resources`），既污染签名，
+            // 又让 daemon 读不到（daemon 读的是这里）。脚本一律优先用这个变量。
+            .env("ZUNZHE_RUN_DIR", &run_dir);
         for (key, value) in &cookie_env {
             cmd.env(key, value);
         }
@@ -177,10 +199,7 @@ pub async fn run_bilibili_script(
 
 /// 跨进程独占锁文件，固定放在运行目录，供 daemon/CLI/桌面端共享。
 fn electron_lock_file(project_dir: &Path) -> PathBuf {
-    project_dir
-        .join("fupan_output")
-        .join("run")
-        .join("bilibili_electron.lock")
+    crate::paths::run_dir(project_dir).join("bilibili_electron.lock")
 }
 
 /// 等待获取 B站 Electron 跨进程独占锁。
@@ -344,7 +363,7 @@ fn cleanup_daemon_state_stale_files(run_dir: &Path) {
     }
 }
 
-fn find_electron(project_dir: &Path) -> Option<PathBuf> {
+pub(crate) fn find_electron(project_dir: &Path) -> Option<PathBuf> {
     // 独立 .app 由主窗口把 process.execPath 传给 Rust CLI，直接用应用自身的
     // Electron 二进制执行辅助脚本；源码模式回退到 desktop/node_modules。
     if let Ok(exe) = std::env::var("ZUNZHE_ELECTRON_EXE") {

@@ -13,7 +13,7 @@ import json
 import re
 from pathlib import Path
 
-from .settings import FUPAN_DIR, fupan_config, get, is_yes, ensure_project_on_path
+from .settings import fupan_config, get, is_yes, ensure_project_on_path
 
 ensure_project_on_path()
 from .transcribe import transcribe_file
@@ -28,17 +28,26 @@ _MEDIA_SUFFIXES = ('.mp4', '.ts', '.mkv', '.flv', '.mov', '.webm', '.mp3', '.m4a
 def _find_candidates(media: Path) -> list[Path]:
     """按路径找实际录制文件。分段录制路径是 ffmpeg 模板（如 xxx_%03d.ts），
     实际文件是 xxx_000.ts；转码又会把 ts 换成 mp4，都要兼容。"""
-    import re
     # ffmpeg 分段模板占位符 %03d / %d 换成通配符
     stem_pattern = re.sub(r'%0?\d*d', '*', media.stem)
     glob_pattern = re.sub(r'\*+', '*', f'{stem_pattern}*.*')
-    candidates = []
+    candidates: list[Path] = []
+    # 精确命中优先。注意：media 与 media.with_suffix('.mp4') 在「请求的就是 .mp4」
+    # 时是同一个文件，原实现在这种情况下会把同一个路径加进列表两次，导致下游
+    # 拿到的候选列表出现重复项。这里用 seen 集合去重。
+    seen: set[Path] = set()
     for path in (media, media.with_suffix('.mp4')):
-        if '%' not in path.name and path.exists():
-            candidates.append(path)
+        if '%' in path.name or not path.exists():
+            continue
+        if path in seen:
+            continue
+        seen.add(path)
+        candidates.append(path)
     if not candidates and media.parent.exists():
-        candidates = [p for p in media.parent.glob(glob_pattern)
-                      if p.suffix.lower() in _MEDIA_SUFFIXES]
+        candidates = sorted(
+            p for p in media.parent.glob(glob_pattern)
+            if p.suffix.lower() in _MEDIA_SUFFIXES
+        )
     # mp4 优先（ts 转码完成后原文件会被删）
     candidates.sort(key=lambda p: (p.suffix.lower() != '.mp4', p.name))
     return candidates
@@ -48,6 +57,14 @@ def _resolve_media(media_path: str, timeout: int = 900) -> Path:
     """录制的 ts 可能正在被异步转成 mp4（转完删原文件），等文件落定后返回实际路径。"""
     import time
     media = Path(media_path)
+    # 分段录制会产生多个分片，而本流水线只处理单个媒体文件。原实现静默取
+    # candidates[0]，第 2..N 个分片永远不会被转写/提炼，用户看不到任何提示，
+    # 表现为“录了 3 段但复盘只有第 1 段”。这里显式提示，避免静默丢数据。
+    initial = _find_candidates(media)
+    if len(initial) > 1:
+        print(f'[warn] 检测到 {len(initial)} 个候选文件（分段录制？），'
+              f'当前流水线只处理第一个: {initial[0].name}；'
+              f'其余 {len(initial) - 1} 个分片未纳入复盘')
     deadline = time.time() + timeout
     last = (None, -1)
     while time.time() < deadline:
@@ -81,7 +98,10 @@ def run_pipeline(media_path: str, record_name: str = '',
     media = _resolve_media(media_path)
 
     record_name = record_name or media.stem
-    out_dir = FUPAN_DIR / record_name / media.stem
+    # 产品手册第 3 章铁律 R3：文字和视频在同一个文件夹。转写产物直接落在媒体
+    # 所在目录（{主播}/直播/{场次}/ 或 {主播}/短视频/{标题}/），不再单独建
+    # fupan_output/{名字}/{场次}/ 目录——那条树让文字和视频分家，已作废。
+    out_dir = media.parent
     out_dir.mkdir(parents=True, exist_ok=True)
     summary = {'media': str(media), 'output_dir': str(out_dir)}
 
@@ -104,7 +124,11 @@ def run_pipeline(media_path: str, record_name: str = '',
     else:
         summary['distill'] = '跳过'
     if not distilled:
-        summary['status'] = '未配置大模型接口，已保留转写文本，流水线结束'
+        # 本软件不接大模型 API（产品定义）：提炼未启用时转写完成即正常结束。
+        # 开播/新视频通知由 Rust 侧在「发现时」发送，不依赖本流水线。
+        summary['status'] = '转写完成，流水线结束'
+        (out_dir / '流水线结果.json').write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
         print(summary['status'])
         return summary
     summary['points'] = len(distilled['points'])
@@ -146,6 +170,13 @@ def main():
     summary = run_pipeline(args.save_file_path, record_name,
                            transcribe=args.transcribe, distill=args.distill,
                            clips=args.clips)
+    # Rust 核心(download.rs / pipeline_bridge.rs)通过子进程 stdout 的尾部判断
+    # 流水线结果。原实现丢弃了 run_pipeline 的返回值，导致「三个开关全关」这类
+    # 提前返回的分支一个字都不打印，Rust 侧只看到空 output_tail，既无法记录
+    # 原因也无法诊断。这里统一把 summary 打到 stdout（stderr 留给日志/异常）。
+    if isinstance(summary, dict):
+        print(json.dumps({'pipeline_summary': summary}, ensure_ascii=False))
+    return summary
 
 
 if __name__ == '__main__':

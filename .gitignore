@@ -166,7 +166,7 @@ cython_debug/
 
 backup_config/
 
-# ���ļ�Ŀ¼
+# ���ļ�Ŀ¼
 desktop/node_modules/
 ffmpeg/
 fupan_output/
@@ -175,10 +175,18 @@ fupan_output/
 *.mkv
 *.flv
 
-# �������ã��� cookie������ȣ�
+# �������ã��� cookie������ȣ�
 config/config.ini
 config/URL_config.ini
-# ���ʹ���ļ�
+config/fupan_config.ini
+config/���ƫ��.json
+config/��Ƶ����б�.ini
+config/����ƫ��.json
+config/URL_config.ini
+# ���ʱֻʹ�� config-template/���ɾ�ģ�壩����ʵ config/ һ�ɲ����汾��
+config/*
+!config/*.example
+# ���ʹ���ļ�
 desktop/electron-win.zip
 
 # Rust core local database
@@ -188,3 +196,20 @@ zunzhe-core.db-wal
 
 # 旧核心 DB 归档（历史数据，不入库）
 zunzhe-core/zunzhe-core.db.legacy-*
+
+# 本机垃圾 / 构建产物 / 缓存（不入库）
+.DS_Store
+releases/
+desktop/release/
+_app_backup/
+_app_extract/
+_backup_*/
+.trash-*/
+graphify-out/
+.codex/
+.workbuddy/
+..dockerignore.*
+desktop/_probe_*.cjs
+
+# 误提交的 cargo 构建目录
+zunzhe-core/off/

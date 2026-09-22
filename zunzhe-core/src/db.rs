@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
 use sqlx::Row;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteSynchronous};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 
 use crate::model::{Anchor, LiveSession, NotifyEvent, Task, Video};
@@ -58,10 +58,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     url        TEXT NOT NULL DEFAULT '',
     name       TEXT NOT NULL DEFAULT '',
     status     TEXT NOT NULL DEFAULT 'pending',
-    attempts   INTEGER NOT NULL DEFAULT 0,
-    payload    TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    payload       TEXT NOT NULL DEFAULT '',
+    last_error    TEXT NOT NULL DEFAULT '',
+    next_retry_at TEXT NOT NULL DEFAULT '',
+    created_at    TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    updated_at    TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
 
 CREATE TABLE IF NOT EXISTS monitor_baseline (
@@ -95,6 +97,18 @@ CREATE TABLE IF NOT EXISTS live_states (
     consecutive_fails INTEGER NOT NULL DEFAULT 0,
     updated_at        TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
+
+CREATE TABLE IF NOT EXISTS mcp_calls (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    tool              TEXT NOT NULL DEFAULT '',
+    risk              TEXT NOT NULL DEFAULT 'unknown',
+    arguments_summary TEXT NOT NULL DEFAULT '',
+    success           INTEGER NOT NULL DEFAULT 0,
+    error             TEXT NOT NULL DEFAULT '',
+    duration_ms       INTEGER NOT NULL DEFAULT 0,
+    created_at        TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_mcp_calls_created ON mcp_calls(id DESC);
 "#;
 
 pub async fn init_db(pool: &SqlitePool) -> anyhow::Result<()> {
@@ -131,6 +145,33 @@ pub async fn init_db(pool: &SqlitePool) -> anyhow::Result<()> {
             .await
             .context("迁移 notify 重试计数字段")?;
     }
+    // 旧版本 tasks 没有结构化失败字段。只有 tracing 文本时，界面和 MCP 无法
+    // 解释“点过了为什么没结果”，也不能安全地做重试/清理；启动时补齐列。
+    for (column, ddl) in [
+        (
+            "last_error",
+            "ALTER TABLE tasks ADD COLUMN last_error TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "next_retry_at",
+            "ALTER TABLE tasks ADD COLUMN next_retry_at TEXT NOT NULL DEFAULT ''",
+        ),
+    ] {
+        let exists = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name=?",
+        )
+        .bind(column)
+        .fetch_one(pool)
+        .await
+        .with_context(|| format!("检查 tasks.{column} 字段"))?;
+        if exists == 0 {
+            sqlx::query(ddl)
+                .execute(pool)
+                .await
+                .with_context(|| format!("迁移 tasks.{column} 字段"))?;
+        }
+    }
+
     // 旧版本 monitor_baseline 没有失败计数/冷却时间：CREATE TABLE IF NOT EXISTS
     // 不会给已存在的表补列，必须先迁移，否则视频源冷却读写会直接报错。
     let has_source_fails = sqlx::query_scalar::<_, i64>(
@@ -170,7 +211,6 @@ pub fn open_options(path: &Path) -> SqliteConnectOptions {
     SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(true)
-        .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
         .busy_timeout(std::time::Duration::from_secs(15))
         .foreign_keys(true)
@@ -192,8 +232,26 @@ pub async fn open_pool(path: &Path) -> anyhow::Result<SqlitePool> {
         .connect_with(open_options(path))
         .await
         .context("连接 SQLite 数据库")?;
+    ensure_wal_mode(&pool).await?;
     init_db(&pool).await?;
     Ok(pool)
+}
+
+/// 让已有库保持 WAL，但避免每个物理连接都重复执行会争抢排他锁的
+/// `PRAGMA journal_mode = WAL`。journal_mode 是数据库持久属性：首次打开时
+/// 检查一次即可，之后的连接会直接继承 WAL。
+async fn ensure_wal_mode(pool: &SqlitePool) -> anyhow::Result<()> {
+    let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+        .fetch_one(pool)
+        .await
+        .context("读取 SQLite journal mode")?;
+    if !mode.eq_ignore_ascii_case("wal") {
+        sqlx::query("PRAGMA journal_mode = WAL")
+            .execute(pool)
+            .await
+            .context("启用 SQLite WAL")?;
+    }
+    Ok(())
 }
 
 /// 独立 CLI/MCP/看门狗入口的数据库维护节流。
@@ -203,7 +261,7 @@ pub async fn open_pool(path: &Path) -> anyhow::Result<SqlitePool> {
 /// 每次调用时检查 `fupan_output/run/zunzhe-core.maintenance` 的修改时间，
 /// 超过 6 小时才执行一次，避免每个 CLI 进程都重复跑 checkpoint/清理。
 pub async fn maintenance_if_due(project_dir: &Path, pool: &SqlitePool) -> anyhow::Result<bool> {
-    let run_dir = project_dir.join("fupan_output").join("run");
+    let run_dir = crate::paths::run_dir(project_dir);
     let marker = run_dir.join("zunzhe-core.maintenance");
     if maintenance_marker_age(&marker).is_some_and(|age| age < MAINTENANCE_INTERVAL) {
         return Ok(false);
@@ -332,40 +390,73 @@ pub async fn maintenance(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await
     .context("清理直播录制历史表")?;
+    // MCP 调用审计表：每次工具调用落一行，MCP 被高频使用时同样会无上限增长。
+    // 这里与 notify/tasks 一样限额清理（保留最近 500 条，比工作队列多留一些
+    // 以便回溯）；mcp_calls 是纯审计、没有「未完成」状态，删旧行是安全的。
+    sqlx::query(
+        "DELETE FROM mcp_calls WHERE id NOT IN
+         (SELECT id FROM mcp_calls ORDER BY id DESC LIMIT 500)",
+    )
+    .execute(pool)
+    .await
+    .context("清理 MCP 调用审计表")?;
     Ok(())
 }
 
-/// 把任务表里指向旧桌面项目根的历史路径改写到当前项目根。
+/// 把任务表里指向旧桌面项目根的历史路径改写到当前产物路径。
 ///
 /// 项目从 `~/Desktop/尊者监控直播短视频` 迁到 `~/Projects/尊者监控直播短视频`
 /// 后，旧的 `process` 任务 URL 仍指向桌面副本；文件其实已经随项目一起移动，
 /// 继续引用旧根会让“已复盘/已下载”记录与实际位置漂移，手动重试也会打开
 /// 不存在或过期的路径。只改前缀，不删任务、不改状态。
+///
+/// `downloads/` 与 `fupan_output/` 这两段前缀必须按**当前配置**重定位，而不是
+/// 一律拼到项目根：产物根被改到别的目录（`[路径设置] 产物根目录`）之后，
+/// 历史任务里的 `.../downloads/x.mp4` 应该落到新的下载目录，否则改写出来的
+/// 路径是一个不存在的旧位置，比不改还糟。
 pub async fn rewrite_legacy_task_paths(
     pool: &SqlitePool,
     project_dir: &Path,
 ) -> anyhow::Result<usize> {
-    let canonical = project_dir
-        .canonicalize()
-        .unwrap_or_else(|_| project_dir.to_path_buf());
+    let dirs = crate::paths::storage(project_dir);
     let home = std::env::var("HOME").unwrap_or_default();
-    let legacy_root = std::path::Path::new(&home).join("Desktop/尊者监控直播短视频");
-    let Some(legacy_prefix) = legacy_root.to_str().map(String::from) else {
-        return Ok(0);
-    };
-    let rows = sqlx::query("SELECT id, url FROM tasks WHERE url LIKE ?")
-        .bind(format!("{legacy_prefix}%"))
-        .fetch_all(pool)
-        .await
-        .context("读取旧路径任务")?;
+    let legacy_prefixes = [
+        std::path::Path::new(&home).join("Desktop/尊者监控直播短视频"),
+        std::path::Path::new(&home).join("Projects/尊者监控直播短视频"),
+    ];
+    let mut rows = Vec::new();
+    for legacy_root in &legacy_prefixes {
+        let Some(prefix) = legacy_root.to_str() else {
+            continue;
+        };
+        rows.extend(
+            sqlx::query("SELECT id, url FROM tasks WHERE url LIKE ?")
+                .bind(format!("{prefix}%"))
+                .fetch_all(pool)
+                .await
+                .context("读取旧路径任务")?,
+        );
+    }
     let mut changed = 0usize;
     for row in rows {
         let id: i64 = row.try_get("id")?;
         let url: String = row.try_get("url")?;
-        let Some(rest) = url.strip_prefix(&legacy_prefix) else {
+        let Some(rest) = legacy_prefixes
+            .iter()
+            .find_map(|prefix| url.strip_prefix(prefix.to_str()?))
+        else {
             continue;
         };
-        let new_url = canonical.join(rest.trim_start_matches('/'));
+        let rest = rest.trim_start_matches('/');
+        // 目标目录可能尚不存在（自定义产物根、下载目录还没建），所以用宽松规范化：
+        // 直接 canonicalize 会失败并退回原样，写出未解析的 `/var` 而非 `/private/var`。
+        let new_url = if let Some(tail) = rest.strip_prefix("downloads/") {
+            crate::paths::canonical_lenient(&dirs.downloads).join(tail)
+        } else if let Some(tail) = rest.strip_prefix("fupan_output/") {
+            crate::paths::canonical_lenient(&dirs.fupan).join(tail)
+        } else {
+            crate::paths::canonical_lenient(&dirs.project_dir).join(rest)
+        };
         let new_url = new_url.to_string_lossy().to_string();
         if new_url == url {
             continue;
@@ -456,16 +547,8 @@ mod maintenance_tests {
 
     #[tokio::test]
     async fn rewrite_legacy_task_paths_points_to_current_project() {
-        let project = std::env::temp_dir().join(format!(
-            "zunzhe-rewrite-path-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&project);
-        std::fs::create_dir_all(project.join("fupan_output").join("run")).unwrap();
+        let project = crate::test_support::isolated_project("rewrite-path");
+        std::fs::create_dir_all(crate::paths::run_dir(&project)).unwrap();
         let db = project.join("zunzhe-test.db");
         let pool = open_pool(&db).await.unwrap();
 
@@ -482,13 +565,43 @@ mod maintenance_tests {
         let tasks = crate::db::list_tasks(&pool, "pending", 10).await.unwrap();
         assert_eq!(tasks.len(), 1);
         let url = &tasks[0].url;
-        let canonical = project.canonicalize().unwrap();
-        assert!(
-            url.starts_with(canonical.to_str().unwrap())
-                && url.ends_with("downloads/短视频/主播/视频.mp4"),
-            "任务路径应改写为当前项目根: {url}"
+        let expected = crate::paths::canonical_lenient(&crate::paths::storage(&project).downloads)
+            .join("短视频")
+            .join("主播")
+            .join("视频.mp4");
+        assert_eq!(
+            Path::new(url),
+            expected,
+            "任务路径应改写为配置的下载目录: {url}"
         );
         assert!(!url.contains("Desktop/尊者监控直播短视频"));
+        std::mem::forget(db);
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[tokio::test]
+    async fn rewrite_legacy_task_paths_covers_projects_symlink_root() {
+        let project = crate::test_support::isolated_project("rewrite-projects-path");
+        std::fs::create_dir_all(crate::paths::run_dir(&project)).unwrap();
+        let db = project.join("zunzhe-test.db");
+        let pool = open_pool(&db).await.unwrap();
+
+        let home = std::env::var("HOME").unwrap();
+        let legacy = format!("{home}/Projects/尊者监控直播短视频/downloads/短视频/主播/视频.mp4");
+        crate::db::enqueue_task(&pool, "process", &legacy, "主播")
+            .await
+            .unwrap();
+
+        let changed = crate::db::rewrite_legacy_task_paths(&pool, &project)
+            .await
+            .unwrap();
+        assert_eq!(changed, 1, "Projects 软链根的旧任务路径也必须迁移");
+        let tasks = crate::db::list_tasks(&pool, "pending", 10).await.unwrap();
+        let expected = crate::paths::canonical_lenient(&crate::paths::storage(&project).downloads)
+            .join("短视频")
+            .join("主播")
+            .join("视频.mp4");
+        assert_eq!(Path::new(&tasks[0].url), expected);
         std::mem::forget(db);
         let _ = std::fs::remove_dir_all(&project);
     }
@@ -751,16 +864,11 @@ mod maintenance_tests {
 #[cfg(test)]
 mod opportunistic_maintenance_tests {
     use super::*;
-    use std::time::SystemTime;
 
     #[test]
     fn maintenance_marker_timestamp_recovers_after_restart() {
         let project = temp_project("marker-ts");
-        let marker = project
-            .0
-            .join("fupan_output")
-            .join("run")
-            .join("zunzhe-core.maintenance");
+        let marker = crate::paths::run_dir(&project.0).join("zunzhe-core.maintenance");
         // 哨兵缺省时返回 None：daemon 启动会立即执行一次维护，而不是把计时
         // 重置成“现在”后继续推迟 6 小时。
         assert_eq!(maintenance_marker_timestamp(&marker), None);
@@ -779,7 +887,7 @@ mod opportunistic_maintenance_tests {
     #[test]
     fn touch_maintenance_marker_persists_for_next_restart() {
         let project = temp_project("marker-touch");
-        let run_dir = project.0.join("fupan_output").join("run");
+        let run_dir = crate::paths::run_dir(&project.0);
         touch_maintenance_marker(&run_dir).unwrap();
         let marker = run_dir.join("zunzhe-core.maintenance");
         assert!(marker.exists(), "维护哨兵应落盘");
@@ -798,16 +906,8 @@ mod opportunistic_maintenance_tests {
     }
 
     fn temp_project(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
-        let project = std::env::temp_dir().join(format!(
-            "zunzhe-maint-{name}-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&project);
-        std::fs::create_dir_all(project.join("fupan_output").join("run")).unwrap();
+        let project = crate::test_support::isolated_project(name);
+        std::fs::create_dir_all(crate::paths::run_dir(&project)).unwrap();
         let db = project.join("zunzhe-test.db");
         (project, db)
     }
@@ -824,10 +924,7 @@ mod opportunistic_maintenance_tests {
         assert!(ran, "哨兵已到期时应执行维护");
         let tasks = list_tasks(&pool, "pending", 10).await.unwrap();
         assert_eq!(tasks.len(), 1, "维护不应删除 pending 任务");
-        let marker = project
-            .join("fupan_output")
-            .join("run")
-            .join("zunzhe-core.maintenance");
+        let marker = crate::paths::run_dir(&project).join("zunzhe-core.maintenance");
         assert!(
             marker.exists(),
             "维护成功后应刷新哨兵，避免每个 CLI 进程都重复 checkpoint"
@@ -852,7 +949,7 @@ mod opportunistic_maintenance_tests {
     #[tokio::test]
     async fn maintenance_if_due_cleans_run_dir_residue() {
         let (project, db) = temp_project("residue");
-        let run_dir = project.join("fupan_output").join("run");
+        let run_dir = crate::paths::run_dir(&project);
         // 模拟旧版本 Electron 中断残留 + 原子写硬崩溃残留。
         let old_payload = run_dir.join("bili_script_payload_stale.js");
         std::fs::write(&old_payload, "old").unwrap();
@@ -1477,6 +1574,38 @@ pub async fn mark_downloaded_by_url(
     Ok(result.rows_affected())
 }
 
+/// 跨平台去重查询：同主播、规范化标题相同（忽略半角/全角空格）、
+/// 但来自其他 URL 的**已下载**视频。命中说明同一内容已在别的平台下载过，
+/// 调用方（下载 worker）应跳过本次下载，避免同一视频多平台各存一份。
+/// 返回 (平台, 标题)。
+pub async fn find_cross_platform_duplicate(
+    pool: &SqlitePool,
+    anchor: &str,
+    title: &str,
+    url: &str,
+) -> anyhow::Result<Option<(String, String)>> {
+    let norm_title = normalize_title(title);
+    let row: Option<(String, String)> = sqlx::query_as(
+        r#"SELECT COALESCE(NULLIF(platform,''),'未知'), title
+           FROM videos
+           WHERE anchor = ? AND downloaded = 1 AND url != ?
+             AND REPLACE(REPLACE(title,' ',''),'　','') = ?
+           LIMIT 1"#,
+    )
+    .bind(anchor)
+    .bind(url)
+    .bind(&norm_title)
+    .fetch_optional(pool)
+    .await
+    .context("跨平台重复查询失败")?;
+    Ok(row)
+}
+
+/// 标题规范化：去除半角/全角空格后比较，吸收多平台发布时的空格差异。
+fn normalize_title(title: &str) -> String {
+    title.replace([' ', '　'], "")
+}
+
 /// 下载成功但视频库还没有该记录时，先补一行最小记录（不覆盖已有字段）。
 pub async fn ensure_video_row(
     pool: &SqlitePool,
@@ -1682,12 +1811,24 @@ pub async fn claim_pending_task_by_kind(
     // 必须同时限定 kind：下载 worker 只自愈自己的任务，不能把另一个 worker
     // 正在处理的 process 任务标 failed，也不能在运行中把 processing 恢复。
     if kind.is_empty() {
-        sqlx::query("UPDATE tasks SET status='failed', updated_at=datetime('now','localtime') WHERE status='pending' AND attempts >= 3")
+        sqlx::query(
+            "UPDATE tasks
+             SET status='failed',
+                 last_error=CASE WHEN trim(last_error) = '' THEN '任务重试次数已超过上限，自动结束' ELSE last_error END,
+                 updated_at=datetime('now','localtime')
+             WHERE status='pending' AND attempts >= 3",
+        )
             .execute(pool)
             .await
             .context("落定超出重试上限的任务")?;
     } else {
-        sqlx::query("UPDATE tasks SET status='failed', updated_at=datetime('now','localtime') WHERE status='pending' AND kind=? AND attempts >= 3")
+        sqlx::query(
+            "UPDATE tasks
+             SET status='failed',
+                 last_error=CASE WHEN trim(last_error) = '' THEN '任务重试次数已超过上限，自动结束' ELSE last_error END,
+                 updated_at=datetime('now','localtime')
+             WHERE status='pending' AND kind=? AND attempts >= 3",
+        )
             .bind(kind)
             .execute(pool)
             .await
@@ -1700,7 +1841,7 @@ pub async fn claim_pending_task_by_kind(
     // 第 3 次 15 分钟；attempts>=3 在进入本函数时已落定 failed，因此实际只会
     // 遇到 1/2 分钟档。新任务（attempts=0）不等待，坏时间戳按“已到期”处理。
     let mut sql = String::from(
-        "SELECT id, kind, url, name, status, attempts, payload, created_at, updated_at
+        "SELECT id, kind, url, name, status, attempts, payload, last_error, next_retry_at, created_at, updated_at
          FROM tasks
          WHERE status = 'pending'",
     );
@@ -1760,6 +1901,8 @@ pub async fn claim_pending_task_by_kind(
             // 认领时 DB 里已经 `attempts+1`，这里返回最新值，调用方据此决定是否落定 failed。
             attempts: attempts + 1,
             payload: row.try_get("payload")?,
+            last_error: row.try_get("last_error")?,
+            next_retry_at: row.try_get("next_retry_at")?,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
         }));
@@ -1803,7 +1946,10 @@ pub async fn fail_stale_processing_by_kind(
     attempts_limit: i64,
 ) -> anyhow::Result<u64> {
     let result = sqlx::query(
-        "UPDATE tasks SET status='failed', updated_at=datetime('now','localtime')
+        "UPDATE tasks
+         SET status='failed',
+             last_error=CASE WHEN trim(last_error) = '' THEN '任务处理中断且重试次数已超过上限，自动结束' ELSE last_error END,
+             updated_at=datetime('now','localtime')
          WHERE status='processing' AND kind=? AND attempts >= ?",
     )
     .bind(kind)
@@ -1816,7 +1962,7 @@ pub async fn fail_stale_processing_by_kind(
 
 pub async fn list_tasks(pool: &SqlitePool, status: &str, limit: i64) -> anyhow::Result<Vec<Task>> {
     let mut sql = String::from(
-        "SELECT id, kind, url, name, status, attempts, payload, created_at, updated_at FROM tasks WHERE 1=1",
+        "SELECT id, kind, url, name, status, attempts, payload, last_error, next_retry_at, created_at, updated_at FROM tasks WHERE 1=1",
     );
     if !status.is_empty() {
         sql.push_str(" AND status = ?");
@@ -1838,11 +1984,79 @@ pub async fn list_tasks(pool: &SqlitePool, status: &str, limit: i64) -> anyhow::
             status: row.try_get("status")?,
             attempts: row.try_get("attempts")?,
             payload: row.try_get("payload")?,
+            last_error: row.try_get("last_error")?,
+            next_retry_at: row.try_get("next_retry_at")?,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
         });
     }
     Ok(out)
+}
+
+/// 按任务类型读取最近的任务，供状态快照/界面显示队列进度。
+///
+/// 与 `list_tasks` 分开：调度器需要按状态和插入顺序工作；桌面端只关心某类任务
+/// 最近发生了什么，必须按 id 倒序拿到最新记录，不能把全表拉到调用方再过滤。
+pub async fn list_tasks_by_kind(
+    pool: &SqlitePool,
+    kind: &str,
+    limit: i64,
+) -> anyhow::Result<Vec<Task>> {
+    let rows = sqlx::query(
+        "SELECT id, kind, url, name, status, attempts, payload, last_error, next_retry_at, created_at, updated_at
+         FROM tasks WHERE kind=? ORDER BY id DESC LIMIT ?",
+    )
+    .bind(kind)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .context("查询指定类型 tasks")?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(Task {
+            id: row.try_get("id")?,
+            kind: row.try_get("kind")?,
+            url: row.try_get("url")?,
+            name: row.try_get("name")?,
+            status: row.try_get("status")?,
+            attempts: row.try_get("attempts")?,
+            payload: row.try_get("payload")?,
+            last_error: row.try_get("last_error")?,
+            next_retry_at: row.try_get("next_retry_at")?,
+            created_at: row.try_get("created_at")?,
+            updated_at: row.try_get("updated_at")?,
+        });
+    }
+    Ok(out)
+}
+
+/// 记录一次任务失败，并保留可展示、可诊断的原因。
+///
+/// `status` 由调用方给 `pending`（还会自动重试）或 `failed`（重试已耗尽）。
+/// `next_retry_at` 只对 pending 有意义；终态失败必须清空，避免界面显示一条
+/// 永远不会再执行的任务仍在等待。
+pub async fn record_task_failure(
+    pool: &SqlitePool,
+    id: i64,
+    error: &str,
+    status: &str,
+) -> anyhow::Result<()> {
+    let retry_expr = if status == "pending" {
+        "datetime('now','localtime','+1 minute')"
+    } else {
+        "''"
+    };
+    let sql = format!(
+        "UPDATE tasks SET status=?, last_error=?, next_retry_at={retry_expr}, updated_at=datetime('now','localtime') WHERE id=?"
+    );
+    sqlx::query(&sql)
+        .bind(status)
+        .bind(error.chars().take(4000).collect::<String>())
+        .bind(id)
+        .execute(pool)
+        .await
+        .context("记录任务失败原因")?;
+    Ok(())
 }
 
 pub async fn update_task_status(pool: &SqlitePool, id: i64, status: &str) -> anyhow::Result<()> {
@@ -1854,6 +2068,23 @@ pub async fn update_task_status(pool: &SqlitePool, id: i64, status: &str) -> any
         .execute(pool)
         .await
         .context("更新任务状态")?;
+    Ok(())
+}
+
+/// 完成一个已经产出真实结果的任务，同时保留一段“非失败说明”。
+///
+/// 典型场景：转写文件已经落盘，但用户尚未配置 LLM 接口，Python 流水线以
+/// “未配置大模型接口”提前结束。整条任务不能因此继续重试并覆盖真实状态；
+/// 这里统一标 done、清空 next_retry_at，并把说明留在 last_error 供界面显示。
+pub async fn complete_task_with_note(pool: &SqlitePool, id: i64, note: &str) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE tasks SET status='done', last_error=?, next_retry_at='', updated_at=datetime('now','localtime') WHERE id=?",
+    )
+    .bind(note.chars().take(4000).collect::<String>())
+    .bind(id)
+    .execute(pool)
+    .await
+    .context("完成带说明的任务")?;
     Ok(())
 }
 
@@ -2182,6 +2413,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn open_options_does_not_reapply_wal_on_every_connection() {
+        let seq = TEST_DB_SEQ.fetch_add(1, Ordering::Relaxed);
+        let file = std::env::temp_dir().join(format!(
+            "zunzhe-wal-reinit-{}-{}.db",
+            std::process::id(),
+            seq
+        ));
+        let _ = std::fs::remove_file(&file);
+
+        // 第一次打开负责把库切到 WAL；此后 journal_mode 是数据库的持久属性。
+        let first = open_pool(&file).await.unwrap();
+        first.close().await;
+
+        // 第二次打开必须只继承持久 WAL，而不是再次发出 `PRAGMA journal_mode=WAL`。
+        // 生产日志里 6~11 秒的慢查询正是这条连接初始化语句。
+        // sqlx 的 Debug 会列出所有 pragma key，但值为 `None` 的条目只是
+        // “未启用”，不代表连接时会执行。这里必须只检查实际有值的 pragma，
+        // 否则会把 `journal_mode: None` 误判成重复切 WAL。
+        let options_debug = format!("{:?}", open_options(&file)).to_ascii_lowercase();
+        let journal_mode_value = options_debug
+            .split("journal_mode\":")
+            .nth(1)
+            .and_then(|tail| tail.split(',').next())
+            .unwrap_or_default()
+            .trim();
+        assert!(
+            journal_mode_value == "none" || journal_mode_value.is_empty(),
+            "已存在的库不应在每个连接重复设置 journal_mode: {journal_mode_value}"
+        );
+        assert!(options_debug.contains("busy_timeout"));
+        assert!(options_debug.contains("foreign_keys"));
+
+        // 但库本身仍必须保持持久 WAL，后续连接无需再切换。
+        let reopened = open_pool(&file).await.unwrap();
+        let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&reopened)
+            .await
+            .unwrap();
+        assert_eq!(mode.to_ascii_lowercase(), "wal");
+        reopened.close().await;
+
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
     async fn pool_survives_concurrent_read_write_stress() {
         let pool = test_pool().await;
         // 36 个并发任务同时读/写同一张表，模拟 daemon tick、直播状态、下载
@@ -2240,6 +2516,70 @@ mod tests {
         mark_notify_done(&pool, nid).await.unwrap();
         assert_eq!(list_notify(&pool, "pending", 10).await.unwrap().len(), 0);
         assert_eq!(list_notify(&pool, "sent", 10).await.unwrap()[0].attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn completed_task_can_keep_a_note_without_waiting_for_retry() {
+        let pool = test_pool().await;
+        let id = enqueue_task(&pool, "process", "/tmp/有转写.mp4", "测试")
+            .await
+            .unwrap();
+        record_task_failure(&pool, id, "旧的临时失败", "pending")
+            .await
+            .unwrap();
+        complete_task_with_note(&pool, id, "未配置大模型接口，已保留转写文本，流水线结束")
+            .await
+            .unwrap();
+        let task = list_tasks(&pool, "done", 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|task| task.id == id)
+            .expect("转写成功但未提炼的任务应进入 done");
+        assert!(task.last_error.contains("已保留转写文本"), "{task:?}");
+        assert!(
+            task.next_retry_at.is_empty(),
+            "done 任务不应等待重试: {task:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_task_records_structured_error_and_retry_time() {
+        let pool = test_pool().await;
+        let id = enqueue_task(&pool, "process", "/tmp/失败.mp4", "测试")
+            .await
+            .unwrap();
+        record_task_failure(&pool, id, "联网下载模型超时: ConnectTimeout", "pending")
+            .await
+            .unwrap();
+        let task = list_tasks(&pool, "pending", 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|task| task.id == id)
+            .expect("失败后仍应保留可重试任务");
+        assert!(
+            task.last_error.contains("ConnectTimeout"),
+            "应保存可读错误: {task:?}"
+        );
+        assert!(
+            !task.next_retry_at.is_empty(),
+            "失败后应写入下次重试时间: {task:?}"
+        );
+        record_task_failure(&pool, id, "最终失败", "failed")
+            .await
+            .unwrap();
+        let task = list_tasks(&pool, "failed", 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|task| task.id == id)
+            .expect("终态失败任务应可查询");
+        assert_eq!(task.last_error, "最终失败");
+        assert!(
+            task.next_retry_at.is_empty(),
+            "终态失败不应继续等待重试: {task:?}"
+        );
     }
 
     #[tokio::test]
@@ -2424,9 +2764,14 @@ mod tests {
             .unwrap();
         assert!(claimed.is_none(), "超上限任务不应再被认领");
         let rows = list_tasks(&pool, "failed", 10).await.unwrap();
+        let task = rows.iter().find(|t| t.id == id);
         assert!(
-            rows.iter().any(|t| t.id == id),
+            task.is_some(),
             "超上限的 pending 任务应自愈为 failed: {rows:?}"
+        );
+        assert!(
+            task.is_some_and(|t| !t.last_error.trim().is_empty()),
+            "自愈失败的任务必须保留非空失败原因，不能在界面显示空白: {rows:?}"
         );
     }
 
@@ -2494,9 +2839,14 @@ mod tests {
             .unwrap();
         assert_eq!(healed, 1);
         let failed = list_tasks(&pool, "failed", 10).await.unwrap();
+        let task = failed.iter().find(|t| t.id == dl_id);
         assert!(
-            failed.iter().any(|t| t.id == dl_id),
+            task.is_some(),
             "超限 download processing 应落定 failed: {failed:?}"
+        );
+        assert!(
+            task.is_some_and(|t| !t.last_error.trim().is_empty()),
+            "processing 自愈失败的任务也必须保留非空失败原因: {failed:?}"
         );
         assert!(
             !failed.iter().any(|t| t.id == process_id),

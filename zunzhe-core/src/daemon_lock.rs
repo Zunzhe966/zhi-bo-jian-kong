@@ -58,10 +58,7 @@ impl Drop for DaemonLock {
 }
 
 pub fn lock_file(project_dir: &Path) -> PathBuf {
-    project_dir
-        .join("fupan_output")
-        .join("run")
-        .join("zunzhe-core.lock")
+    crate::paths::run_dir(project_dir).join("zunzhe-core.lock")
 }
 
 /// 尝试立即加独占锁；已有持有者返回 `Ok(false)`，IO 错误返回 `Err`。

@@ -9,6 +9,7 @@ Copyright (c) 2023-2025 by Hmily, All Rights Reserved.
 Function: Record live stream video.
 """
 import asyncio
+import io
 import os
 import sys
 import builtins
@@ -26,6 +27,7 @@ import urllib.request
 from urllib.error import URLError, HTTPError
 from typing import Any
 import configparser
+import shlex
 import httpx
 from src import spider, stream
 from src.proxy import ProxyDetector
@@ -71,7 +73,30 @@ url_config_file = f'{script_path}/config/URL_config.ini'
 backup_dir = f'{script_path}/backup_config'
 text_encoding = 'utf-8-sig'
 rstr = r"[\/\\\:\*\？?\"\<\>\|&#.。,， ~！· ]"
-default_path = f'{script_path}/downloads'
+def _resolve_default_record_path() -> str:
+    """录像默认落点：跟随 config.ini `[路径设置] 产物根目录`，留空则维持旧行为。
+
+    以前写死成 `{script_path}/downloads`，用户把产物根改到别处后这里仍会往老位置
+    写盘，与 daemon 记录的路径对不上。解析规则与 Rust 侧 zunzhe-core/src/paths.rs
+    保持一致：`~` 展开、相对路径以项目根为基准。
+    """
+    try:
+        parser = configparser.RawConfigParser()
+        if os.path.exists(config_file):
+            parser.read(config_file, encoding=text_encoding)
+        root = (parser.get('路径设置', '产物根目录', fallback='') or '').strip()
+        if root:
+            expanded = os.path.expanduser(root)
+            if not os.path.isabs(expanded):
+                expanded = os.path.join(script_path, expanded)
+            return os.path.join(expanded, 'downloads')
+    except Exception:
+        # 配置读不动不该让录制器起不来：退回旧的默认位置。
+        pass
+    return f'{script_path}/downloads'
+
+
+default_path = _resolve_default_record_path()
 os.makedirs(default_path, exist_ok=True)
 file_update_lock = threading.Lock()
 os_type = os.name
@@ -367,24 +392,96 @@ def push_message(record_name: str, live_url: str, content: str) -> None:
                 color_obj.print_colored(f"直播消息推送到{platform}失败: {e}", color_obj.RED)
 
 
+# 自定义脚本（复盘流水线等）的执行上限。脚本内部有转写/提炼/切片，正常几分钟，
+# 但没有上限时一旦卡住（网络挂起、模型服务无响应）录制线程就永远回不来。
+SCRIPT_TIMEOUT_SECONDS = 1800
+
+
+def _terminate_process_tree(process: subprocess.Popen) -> None:
+    """先给整组 SIGTERM，短暂等待后仍在则 SIGKILL。
+
+    配合 `start_new_session=True`，这里按进程组收：`shell=True` 起的是 sh，
+    真正的脚本是它的子进程，只 `terminate()` 父进程会留下孤儿。
+    """
+    if process.poll() is not None:
+        return
+    try:
+        if os.name == 'nt':
+            process.terminate()
+        else:
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            process.terminate()
+        except OSError:
+            return
+    try:
+        process.wait(timeout=10)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        if os.name == 'nt':
+            process.kill()
+        else:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            process.kill()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        logger.error('自定义脚本进程无法终止，可能残留，请手动检查 ps')
+
+
 def run_script(command: str) -> None:
+    """执行用户配置的自定义脚本（如复盘流水线）。
+
+    旧实现有三处会让失败完全静默：
+      1. `communicate()` 没有超时 —— 脚本卡住就永久挂起录制线程；
+      2. 从不检查 returncode —— 脚本压根没起来（exit 127）也被当成成功，
+         于是「复盘不产出」查不到任何线索；
+      3. 没有独立进程组 —— 主进程被 kill -9 后脚本变孤儿继续跑。
+    """
     try:
         process = subprocess.Popen(
-            command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, startupinfo=get_startup_info(os_type)
+            command,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            startupinfo=get_startup_info(os_type),
+            start_new_session=(os.name != 'nt'),
         )
-        stdout, stderr = process.communicate()
-        stdout_decoded = stdout.decode('utf-8')
-        stderr_decoded = stderr.decode('utf-8')
-        if stdout_decoded.strip():
-            print(stdout_decoded)
-        if stderr_decoded.strip():
-            print(stderr_decoded)
     except PermissionError as e:
         logger.error(e)
         logger.error('脚本无执行权限!, 若是Linux环境, 请先执行:chmod +x your_script.sh 授予脚本可执行权限')
+        return
     except OSError as e:
         logger.error(e)
         logger.error('Please add `#!/bin/bash` at the beginning of your bash script file.')
+        return
+
+    try:
+        stdout, stderr = process.communicate(timeout=SCRIPT_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        _terminate_process_tree(process)
+        logger.error(f'自定义脚本执行超时（{SCRIPT_TIMEOUT_SECONDS} 秒），已终止: {command}')
+        return
+
+    stdout_decoded = stdout.decode('utf-8', errors='replace')
+    stderr_decoded = stderr.decode('utf-8', errors='replace')
+    if stdout_decoded.strip():
+        print(stdout_decoded)
+    if stderr_decoded.strip():
+        print(stderr_decoded)
+    if process.returncode != 0:
+        logger.error(f'自定义脚本执行失败（退出码 {process.returncode}）: {command}')
+        if stderr_decoded.strip():
+            logger.error(f'脚本错误输出：\n{stderr_decoded.strip()}')
+        elif not stdout_decoded.strip():
+            logger.error('脚本没有任何输出，常见原因：解释器/路径不存在（退出码 127）')
 
 
 def clear_record_info(record_name: str, record_url: str) -> None:
@@ -399,7 +496,13 @@ def clear_record_info(record_name: str, record_url: str) -> None:
 def direct_download_stream(source_url: str, save_path: str, record_name: str, live_url: str, platform: str) -> bool:
     try:
         with open(save_path, 'wb') as f:
-            client = httpx.Client(timeout=None)
+            # 不能再用 timeout=None（永不超时）：直播流中途静默断流时，
+            # iter_bytes 会一直等下去，录制线程永久挂起、既不出片也不报错。
+            # 这里只给「连接/读/写/取连接」分段超时，不给总时长上限——
+            # 正常播放中数据持续到达，read 超时不会误伤几小时的长直播；
+            # 只有真断流（60 秒一个字节都没有）才会抛错退出。
+            client = httpx.Client(timeout=httpx.Timeout(
+                connect=15.0, read=60.0, write=30.0, pool=15.0))
 
             headers = {}
             header_params = get_record_headers(platform, live_url)
@@ -435,7 +538,13 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
                      script_command: str | None = None) -> bool:
     save_file_path = ffmpeg_command[-1]
     process = subprocess.Popen(
-        ffmpeg_command, stdin=subprocess.PIPE, stderr=subprocess.STDOUT, startupinfo=get_startup_info(os_type)
+        ffmpeg_command,
+        stdin=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        startupinfo=get_startup_info(os_type),
+        # 独立进程组：daemon 被 kill -9（或被 launchd 强杀）时 ffmpeg 会随组一起
+        # 收走。否则孤儿 ffmpeg 会继续往同一个文件写，既不停止也无人回收。
+        start_new_session=(os.name != 'nt'),
     )
 
     subs_file_path = save_file_path.rsplit('.', maxsplit=1)[0]
@@ -451,18 +560,20 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
         if not script_command:
             return
         logger.debug("开始执行脚本命令!")
+        # 安全加固：record_name / save_file_path 可能来自平台返回的主播名/直播标题
+        # （外部不可信数据），拼入 shell 命令前必须用 shlex.quote 转义，防止命令注入。
         if "python" in script_command:
             params = [
-                f'--record_name "{record_name}"',
-                f'--save_file_path "{save_file_path}"',
+                f'--record_name {shlex.quote(record_name)}',
+                f'--save_file_path {shlex.quote(save_file_path)}',
                 f'--save_type {save_type}',
                 f'--split_video_by_time {split_video_by_time}',
                 f'--converts_to_mp4 {converts_to_mp4}',
             ]
         else:
             params = [
-                f'"{record_name.split(" ", maxsplit=1)[-1]}"',
-                f'"{save_file_path}"',
+                shlex.quote(record_name.split(" ", maxsplit=1)[-1]),
+                shlex.quote(save_file_path),
                 save_type,
                 f'split_video_by_time:{split_video_by_time}',
                 f'converts_to_mp4:{converts_to_mp4}'
@@ -1734,10 +1845,12 @@ def check_ffmpeg_existence() -> bool:
         logger.error(e)
     except FileNotFoundError:
         pass
-    finally:
-        if check_ffmpeg():
-            time.sleep(1)
-            return True
+    except (IndexError, OSError) as e:
+        # ffmpeg 有输出但行数不足 / 无法执行时不要静默吞掉，交给下面的兜底安装逻辑。
+        logger.debug(f'ffmpeg 版本探测异常，改用兜底检查: {e}')
+    if check_ffmpeg():
+        time.sleep(1)
+        return True
     return False
 
 
@@ -1777,8 +1890,10 @@ def read_config_value(config_parser: configparser.RawConfigParser, section: str,
         return config_parser.get(section, option)
     except (configparser.NoSectionError, configparser.NoOptionError):
         config_parser.set(section, option, str(default_value))
-        with open(config_file, 'w', encoding=text_encoding) as f:
-            config_parser.write(f)
+        # 原子写：旧实现直接 open('w') 覆盖，写一半被杀就整份配置截断。
+        _buf = io.StringIO()
+        config_parser.write(_buf)
+        utils.atomic_write_text(config_file, _buf.getvalue(), encoding=text_encoding)
         return default_value
 
 
@@ -1815,8 +1930,8 @@ while True:
 
     try:
         if not os.path.isfile(config_file):
-            with open(config_file, 'w', encoding=text_encoding) as file:
-                pass
+            # 原子写（等价于创建一个空文件，但不会在并发场景下把已有内容截断）。
+            utils.atomic_write_text(config_file, '', encoding=text_encoding)
 
         ini_URL_content = ''
         if os.path.isfile(url_config_file):
@@ -1825,8 +1940,8 @@ while True:
 
         if not ini_URL_content.strip():
             input_url = input('请输入要录制的主播直播间网址（尽量使用PC网页端的直播间地址）:\n')
-            with open(url_config_file, 'w', encoding=text_encoding) as file:
-                file.write(input_url)
+            # 监控列表是唯一权威文件，绝不能覆盖写到一半。
+            utils.atomic_write_text(url_config_file, input_url, encoding=text_encoding)
     except OSError as err:
         logger.error(f"发生 I/O 错误: {err}")
 

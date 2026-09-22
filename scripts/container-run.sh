@@ -7,7 +7,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-mkdir -p "$ROOT/logs" "$ROOT/fupan_output/run" "$ROOT/downloads"
+mkdir -p "$ROOT/products/logs" "$ROOT/products/fupan_output/run" "$ROOT/products/downloads"
 
 export PATH="$PATH:/usr/local/bin"
 export RUST_LOG="${RUST_LOG:-info}"

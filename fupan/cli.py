@@ -36,12 +36,14 @@ from pathlib import Path
 from .config_api import config_schema, get_config, set_config, set_config_bulk
 from .app_prefs import get_prefs, set_prefs, mark_wizard_done
 from .monitor_prefs import attach_to_items, delete_prefs, set_notify, get_notify, NOTIFY_OPTIONS
-from .settings import CONFIG_DIR, FUPAN_DIR, PROJECT_DIR, ensure_project_on_path, venv_python
+from .settings import (CONFIG_DIR, DOWNLOADS_DIR, FUPAN_DIR, PROJECT_DIR, RECORDINGS_DIR,
+                       RUN_DIR as PATHS_RUN_DIR, ensure_project_on_path, storage_paths,
+                       venv_python)
 from .video_library import DB_PATH, init_db, get_videos, cache_cover, mark_downloaded
 
 ensure_project_on_path()
 
-RUN_DIR = FUPAN_DIR / 'run'
+RUN_DIR = PATHS_RUN_DIR
 LOG_DIR = FUPAN_DIR / 'logs'
 URL_CONFIG = CONFIG_DIR / 'URL_config.ini'
 WATCHLIST = CONFIG_DIR / '视频监控列表.ini'
@@ -450,18 +452,28 @@ def stop() -> dict:
 # ---------- 状态与产物 ----------
 
 def status() -> dict:
-    downloads = PROJECT_DIR / 'downloads'
+    # 录像落点可配置（[录制设置] 直播保存路径 / [路径设置] 产物根目录）。
+    # 以前写死 PROJECT_DIR/'downloads'，用户把产物搬到别处后这里会扫到一个空目录，
+    # 界面就显示「没有录制」。
+    downloads = RECORDINGS_DIR
     recent_recordings = []
     if downloads.exists():
         files = sorted(downloads.rglob('*.*'), key=lambda p: p.stat().st_mtime, reverse=True)
         now = time.time()
         for f in files[:10]:
+            # 录像可能落在项目目录之外（自定义产物根 / 外置盘），这时
+            # relative_to 会抛 ValueError 把整个 status 命令带崩，必须兜住。
+            try:
+                shown = str(f.relative_to(PROJECT_DIR))
+            except ValueError:
+                shown = str(f)
             recent_recordings.append({
-                'file': str(f.relative_to(PROJECT_DIR)),
+                'file': shown,
                 'size_mb': round(f.stat().st_size / 1048576, 1),
                 'minutes_ago': int((now - f.stat().st_mtime) / 60),
                 'probably_recording': now - f.stat().st_mtime < 120,
             })
+    resolved = storage_paths()
     return {
         'services': {s: ({'running': True, 'pid': pid} if (pid := _service_pid(s))
                          else {'running': False}) for s in _SERVICES},
@@ -469,8 +481,19 @@ def status() -> dict:
         'video_watchlist': list_video(),
         'recent_recordings': recent_recordings,
         'notes': notes(),
-        'paths': {'recordings': str(downloads), 'fupan_output': str(FUPAN_DIR),
-                  'logs': str(LOG_DIR)},
+        # 键保持旧名不变（界面在用），另补 media_root/customized 等新字段，
+        # 让「文件到底存哪」在界面上一目了然。
+        'paths': {
+            'recordings': str(downloads),
+            'fupan_output': str(FUPAN_DIR),
+            'logs': str(LOG_DIR),
+            'downloads': str(DOWNLOADS_DIR),
+            'media_root': str(resolved['media_root']),
+            'covers': str(resolved['covers']),
+            'run': str(resolved['run']),
+            'database': str(resolved['database']),
+            'customized': str(resolved['media_root']) != str(PROJECT_DIR),
+        },
     }
 
 

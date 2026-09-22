@@ -7,8 +7,64 @@ set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+CONFIG_FILE="$ROOT/config/config.ini"
+[ -f "$CONFIG_FILE" ] || CONFIG_FILE="$ROOT/config/config.ini.example"
+MEDIA_ROOT=""
+LOG_DIR=""
+if [ -f "$CONFIG_FILE" ]; then
+  MEDIA_ROOT="$(awk -F= '
+    /^[[:space:]]*\[/ { section=$0; gsub(/^[[:space:]]*\[|[[:space:]]*\].*$/, "", section) }
+    section == "路径设置" && $1 ~ /^[[:space:]]*产物根目录[[:space:]]*$/ {
+      sub(/^[^=]*=/, ""); gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print; exit
+    }
+  ' "$CONFIG_FILE")"
+  LOG_DIR="$(awk -F= '
+    /^[[:space:]]*\[/ { section=$0; gsub(/^[[:space:]]*\[|[[:space:]]*\].*$/, "", section) }
+    section == "路径设置" && $1 ~ /^[[:space:]]*日志目录[[:space:]]*$/ {
+      sub(/^[^=]*=/, ""); gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print; exit
+    }
+  ' "$CONFIG_FILE")"
+  FUPAN_DIR="$(awk -F= '
+    /^[[:space:]]*\[/ { section=$0; gsub(/^[[:space:]]*\[|[[:space:]]*\].*$/, "", section) }
+    section == "路径设置" && $1 ~ /^[[:space:]]*复盘输出目录[[:space:]]*$/ {
+      sub(/^[^=]*=/, ""); gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print; exit
+    }
+  ' "$CONFIG_FILE")"
+fi
+if [ -z "$MEDIA_ROOT" ]; then
+  MEDIA_ROOT="$HOME/Documents/尊者产物"
+else
+  case "$MEDIA_ROOT" in
+    \~) MEDIA_ROOT="$HOME" ;;
+    \~/*) MEDIA_ROOT="$HOME/${MEDIA_ROOT#\~/}" ;;
+    /*) ;;
+    *) MEDIA_ROOT="$ROOT/$MEDIA_ROOT" ;;
+  esac
+fi
+if [ -z "$LOG_DIR" ]; then
+  LOG_DIR="$MEDIA_ROOT/logs"
+else
+  case "$LOG_DIR" in
+    \~) LOG_DIR="$HOME" ;;
+    \~/*) LOG_DIR="$HOME/${LOG_DIR#\~/}" ;;
+    /*) ;;
+    *) LOG_DIR="$ROOT/$LOG_DIR" ;;
+  esac
+fi
+if [ -z "$FUPAN_DIR" ]; then
+  FUPAN_DIR="$MEDIA_ROOT/fupan_output"
+else
+  case "$FUPAN_DIR" in
+    \~) FUPAN_DIR="$HOME" ;;
+    \~/*) FUPAN_DIR="$HOME/${FUPAN_DIR#\~/}" ;;
+    /*) ;;
+    *) FUPAN_DIR="$ROOT/$FUPAN_DIR" ;;
+  esac
+fi
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+
 if [ -x "$ROOT/scripts/ensure-full-access.sh" ]; then
-  "$ROOT/scripts/ensure-full-access.sh" >> "$ROOT/logs/zunzhe-core.watchdog.log" 2>/dev/null || true
+  "$ROOT/scripts/ensure-full-access.sh" >> "$LOG_DIR/zunzhe-core.watchdog.log" 2>/dev/null || true
 fi
 
 RUST_BIN="$ROOT/zunzhe-core/target/release/zunzhe-core"
@@ -16,10 +72,9 @@ if [ ! -x "$RUST_BIN" ]; then
   RUST_BIN="$ROOT/zunzhe-core/target/debug/zunzhe-core"
 fi
 
-LOG="$ROOT/logs/zunzhe-core.watchdog.log"
-mkdir -p "$(dirname "$LOG")"
+LOG="$LOG_DIR/zunzhe-core.watchdog.log"
 
-AUDIT_LOG="$ROOT/logs/zunzhe-core.audit.log"
+AUDIT_LOG="$LOG_DIR/zunzhe-core.audit.log"
 
 # 桌面端 watchdog 每分钟追加一行；按大小轮转并保留最近 5 份，避免
 # 24×30 期间只靠桌面端运行时日志无限增长。
@@ -33,14 +88,15 @@ rotate_if_large() {
     size=0
   fi
   if [ "$size" -ge "$max_bytes" ]; then
-    for i in 5 4 3 2 1; do
+    # 保留最近 5 份（.1~.5）：先丢弃最老的 .5，再整体后移一位，
+    # 最后把当前文件挪成 .1。旧实现 `for i in 5 4 3 2 1` 会把 .5 挪成 .6
+    # （多留一份且永不复用），且末尾还有一段重复移动 .1 的死代码。
+    rm -f "$file.5" 2>/dev/null || true
+    for i in 4 3 2 1; do
       if [ -f "$file.$i" ]; then
         mv -f "$file.$i" "$file.$((i+1))" 2>/dev/null || true
       fi
     done
-    if [ -f "$file.1" ]; then
-      mv -f "$file.1" "$file.2" 2>/dev/null || true
-    fi
     mv -f "$file" "$file.1" 2>/dev/null || true
   fi
 }
@@ -48,7 +104,10 @@ rotate_if_large "$LOG"
 rotate_if_large "$AUDIT_LOG"
 
 now="$(date '+%Y-%m-%d %H:%M:%S %z')"
-pid="$(cat "$ROOT/fupan_output/run/zunzhe-core.pid" 2>/dev/null || true)"
+# 运行态目录跟随「复盘输出目录/run」，与 Rust paths::run_dir 同口径。
+# 旧写法硬编码 $ROOT/fupan_output/run；产物迁到外置盘后这里会永远读不到 pid，
+# 看门狗日志就会长期显示 pid=none，误导排查。
+pid="$(cat "$FUPAN_DIR/run/zunzhe-core.pid" 2>/dev/null || true)"
 
 status="$("$RUST_BIN" doctor 2>/dev/null || true)"
 if printf '%s' "$status" | grep -q '"rust_daemon":true'; then

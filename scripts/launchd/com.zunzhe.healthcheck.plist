@@ -16,9 +16,11 @@
   <true/>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>PATH</key>
-    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
-  </dict>
+      <key>PATH</key>
+      <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+      <key>ZUNZHE_PROJECT_ROOT</key>
+      <string>__PROJECT_DIR__</string>
+    </dict>
   <key>StandardOutPath</key>
   <string>__LOG_DIR__/zunzhe-healthcheck.log</string>
   <key>StandardErrorPath</key>

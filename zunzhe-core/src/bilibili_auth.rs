@@ -5,10 +5,7 @@ use anyhow::Context;
 
 /// 桌面端「B站授权」导出的浏览器 Cookie 固定相对路径。
 pub fn browser_cookie_path(project_dir: &Path) -> PathBuf {
-    project_dir
-        .join("fupan_output")
-        .join("run")
-        .join("bilibili_browser_cookies.txt")
+    crate::paths::run_dir(project_dir).join("bilibili_browser_cookies.txt")
 }
 
 /// 用户粘贴在 `[视频监控] b站cookie` 里的 Cookie 生成的 Netscape 文件路径。
@@ -16,10 +13,7 @@ pub fn browser_cookie_path(project_dir: &Path) -> PathBuf {
 /// 与旧 Python `fupan/video_monitor.py::_bilibili_user_cookies_file()` 保持同一路径，
 /// 让桌面端/CLI 和旧 Python 在混用期间共享同一份缓存，避免两边生成不同文件。
 pub fn user_cookie_path(project_dir: &Path) -> PathBuf {
-    project_dir
-        .join("fupan_output")
-        .join("run")
-        .join("bilibili_user_cookies.txt")
+    crate::paths::run_dir(project_dir).join("bilibili_user_cookies.txt")
 }
 
 /// 把 Netscape 格式的 Cookie 文件转成 `name=value; ...` 请求头字符串。
@@ -54,10 +48,7 @@ pub fn read_browser_cookie_file(project_dir: &Path) -> anyhow::Result<Option<Str
 /// 这个文件不是账号登录态，仅用于给 yt-dlp 一个匿名设备标识，
 /// 降低无 Cookie 请求触发 412 的概率。
 pub fn anon_cookie_path(project_dir: &Path) -> PathBuf {
-    project_dir
-        .join("fupan_output")
-        .join("run")
-        .join("bilibili_anon_cookies.txt")
+    crate::paths::run_dir(project_dir).join("bilibili_anon_cookies.txt")
 }
 
 /// 可注入 Electron 会话的 B站 Cookie 文件，按优先级排序：浏览器授权 > 用户配置。
@@ -81,9 +72,20 @@ pub fn electron_cookie_files(project_dir: &Path) -> Vec<PathBuf> {
 /// 从 B站 finger/spi 返回的数据生成 Netscape Cookie 文本。
 ///
 /// `b_3`/`b_4` 是公开接口返回的匿名设备 ID，不包含账号凭据。
+///
+/// 24× 实测：只带 `buvid3` 请求 `space/wbi/arc/search` 会返回
+/// `-352 风控校验失败`；补齐 `buvid3 + buvid4 + b_lsid` 后风控校验通过，
+/// 错误收敛为 `-403 访问权限不足`（即仅差登录态）。因此这里一并写入
+/// `b_lsid`（本地生成的设备会话标识，非账号凭据），让匿名请求尽可能
+/// 通过风控层，错误提示才能准确区分“风控”与“需登录”。
 pub fn build_anon_cookie_netscape(b_3: &str, b_4: &str, expire: i64) -> String {
+    let b_lsid = generate_b_lsid();
     let mut lines = vec!["# Netscape HTTP Cookie File".to_string()];
-    for (key, value) in [("buvid3", b_3), ("buvid4", b_4)] {
+    for (key, value) in [
+        ("buvid3", b_3),
+        ("buvid4", b_4),
+        ("b_lsid", b_lsid.as_str()),
+    ] {
         if value.is_empty() {
             continue;
         }
@@ -93,6 +95,38 @@ pub fn build_anon_cookie_netscape(b_3: &str, b_4: &str, expire: i64) -> String {
     }
     lines.push(String::new());
     lines.join("\n")
+}
+
+/// 生成 B站 `b_lsid` 形态的匿名设备会话标识。
+///
+/// 官方形态为「16 位十六进制大写 + 下划线 + 13 位毫秒时间戳」，不含账号信息。
+/// 单一来源的随机/时间戳，无需引入额外随机数依赖。
+fn generate_b_lsid() -> String {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    // 用时间戳叠加进程号/纳秒做哈希，得到稳定的十六进制片段。
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    let mut state =
+        now_ms ^ (nanos << 17) ^ (std::process::id() as u64).wrapping_mul(0x9E3779B97F4A7C15);
+    let mut hex = String::with_capacity(16);
+    for _ in 0..16 {
+        // xorshift64*，避免依赖外部 rand。
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let nibble = (state >> 60) & 0xF;
+        hex.push(
+            char::from_digit(nibble as u32, 16)
+                .unwrap_or('0')
+                .to_ascii_uppercase(),
+        );
+    }
+    format!("{hex}_{now_ms}")
 }
 
 /// 把浏览器 `name=value; name2=value2` Cookie 字符串转成 Netscape 文本。
@@ -149,7 +183,7 @@ pub async fn ensure_anon_cookie(project_dir: &Path) -> Option<PathBuf> {
         return Some(path);
     }
 
-    let client = reqwest::Client::builder()
+    let client = crate::net::client_builder()
         .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)")
         .timeout(std::time::Duration::from_secs(15))
         .build()
@@ -238,7 +272,34 @@ mod tests {
         assert!(text.starts_with("# Netscape HTTP Cookie File"));
         assert!(text.contains(".bilibili.com\tTRUE\t/\tFALSE\t12345\tbuvid3\tb3-token"));
         assert!(text.contains(".bilibili.com\tTRUE\t/\tFALSE\t12345\tbuvid4\tb4-token"));
+        // 实测：补齐 b_lsid 才能通过风控校验（-352 → -403），因此匿名 cookie
+        // 必须同时带上 b_lsid，且它不含任何账号凭据。
+        assert!(
+            text.contains("\tb_lsid\t"),
+            "匿名 cookie 必须含 b_lsid：{text}"
+        );
         assert!(!text.contains("SESSDATA="));
+    }
+
+    #[test]
+    fn generated_b_lsid_has_official_shape_and_no_credentials() {
+        let lsid = generate_b_lsid();
+        // 官方形态：16 位十六进制大写 + 下划线 + 时间戳。
+        let (hex, ts) = lsid.split_once('_').expect("b_lsid 应含下划线分隔");
+        assert_eq!(hex.len(), 16, "十六进制段应为 16 位：{lsid}");
+        assert!(
+            hex.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase()),
+            "应为大写十六进制：{lsid}"
+        );
+        assert!(
+            ts.chars().all(|c| c.is_ascii_digit()),
+            "时间戳段应为数字：{lsid}"
+        );
+        // 两次生成应不同（含时间/随机成分），且都不含登录凭据字面量。
+        let other = generate_b_lsid();
+        assert!(!lsid.contains("SESSDATA"));
+        assert!(!other.contains("SESSDATA"));
     }
 
     #[test]
@@ -259,15 +320,8 @@ mod tests {
 
     #[test]
     fn electron_cookie_files_only_include_existing_files() {
-        let dir = std::env::temp_dir().join(format!(
-            "zunzhe-electron-cookies-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(dir.join("fupan_output").join("run")).unwrap();
+        let dir = crate::test_support::isolated_project("electron-cookies");
+        std::fs::create_dir_all(crate::paths::run_dir(&dir)).unwrap();
         assert!(electron_cookie_files(&dir).is_empty());
 
         let browser = browser_cookie_path(&dir);

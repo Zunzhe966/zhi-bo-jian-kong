@@ -1,5 +1,49 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
+
+/// Create a self-contained project root whose configured product paths stay
+/// inside that root. Tests must not inherit `~/Documents/尊者产物` or touch the
+/// real source tree just because a fixture happens to create `fupan_output/`.
+pub fn isolated_project(name: &str) -> PathBuf {
+    let project = std::env::temp_dir().join(format!(
+        "zunzhe-test-{name}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&project);
+    std::fs::create_dir_all(project.join("config")).unwrap();
+    let media_root = project.join("products");
+    std::fs::write(
+        project.join("config").join("config.ini"),
+        format!(
+            "[路径设置]\n产物根目录 = {}\n数据库文件 = {}\n",
+            media_root.display(),
+            project.join("zunzhe-core.db").display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("config").join("fupan_config.ini"),
+        "[视频监控]\n",
+    )
+    .unwrap();
+    project
+}
+
+/// 写一个最小、可被 ffmpeg/PyAV 打开的有效 WAV 夹具。
+///
+/// 复盘入队会真实校验媒体可解码，测试不能用 `b"fixture"` 冒充 .mp4；
+/// 这个 0 采样 WAV 让文件/任务/API 契约测试仍聚焦各自目标。
+pub fn write_valid_wav(path: &Path) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    const WAV: &[u8] = b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x40\x1f\x00\x00\x80\x3e\x00\x00\x02\x00\x10\x00data\x00\x00\x00\x00";
+    std::fs::write(path, WAV).unwrap();
+}
 
 /// 把文件修改时间设置为若干天前。仅用于测试模拟“超龄残留”。
 pub fn set_mtime_days_ago(path: &Path, days: u64) {

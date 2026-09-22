@@ -47,7 +47,7 @@ pub struct BilibiliLiveAdapter {
 impl Default for BilibiliLiveAdapter {
     fn default() -> Self {
         Self {
-            client: reqwest::Client::builder()
+            client: crate::net::client_builder()
                 .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
                 .timeout(Duration::from_secs(20))
                 .build()
@@ -247,7 +247,7 @@ pub struct DirectLiveAdapter {
 impl Default for DirectLiveAdapter {
     fn default() -> Self {
         Self {
-            client: reqwest::Client::builder()
+            client: crate::net::client_builder()
                 .timeout(Duration::from_secs(15))
                 .build()
                 .unwrap_or_default(),
@@ -516,7 +516,7 @@ impl<'a> LiveMonitor<'a> {
                 && session.pid as u32 != std::process::id()
                 && process_alive(session.pid as u32)
             {
-                terminate_process(session.pid as u32);
+                terminate_process(session.pid as u32).await;
                 recovered += 1;
                 info!(
                     "[{}] 回收重启前残留录制进程 pid={}",
@@ -634,7 +634,7 @@ impl<'a> LiveMonitor<'a> {
                 // ffmpeg 已启动但 DB 写入失败：不能让一个无法被状态机追踪的
                 // 录制进程变成孤儿。先终止进程组并清理 pid 文件，再返回错误。
                 if pid > 0 {
-                    terminate_process(pid);
+                    terminate_process(pid).await;
                     let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
                 }
                 remove_rust_live_pid(self.project_dir, &item.url);
@@ -719,7 +719,7 @@ impl<'a> LiveMonitor<'a> {
             if session.pid > 0 && process_alive(session.pid as u32) {
                 // 先发优雅退出信号并给 ffmpeg 一点时间落盘收尾；若仍在运行再强杀。
                 // 直接 SIGKILL 会截断正在写入的 ts/flv，长期运行下更容易留下损坏录像。
-                terminate_process(session.pid as u32);
+                terminate_process(session.pid as u32).await;
                 let pid = session.pid as u32;
                 for _ in 0..5 {
                     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -740,43 +740,33 @@ impl<'a> LiveMonitor<'a> {
         crate::service::find_binary(self.project_dir, "ffmpeg", "ffmpeg.exe")
     }
 
-    fn output_path(&self, item: &LiveItem, status: &LiveStatus, anchor: &str) -> Result<PathBuf> {
-        let save_path = self.config.get_main("录制设置", "直播保存路径(不填则默认)");
-        // 旧 Python 的 `default_path = {项目根}/downloads`，主播目录默认拼在
-        // `downloads/B站直播/主播` 下；这里不再在用户自定义路径后追加 download 目录，
-        // 避免默认配置产生 `downloads/downloads/...` 双重目录。
-        let root = if save_path.trim().is_empty() {
-            self.project_dir.join("downloads")
+    /// 录制输出路径：`{直播保存路径|产物根}/{主播}/直播/{日期} {场次}/{场次}.{ext}`。
+    ///
+    /// 新布局（产品手册第 3 章）：产物根下一级永远是主播名，不再按平台分目录；
+    /// 转写产物随后落在同一目录（pipeline 的 out_dir = 录像所在目录），满足
+    /// 「文字和视频在同一个文件夹」。旧 Python 的「保存文件夹是否以作者/时间/标题
+    /// 区分」「保存文件名是否包含标题」四个开关随之作废——目录形态由手册固定，
+    /// 不再可配。
+    fn output_path(&self, _item: &LiveItem, status: &LiveStatus, anchor: &str) -> Result<PathBuf> {
+        let root = crate::paths::storage(self.project_dir).recordings();
+        let now = chrono::Local::now();
+        let date = now.format("%Y-%m-%d").to_string();
+        // 主播名/标题可能带 `/`、`:` 等文件系统非法字符，必须清洗后再拼路径。
+        // 场次名取直播标题，标题为空时退到主播名。
+        let title = status.title.trim();
+        let base_session = if title.is_empty() {
+            clean_name(anchor)
         } else {
-            PathBuf::from(save_path.trim())
+            clean_name(title)
         };
-        let platform_dir = platform_dir_name(&item.url);
-        let mut dir = root.join(platform_dir);
-        let folder_by_time = self
-            .config
-            .is_yes("录制设置", "保存文件夹是否以时间区分", false);
-        let folder_by_title = self
-            .config
-            .is_yes("录制设置", "保存文件夹是否以标题区分", false);
-        let now_date = chrono::Local::now().format("%Y-%m-%d").to_string();
-        let folder_by_author = self
-            .config
-            .is_yes("录制设置", "保存文件夹是否以作者区分", true);
-        if folder_by_author {
-            dir = dir.join(clean_name(anchor));
-        }
-        // 与旧 Python 目录规则一致：按日期、按标题建子目录时，标题目录名
-        // 也必须清洗，避免 `/`、`:` 等字符在 Windows 上创建目录失败。
-        let clean_title = clean_name(&status.title);
-        if folder_by_time {
-            dir = dir.join(&now_date);
-        }
-        if folder_by_title && !status.title.is_empty() {
-            if folder_by_time {
-                dir = dir.join(format!("{clean_title}_{}", clean_name(anchor)));
-            } else {
-                dir = dir.join(format!("{now_date}_{clean_title}"));
-            }
+        let anchor_dir = root.join(clean_name(anchor)).join("直播");
+        // 同一天同标题复播（或前一场失败留了空目录）时给场次名加时刻后缀，
+        // 保证场次目录互不覆盖——ffmpeg -y 会写穿已存在的同名文件。
+        let mut session = base_session.clone();
+        let mut dir = anchor_dir.join(format!("{date} {session}"));
+        if dir.exists() {
+            session = format!("{base_session} {}", now.format("%H-%M-%S"));
+            dir = anchor_dir.join(format!("{date} {session}"));
         }
         let save_type = self
             .config
@@ -789,19 +779,7 @@ impl<'a> LiveMonitor<'a> {
             "m4a" | "m4a音频" => "m4a",
             _ => "ts",
         };
-        let now = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
-        let filename_by_title = self
-            .config
-            .is_yes("录制设置", "保存文件名是否包含标题", false);
-        // 主播名/标题可能带 `/`、`\`、`:` 等文件系统非法字符，必须清洗后再拼
-        // 文件名，避免 Windows 上创建文件失败或路径被意外解析成子目录。
-        let clean_anchor = clean_name(anchor);
-        let title_part = if filename_by_title && !status.title.is_empty() {
-            format!("{clean_title}_")
-        } else {
-            String::new()
-        };
-        Ok(dir.join(format!("{clean_anchor}_{title_part}{now}.{ext}")))
+        Ok(dir.join(format!("{session}.{ext}")))
     }
 
     /// 录制前检查项目所在磁盘剩余空间是否低于阈值（GB）。
@@ -812,7 +790,7 @@ impl<'a> LiveMonitor<'a> {
         if free_mb == 0 || (free_mb as f64) < threshold_gb * 1024.0 {
             bail!(
                 "磁盘剩余空间不足，跳过录制：剩余 {free_mb} MB，阈值 {} GB。\
-                 请清理 downloads/ 或 fupan_output/ 后重试",
+                 请清理产物目录后重试",
                 threshold_gb
             );
         }
@@ -1184,7 +1162,13 @@ fn process_alive(pid: u32) -> bool {
     }
 }
 
-fn terminate_process(pid: u32) {
+/// 先发 SIGTERM 让 ffmpeg 优雅收尾，等 500ms 若仍存活再 SIGKILL。
+///
+/// 注意：本函数从 async 上下文调用，必须用 `tokio::time::sleep` 而非
+/// `std::thread::sleep` —— 后者会阻塞整个 tokio worker 线程，在回收多个
+/// 残留会话时每个阻塞 500ms，直接吃掉直播检测的 25s 预算。这是实测
+/// 「直播检测超时」的加重因素。
+async fn terminate_process(pid: u32) {
     #[cfg(unix)]
     {
         if pid == 0 || pid > i32::MAX as u32 {
@@ -1193,7 +1177,7 @@ fn terminate_process(pid: u32) {
         unsafe {
             let _ = libc::kill(-(pid as i32), libc::SIGTERM);
         }
-        std::thread::sleep(Duration::from_millis(500));
+        tokio::time::sleep(Duration::from_millis(500)).await;
         unsafe {
             let _ = libc::kill(-(pid as i32), libc::SIGKILL);
         }
@@ -1220,22 +1204,6 @@ fn clean_name(input: &str) -> String {
         "空白昵称".to_string()
     } else {
         trimmed
-    }
-}
-
-fn platform_dir_name(url: &str) -> &'static str {
-    if url.contains("live.bilibili.com") {
-        "B站直播"
-    } else if url.contains("douyin.com") {
-        "抖音直播"
-    } else if url.contains("kuaishou.com") {
-        "快手直播"
-    } else if url.contains("douyu.com") {
-        "斗鱼直播"
-    } else if url.contains("huya.com") {
-        "虎牙直播"
-    } else {
-        "其他直播"
     }
 }
 
@@ -1330,7 +1298,7 @@ pub async fn record_live_once(
         }
         let pid = cleanup_pid_2.load(std::sync::atomic::Ordering::SeqCst);
         if pid > 0 {
-            terminate_process(pid);
+            terminate_process(pid).await;
         }
     });
     let (code, log) = wait_child(&mut child).await;
@@ -1415,13 +1383,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn platform_dir_maps_common_hosts() {
-        assert_eq!(platform_dir_name("https://live.bilibili.com/1"), "B站直播");
-        assert_eq!(platform_dir_name("https://live.douyin.com/1"), "抖音直播");
-        assert_eq!(platform_dir_name("https://x.test/1"), "其他直播");
-    }
-
     #[tokio::test]
     async fn disk_threshold_parses_or_defaults_to_one_gb() {
         let cfg = |text: &str| {
@@ -1457,11 +1418,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn output_path_uses_single_downloads_root_and_cleans_anchor() {
+    async fn output_path_follows_manual_layout_and_cleans_names() {
+        // 新布局（产品手册第 3 章）：{产物根}/{主播}/直播/{日期} {场次}/{场次}.ts，
+        // 不按平台分目录，主播名/标题清洗非法字符。
         let dir = std::env::temp_dir().join(format!("zunzhe-live-path-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("config")).unwrap();
-        std::fs::write(dir.join("config").join("config.ini"), "").unwrap();
+        let media = dir.join("产物");
+        std::fs::write(
+            dir.join("config").join("config.ini"),
+            format!("[路径设置]\n产物根目录 = {}\n", media.display()),
+        )
+        .unwrap();
         std::fs::write(dir.join("config").join("fupan_config.ini"), "").unwrap();
         let db_file = dir.join("live-path.db");
         let pool = crate::db::open_pool(&db_file).await.unwrap();
@@ -1482,35 +1450,34 @@ mod tests {
             stream_url: "https://example.test/live.m3u8".to_string(),
         };
         let out = monitor.output_path(&item, &status, "主播/甲").unwrap();
-        let text = out.display().to_string();
-        assert!(
-            text.contains("downloads/B站直播/主播_甲"),
-            "默认路径不应出现 downloads/downloads 双重目录: {text}"
-        );
-        assert!(
-            !text.contains("downloads/downloads"),
-            "默认路径出现双重 downloads: {text}"
+        let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let expect_dir = media
+            .join("主播_甲")
+            .join("直播")
+            .join(format!("{date} 测试_标题_一"));
+        assert_eq!(
+            out,
+            expect_dir.join("测试_标题_一.ts"),
+            "录制路径必须按手册布局落盘"
         );
         let filename = out.file_name().unwrap().to_string_lossy().to_string();
         assert!(
             !filename.contains(['/', '\\', ':']),
             "文件名包含非法字符: {filename}"
         );
-        assert!(
-            filename.starts_with("主播_甲_"),
-            "应使用清洗后的主播名: {filename}"
-        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
-    async fn output_path_supports_time_and_title_folders() {
+    async fn output_path_suffixes_session_when_folder_exists() {
+        // 同一天同标题复播：场次目录已存在时加时刻后缀，绝不覆盖已有录制。
         let dir = std::env::temp_dir().join(format!("zunzhe-live-path2-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("config")).unwrap();
+        let media = dir.join("产物");
         std::fs::write(
             dir.join("config").join("config.ini"),
-            "[录制设置]\n保存文件夹是否以时间区分 = 是\n保存文件夹是否以标题区分 = 是\n",
+            format!("[路径设置]\n产物根目录 = {}\n", media.display()),
         )
         .unwrap();
         std::fs::write(dir.join("config").join("fupan_config.ini"), "").unwrap();
@@ -1528,19 +1495,23 @@ mod tests {
         };
         let status = LiveStatus {
             is_live: true,
-            title: "测试:标题/一".to_string(),
-            anchor_name: "主播/甲".to_string(),
+            title: "晚间闲聊".to_string(),
+            anchor_name: "主播甲".to_string(),
             stream_url: "https://example.test/live.m3u8".to_string(),
         };
-        let out = monitor.output_path(&item, &status, "主播/甲").unwrap();
+        let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+        std::fs::create_dir_all(
+            media
+                .join("主播甲")
+                .join("直播")
+                .join(format!("{date} 晚间闲聊")),
+        )
+        .unwrap();
+        let out = monitor.output_path(&item, &status, "主播甲").unwrap();
         let text = out.display().to_string();
         assert!(
-            text.contains("downloads/B站直播/主播_甲/2026-"),
-            "按时间/标题建目录未生效: {text}"
-        );
-        assert!(
-            !text.contains("主播_甲_测试_标题"),
-            "标题目录应清洗非法字符: {text}"
+            text.contains(&format!("{date} 晚间闲聊 ")),
+            "场次目录已存在时应追加时刻后缀: {text}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1551,10 +1522,10 @@ mod tests {
         assert!(last_log_lines(log, 3).contains('d'));
     }
 
-    #[test]
-    fn terminate_process_does_not_panic() {
+    #[tokio::test]
+    async fn terminate_process_does_not_panic() {
         // 不存在的 pid 调用不应 panic；真实清理按 DB 会话驱动。
-        terminate_process(u32::MAX);
+        terminate_process(u32::MAX).await;
     }
 
     #[test]
@@ -1704,5 +1675,36 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_live_for_project_routes_each_platform() {
+        // 回归保障：URL→适配器的分发是直播监控的地基，一旦被误改，
+        // B站会落到 Python 桥、或抖音/快手被当成直链，导致整链解析失效。
+        // 这里用适配器 name() 固化路由结果，无需联网。
+        let cases = [
+            // 抖音：主站 + 短链都走 Python 桥
+            ("https://live.douyin.com/Glx6768", "python-bridge"),
+            ("https://v.douyin.com/abc123/", "python-bridge"),
+            // 快手
+            ("https://live.kuaishou.com/u/Bd20210915", "python-bridge"),
+            // 虎牙 / 斗鱼
+            ("https://www.huya.com/10086", "python-bridge"),
+            ("https://www.douyu.com/999", "python-bridge"),
+            // YouTube 主站 + 短链
+            ("https://www.youtube.com/watch?v=abc", "python-bridge"),
+            ("https://youtu.be/abc", "python-bridge"),
+            // Twitch
+            ("https://www.twitch.tv/someone", "python-bridge"),
+            // B站：原生适配器，不走 Python 桥
+            ("https://live.bilibili.com/24931109", "bilibili"),
+            // 其它未知域名/直链 m3u8：直链适配器
+            ("https://example.test/live.m3u8", "direct"),
+            ("https://cdn.example.com/hls/stream/index.m3u8", "direct"),
+        ];
+        for (url, expect) in cases {
+            let adapter = resolve_live_for_project(url, Path::new("."), "");
+            assert_eq!(adapter.name(), expect, "URL {url} 应路由到 {expect} 适配器");
+        }
     }
 }

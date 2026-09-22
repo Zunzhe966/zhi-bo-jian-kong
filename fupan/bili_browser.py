@@ -12,7 +12,7 @@ import sys
 import time
 from pathlib import Path
 
-from .settings import PROJECT_DIR
+from .settings import PROJECT_DIR, RUN_DIR as _PATHS_RUN_DIR
 
 def _electron_binary() -> str:
     """返回 Electron 可执行文件（跨 Windows/macOS/Linux）。"""
@@ -34,7 +34,7 @@ def _electron_binary() -> str:
 
 ELECTRON = _electron_binary()
 EXTRACT_SCRIPT = PROJECT_DIR / 'desktop' / 'electron' / 'extract-run.cjs'
-RUN_DIR = PROJECT_DIR / 'fupan_output' / 'run'
+RUN_DIR = _PATHS_RUN_DIR
 UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36')
 

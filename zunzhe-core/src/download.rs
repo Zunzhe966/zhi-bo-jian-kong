@@ -108,7 +108,8 @@ pub async fn enqueue_downloads(
 }
 
 /// 下载器：优先走平台原生路径（B站浏览器内核提取直链 + ffmpeg 合流），
-/// 失败回退 yt-dlp。下载产物统一落到 downloads/短视频/<name>/。
+/// 失败回退 yt-dlp。下载产物按产品手册第 3 章落盘：
+/// `{video_root}/<主播>/短视频/<标题>/<标题>.mp4`，转写文字与视频同目录。
 pub struct Downloader {
     project_dir: PathBuf,
 }
@@ -125,20 +126,46 @@ impl Downloader {
         pool: &SqlitePool,
     ) -> Result<DownloadResult> {
         // 主播名来自外部输入，必须清洗后再拼路径：防止 `../`、`/`、Windows
-        // 保留设备名等把文件写到 downloads/短视频/ 之外或产生非法目录。
+        // 保留设备名等把文件写到产物根之外或产生非法目录。
+        // 新布局（产品手册第 3 章）：{video_root}/{主播}/短视频/{标题}/{标题}.mp4。
+        // 标题要等下载完成才知道（yt-dlp 按标题命名），所以先落主播的短视频目录，
+        // 成功后由 finish_download 把文件收进以它自己命名的子目录。
         let safe_name = safe_dir_name(name);
-        let dir = self
-            .project_dir
-            .join("downloads")
-            .join("短视频")
-            .join(&safe_name);
+        let dir = crate::paths::video_root(&self.project_dir)
+            .join(&safe_name)
+            .join("短视频");
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("创建下载目录失败: {}", dir.display()))?;
+
+        // 跨平台去重：同一主播把同一内容发到多个平台（B站+抖音等）时，
+        // 标题通常一致。只要其他平台已成功下载过，这里就跳过，避免同一
+        // 视频每个平台各存一份。文件名带平台标注后，用户可按需手动补下。
+        let video_title = db::get_videos(pool, "", "", false)
+            .await
+            .ok()
+            .and_then(|all| all.iter().find(|v| v.url == url).map(|v| v.title.clone()))
+            .unwrap_or_default();
+        if !video_title.is_empty()
+            && video_title != extract_video_id(url).unwrap_or_default()
+            && let Some((dup_platform, dup_title)) =
+                db::find_cross_platform_duplicate(pool, name, &video_title, url).await?
+        {
+            tracing::info!("跨平台重复跳过下载: {url} 与 [{dup_platform}] 《{dup_title}》内容相同");
+            return Ok(DownloadResult {
+                ok: true,
+                file: String::new(),
+                name: name.to_string(),
+                pipeline_queued: false,
+                pipeline_error: None,
+                duplicate_of: Some(format!("[{dup_platform}] {dup_title}")),
+            });
+        }
 
         // B站匿名请求容易被 412 风控，浏览器内核提取直链最可靠。
         if is_bilibili(url) {
             let output = bilibili_browser_download(&self.project_dir, url, &dir).await;
             if let Some(file) = output {
+                let file = tag_filename_with_platform(&file, url);
                 return self.finish_download(url, &safe_name, pool, file).await;
             }
             tracing::warn!("B站浏览器下载兜底失败，回退 yt-dlp: {url}");
@@ -155,6 +182,10 @@ impl Downloader {
         pool: &SqlitePool,
         file: String,
     ) -> Result<DownloadResult> {
+        // 新布局要求一个视频一个文件夹（{标题}/{标题}.mp4），且转写文字随后落在
+        // 同一文件夹（pipeline 的 out_dir = 视频所在目录）。下载时标题未知，文件
+        // 先落在主播的短视频目录顶层，这里下载完成后收进以它自己命名的子目录。
+        let file = move_into_own_folder(&file);
         let video_id = extract_video_id(url).unwrap_or_else(|| url.to_string());
         // 下载成功但视频库还没有该记录时补一行，保证“已下载”有事实源。
         if let Err(e) = db::ensure_video_row(pool, &video_id, url, name, name).await {
@@ -176,16 +207,21 @@ impl Downloader {
         // Python 流水线。手动 process_media 仍可强制处理。
         let pipeline_enabled = pipeline_enabled(&self.project_dir);
         let mut pipeline_queued = false;
+        let mut pipeline_error = None;
         if pipeline_enabled {
-            pipeline_queued = enqueue_pipeline_after_download(pool, &self.project_dir, &file, name)
-                .await
-                .is_ok();
+            let outcome = PipelineEnqueue::from_result(
+                enqueue_pipeline_after_download(pool, &self.project_dir, &file, name).await,
+            );
+            pipeline_queued = outcome.pipeline_queued;
+            pipeline_error = outcome.pipeline_error;
         }
         Ok(DownloadResult {
             ok: true,
             file,
             name: name.to_string(),
             pipeline_queued,
+            pipeline_error,
+            duplicate_of: None,
         })
     }
 
@@ -196,16 +232,25 @@ impl Downloader {
         // “这次新写出的文件”和“执行前就存在的旧文件”。
         let before = files_in_dir(dir);
         cmd.kill_on_drop(true);
+        // 文件名带 `[平台]` 前缀：一个主播多平台监控时一眼区分来源。
+        let tag = platform_tag(url);
+        let name_prefix = if tag.is_empty() {
+            String::new()
+        } else {
+            format!("[{tag}] ")
+        };
         cmd.args([
             "-f",
             "bv*+ba/b",
             "--merge-output-format",
             "mp4",
             "-o",
-            format!("{}/%(title)s.%(ext)s", dir.display()).as_str(),
+            format!("{}/{}%(title)s.%(ext)s", dir.display(), name_prefix).as_str(),
             "--no-overwrites",
             url,
         ]);
+        // 出站分流：国内站点显式禁代理，国外站点走用户配置的出站代理。
+        cmd.args(crate::net::policy().ytdlp_proxy_args(url));
         // B站风控时带用户 cookie（config/fupan_config.ini [视频监控] b站cookie）
         if url.contains("bilibili.com") || url.contains("b23.tv") {
             // 桌面端「B站授权」导出的浏览器会话 Cookie 最可靠；没有再回退
@@ -226,6 +271,14 @@ impl Downloader {
                 }
             }
         }
+        // 抖音下载需要登录态 Cookie（yt-dlp DouyinIE 未登录直接报 Fresh cookies needed）。
+        if url.contains("douyin.com") || url.contains("iesdouyin.com") {
+            let douyin_cookie =
+                crate::paths::run_dir(&self.project_dir).join("douyin_browser_cookies.txt");
+            if douyin_cookie.exists() {
+                cmd.args(["--cookies", douyin_cookie.display().to_string().as_str()]);
+            }
+        }
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -233,13 +286,18 @@ impl Downloader {
             ManagedChild::spawn(&mut cmd).with_context(|| format!("启动 yt-dlp 失败: {ytdlp}"))?;
         let output = match child.wait_with_output(Duration::from_secs(600)).await {
             Ok(output) => output,
-            Err(ChildError::Io(e)) => return Err(e).context("读取 yt-dlp 输出失败"),
+            Err(ChildError::Io(e)) => {
+                cleanup_intermediates_created_after(dir, &before);
+                return Err(e).context("读取 yt-dlp 输出失败");
+            }
             Err(ChildError::Timeout) => {
+                cleanup_intermediates_created_after(dir, &before);
                 anyhow::bail!("yt-dlp 下载超时（10 分钟），已终止整个进程组")
             }
         };
 
         if !output.status.success() {
+            cleanup_intermediates_created_after(dir, &before);
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(anyhow!(
                 "yt-dlp 下载失败: {}",
@@ -277,7 +335,12 @@ async fn bilibili_browser_download(project_dir: &Path, url: &str, dir: &Path) ->
     // 源码模式仍用 desktop/electron。
     let extract = packaged_electron_dir()
         .map(|dir| dir.join("extract-run.cjs"))
-        .unwrap_or_else(|| project_dir.join("desktop").join("electron").join("extract-run.cjs"));
+        .unwrap_or_else(|| {
+            project_dir
+                .join("desktop")
+                .join("electron")
+                .join("extract-run.cjs")
+        });
     if !extract.exists() {
         tracing::warn!("B站浏览器下载兜底不可用: 缺少 {}", extract.display());
         return None;
@@ -496,6 +559,34 @@ fn unique_media_path(dir: &Path, stem: &str, ext: &str) -> PathBuf {
     candidate
 }
 
+/// 把下载完成的文件收进以它自己命名的子目录：`主播/短视频/{标题}/{标题}.mp4`。
+/// 子目录与文件同名，转写产物随后落在同一目录（pipeline out_dir = 视频所在目录），
+/// 满足「文字和视频在同一个文件夹」。目标已存在（同标题不同来源）时用 `_2` 后缀
+/// 避让，绝不覆盖旧文件。移动失败保留原路径，不影响下载结果。
+fn move_into_own_folder(file: &str) -> String {
+    let path = Path::new(file);
+    let (Some(parent), Some(stem), Some(ext)) = (
+        path.parent(),
+        path.file_stem().and_then(|s| s.to_str()),
+        path.extension().and_then(|e| e.to_str()),
+    ) else {
+        return file.to_string();
+    };
+    let folder = parent.join(stem);
+    if let Err(e) = std::fs::create_dir_all(&folder) {
+        tracing::warn!("创建视频子目录失败 {}: {e}", folder.display());
+        return file.to_string();
+    }
+    let target = unique_media_path(&folder, stem, ext);
+    match std::fs::rename(path, &target) {
+        Ok(()) => target.display().to_string(),
+        Err(e) => {
+            tracing::warn!("视频移入子目录失败 {file} -> {}: {e}", target.display());
+            file.to_string()
+        }
+    }
+}
+
 /// 下载目录名必须是一个安全的单层目录名：继续复用 `clean_name` 的非法字符清洗，
 /// 并额外处理 Windows 保留设备名，避免 `CON`、`NUL` 等名字在 Windows 上写失败。
 fn safe_dir_name(input: &str) -> String {
@@ -552,6 +643,12 @@ fn find_latest_video(dir: &Path) -> Option<String> {
             {
                 continue;
             }
+            // yt-dlp 被中断时会留下 `<标题>.f30077.mp4` 这类单流中间文件
+            // （只有视频轨没有音频轨）。绝不能把它当成下载成功产物，
+            // 否则复盘流水线转写时因无音频流崩溃，且用户拿到的视频无声。
+            if is_ytdlp_intermediate(&path) {
+                continue;
+            }
             let mtime = entry.metadata().ok().and_then(|m| m.modified().ok());
             if let Some(m) = mtime
                 && newest.as_ref().map(|(t, _)| m > *t).unwrap_or(true)
@@ -573,6 +670,42 @@ fn files_in_dir(dir: &Path) -> std::collections::HashSet<String> {
         .collect()
 }
 
+/// 识别 yt-dlp 中断残留的单流中间文件：`标题.f30077.mp4`、`xxx.f30280.m4s`、
+/// `xxx.part` / `.ytdl`。这类文件要么没有音轨，要么根本不可播放。
+fn is_ytdlp_intermediate(path: &Path) -> bool {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if name.ends_with(".part") || name.ends_with(".ytdl") || name.ends_with(".m4s") {
+        return true;
+    }
+    // `\.f\d+\.` 形如 `.f30077.mp4`：yt-dlp 下载单流时的格式号后缀。
+    if let Some(dot) = name.rfind('.') {
+        let stem = &name[..dot];
+        if let Some(fid) = stem.rfind(".f").map(|i| &stem[i + 2..]) {
+            return !fid.is_empty() && fid.bytes().all(|b| b.is_ascii_digit());
+        }
+    }
+    false
+}
+
+/// yt-dlp 失败/超时后清理本次运行新产生的中间文件，防止残缺单流文件
+/// 永久留在下载目录（历史遗留正是 12 个无音轨文件的根因）。
+fn cleanup_intermediates_created_after(dir: &Path, before: &std::collections::HashSet<String>) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() || !is_ytdlp_intermediate(&path) {
+                continue;
+            }
+            let now = path.display().to_string();
+            if !before.contains(&now)
+                && let Err(e) = std::fs::remove_file(&path)
+            {
+                tracing::warn!("清理中断中间文件失败 {}: {e}", path.display());
+            }
+        }
+    }
+}
+
 fn extract_video_id(url: &str) -> Option<String> {
     let re = regex::Regex::new(r"(BV[0-9A-Za-z]{10})|/(\d{10,})").ok()?;
     let caps = re.captures(url)?;
@@ -588,6 +721,155 @@ pub struct DownloadResult {
     pub name: String,
     /// 下载完成后已自动入队复盘任务（转写/提炼/切片）。
     pub pipeline_queued: bool,
+    /// 下载成功但自动复盘入队失败时的真实原因；成功或未启用时为 None。
+    pub pipeline_error: Option<String>,
+    /// 跨平台重复跳过时记录已存在的版本（`[平台] 标题`）；正常下载为 None。
+    pub duplicate_of: Option<String>,
+}
+
+impl DownloadResult {
+    /// 下载成功但自动复盘入队失败时的可展示告警。
+    pub fn pipeline_warning(&self) -> Option<String> {
+        self.pipeline_error
+            .as_ref()
+            .map(|reason| format!("下载成功，但自动复盘入队失败: {reason}"))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PipelineEnqueue {
+    pipeline_queued: bool,
+    pipeline_error: Option<String>,
+}
+
+impl PipelineEnqueue {
+    fn from_result(result: anyhow::Result<i64>) -> Self {
+        match result {
+            Ok(_) => Self {
+                pipeline_queued: true,
+                pipeline_error: None,
+            },
+            Err(e) => Self {
+                pipeline_queued: false,
+                pipeline_error: Some(format!("{e:#}")),
+            },
+        }
+    }
+}
+
+/// 平台的中文标注（用于下载文件名前缀，一眼看出视频来源）。
+fn platform_tag(url: &str) -> &'static str {
+    if is_bilibili(url) || url.contains("b23.tv") {
+        "B站"
+    } else if url.contains("douyin.com") || url.contains("iesdouyin.com") {
+        "抖音"
+    } else if url.contains("xiaohongshu.com") || url.contains("xhslink.com") {
+        "小红书"
+    } else if url.contains("youtube.com") || url.contains("youtu.be") {
+        "YouTube"
+    } else if url.contains("kuaishou.com") {
+        "快手"
+    } else {
+        ""
+    }
+}
+
+/// 给下载产物文件名加 `[平台]` 前缀；已有前缀或识别不出平台时保持原名。
+/// 返回重命名后的路径；改名失败不影响下载结果（返回原路径）。
+fn tag_filename_with_platform(file: &str, url: &str) -> String {
+    let tag = platform_tag(url);
+    if tag.is_empty() {
+        return file.to_string();
+    }
+    let path = std::path::Path::new(file);
+    let Some(filename) = path.file_name().and_then(|n| n.to_str()) else {
+        return file.to_string();
+    };
+    let prefix = format!("[{tag}] ");
+    if filename.starts_with(&prefix) {
+        return file.to_string();
+    }
+    let new_name = format!("{prefix}{filename}");
+    let new_path = path.with_file_name(&new_name);
+    match std::fs::rename(path, &new_path) {
+        Ok(()) => new_path.to_string_lossy().to_string(),
+        Err(e) => {
+            tracing::warn!("添加平台标注改名失败 {file} -> {}: {e}", new_path.display());
+            file.to_string()
+        }
+    }
+}
+
+/// 复盘入队前的媒体预检：只接受本流水线真正支持、且 ffmpeg 能打开的音视频。
+///
+/// 损坏的 mp4 过去会先拿到 pending task_id，用户看到“已加入队列”，随后
+/// Python/PyAV 才失败；这既像假按钮，也制造无意义的失败记录。这里在写库前
+/// 用零时长解码做一次轻量预检，把坏文件挡在队列外并保留 ffmpeg 的真实错误。
+const PROCESS_MEDIA_SUFFIXES: &[&str] = &[
+    "mp4", "ts", "mkv", "flv", "mov", "webm", "mp3", "m4a", "wav",
+];
+
+fn is_known_media_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| PROCESS_MEDIA_SUFFIXES.contains(&ext.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+async fn validate_media_readable(project_dir: &Path, path: &Path) -> anyhow::Result<()> {
+    if !is_known_media_path(path) {
+        // 未知后缀不猜内容；上层原有的存在性/可信路径校验仍然生效。
+        return Ok(());
+    }
+    let ffmpeg = find_ffmpeg(project_dir);
+    let mut cmd = Command::new(&ffmpeg);
+    cmd.kill_on_drop(true)
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-t", "0", "-f", "null", "-"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let child = ManagedChild::spawn(&mut cmd).with_context(|| {
+        format!(
+            "媒体文件校验失败：无法启动 ffmpeg（{}），不能确认文件可读: {}",
+            ffmpeg.display(),
+            path.display()
+        )
+    })?;
+    let output = match child.wait_with_output(Duration::from_secs(20)).await {
+        Ok(output) => output,
+        Err(ChildError::Timeout) => {
+            anyhow::bail!("媒体文件校验超时（20 秒），无法读取: {}", path.display())
+        }
+        Err(ChildError::Io(e)) => {
+            anyhow::bail!("媒体文件校验失败，无法读取 {}: {e}", path.display())
+        }
+    };
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .rev()
+        .take(3)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let detail = if detail.is_empty() {
+        format!("ffmpeg 退出码 {}", output.status)
+    } else {
+        detail.chars().take(500).collect::<String>()
+    };
+    anyhow::bail!(
+        "媒体文件损坏或无法读取: {}（ffmpeg: {detail}）",
+        path.display()
+    )
 }
 
 /// 把 pending 下载任务逐个执行（失败重试，成功标记）。
@@ -620,36 +902,84 @@ pub async fn enqueue_process(
     project_dir: &Path,
     file: &str,
     name: &str,
-) -> anyhow::Result<i64> {
-    // 复盘流水线会调用本地 Python 处理该文件；只有项目内可信媒体路径才允许
-    // 入队。绝对路径必须落在 downloads/ 或 fupan_output/，相对路径不能含 `..`，
-    // 防止外部调用者让 daemon 任意处理本机路径（例如读取/转写敏感文件）。
+) -> anyhow::Result<ProcessEnqueueResult> {
+    // 复盘流水线会调用本地 Python 处理该文件；只有可信媒体路径才允许入队。
+    // 可信根跟着 `[路径设置]` / `直播保存路径` 走（见 paths::trusted_media_roots），
+    // 不再是写死的 `<项目根>/downloads`——否则用户把产物搬到自己的目录后，
+    // 录完的直播会被这条校验默默拒掉，永远进不了复盘。
     let media_path = Path::new(file);
-    let trusted = if media_path.is_absolute() {
-        let downloads = project_dir.join("downloads");
-        let fupan = project_dir.join("fupan_output");
-        media_path.starts_with(&downloads) || media_path.starts_with(&fupan)
-    } else {
-        !media_path
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-    };
+    let trusted = crate::paths::is_trusted_media_path(project_dir, media_path);
     if !trusted {
-        anyhow::bail!("复盘任务只接受 downloads/ 或 fupan_output/ 下的媒体路径: {file}");
+        let roots: Vec<String> = crate::paths::trusted_media_roots(project_dir)
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        anyhow::bail!(
+            "复盘任务只接受可信媒体目录下的路径，当前可信目录: {}；收到: {file}",
+            roots.join("、")
+        );
     }
+    // 文件不存在时绝不能先返回一个 task_id 再让 worker 失败：桌面端会提示
+    // “已加入转写队列”，用户等不到任何转写结果，只能看到一条永远失败的假任务。
+    // 校验放在查重/写库之前，失败时数据库保持原样。
+    if !media_path.is_file() {
+        anyhow::bail!("复盘媒体文件不存在或不是普通文件: {file}");
+    }
+    // 文件存在也可能是 0 字节/截断/损坏：必须在查重写库前探测可解码性。
+    validate_media_readable(project_dir, media_path).await?;
     // 同一媒体文件已经在排队、正在处理或已经完成时不再重复入队，避免重复
     // 转写/切片；只有 failed 是重试耗尽后的终态，手动重试应创建新任务。
-    let existing: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM tasks WHERE kind='process' AND url=? AND status IN ('pending','processing','done') LIMIT 1",
+    let existing: Option<(i64, String)> = sqlx::query_as(
+        "SELECT id, status FROM tasks WHERE kind='process' AND url=? AND status IN ('pending','processing','done') ORDER BY id DESC LIMIT 1",
     )
     .bind(file)
     .fetch_optional(pool)
     .await
     .context("查询已有复盘任务")?;
-    if let Some(id) = existing {
-        return Ok(id);
+    if let Some((id, status)) = existing {
+        return Ok(ProcessEnqueueResult::existing(id, &status));
     }
-    db::enqueue_task(pool, "process", file, name).await
+    let id = db::enqueue_task(pool, "process", file, name).await?;
+    Ok(ProcessEnqueueResult::queued(id))
+}
+
+/// 复盘入队结果。调用方必须能区分「这次真的排队了」和「已经有任务了」，
+/// 否则已完成视频再次点击时会被误导为“刚刚加入队列”。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProcessEnqueueResult {
+    pub task_id: i64,
+    pub queued: bool,
+    pub status: String,
+    pub disposition: String,
+    pub hint: String,
+}
+
+impl ProcessEnqueueResult {
+    fn queued(task_id: i64) -> Self {
+        Self {
+            task_id,
+            queued: true,
+            status: "pending".to_string(),
+            disposition: "queued".to_string(),
+            hint: "已加入 daemon 复盘队列，转写/提炼/切片由后台 worker 处理".to_string(),
+        }
+    }
+
+    fn existing(task_id: i64, status: &str) -> Self {
+        let (disposition, hint) = match status {
+            "processing" => ("already_active", "该视频正在转写，无需重复入队"),
+            "pending" => ("already_active", "该视频已在复盘队列，无需重复入队"),
+            "done" => ("already_done", "该视频已经转写过，无需重复入队"),
+            _ => ("already_active", "该视频已有复盘任务，无需重复入队"),
+        };
+        Self {
+            task_id,
+            queued: false,
+            status: status.to_string(),
+            disposition: disposition.to_string(),
+            hint: hint.to_string(),
+        }
+    }
 }
 
 /// 下载完成后立即入队复盘任务，保持旧调用名兼容。
@@ -659,7 +989,9 @@ pub async fn enqueue_pipeline_after_download(
     file: &str,
     name: &str,
 ) -> anyhow::Result<i64> {
-    enqueue_process(pool, project_dir, file, name).await
+    Ok(enqueue_process(pool, project_dir, file, name)
+        .await?
+        .task_id)
 }
 
 /// 复盘流水线是否启用：转写/知识提炼/切片任一开启即认为启用。
@@ -800,7 +1132,13 @@ async fn run_single_task_with_timeout(
     timeout_duration: Duration,
 ) -> bool {
     if task.kind != "download" {
-        let _ = db::update_task_status(pool, task.id, "failed").await;
+        let _ = db::record_task_failure(
+            pool,
+            task.id,
+            &format!("任务类型错误：期望 download，实际 {}", task.kind),
+            "failed",
+        )
+        .await;
         return false;
     }
     let outcome = tokio::time::timeout(
@@ -809,10 +1147,16 @@ async fn run_single_task_with_timeout(
     )
     .await;
     match outcome {
-        Ok(Ok(_)) => db::update_task_status(pool, task.id, "done").await.is_ok(),
+        Ok(Ok(result)) => {
+            if let Some(warning) = result.pipeline_warning() {
+                tracing::warn!("下载任务 id={} {warning}", task.id);
+            }
+            db::update_task_status(pool, task.id, "done").await.is_ok()
+        }
         Ok(Err(e)) => {
+            let reason = format!("{e:#}");
             tracing::warn!(
-                "下载任务 id={} 失败（attempts={}）: {e:#}",
+                "下载任务 id={} 失败（attempts={}）: {reason}",
                 task.id,
                 task.attempts
             );
@@ -822,10 +1166,11 @@ async fn run_single_task_with_timeout(
             } else {
                 "pending"
             };
-            let _ = db::update_task_status(pool, task.id, next).await;
+            let _ = db::record_task_failure(pool, task.id, &reason, next).await;
             false
         }
         Err(_) => {
+            let reason = format!("下载任务超时（attempts={}）", task.attempts);
             tracing::warn!(
                 "下载任务 id={} 超时（attempts={}），已显式结束本轮",
                 task.id,
@@ -836,7 +1181,7 @@ async fn run_single_task_with_timeout(
             } else {
                 "pending"
             };
-            let _ = db::update_task_status(pool, task.id, next).await;
+            let _ = db::record_task_failure(pool, task.id, &reason, next).await;
             false
         }
     }
@@ -1010,6 +1355,35 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_enqueue_failure_keeps_visible_reason() {
+        let outcome = PipelineEnqueue::from_result(Err(anyhow!("ffmpeg 探测失败")));
+
+        assert!(!outcome.pipeline_queued);
+        assert_eq!(
+            outcome.pipeline_error.as_deref(),
+            Some("ffmpeg 探测失败"),
+            "下载成功但复盘入队失败时，调用方必须拿到真实原因"
+        );
+    }
+
+    #[test]
+    fn successful_download_with_pipeline_failure_is_reported() {
+        let result = DownloadResult {
+            ok: true,
+            file: "/tmp/ok.mp4".to_string(),
+            name: "主播".to_string(),
+            pipeline_queued: false,
+            pipeline_error: Some("媒体文件损坏或无法读取".to_string()),
+            duplicate_of: None,
+        };
+
+        assert_eq!(
+            result.pipeline_warning().as_deref(),
+            Some("下载成功，但自动复盘入队失败: 媒体文件损坏或无法读取")
+        );
+    }
+
+    #[test]
     fn pipeline_switches_are_independent() {
         let dir = std::env::temp_dir().join(format!(
             "zunzhe-pipeline-indep-{}-{}",
@@ -1071,17 +1445,25 @@ mod tests {
         let media_dir = project_dir.join("downloads/短视频/主播甲");
         std::fs::create_dir_all(&media_dir).unwrap();
         let media = media_dir.join("same-media.mp4");
+        crate::test_support::write_valid_wav(&media);
         let media = media.display().to_string();
-        let pending_id = enqueue_process(&pool, &project_dir, &media, "主播甲")
+        let pending = enqueue_process(&pool, &project_dir, &media, "主播甲")
             .await
             .unwrap();
+        assert!(pending.queued);
+        assert_eq!(pending.status, "pending");
+        assert_eq!(pending.disposition, "queued");
+        let pending_id = pending.task_id;
         let duplicate_pending = enqueue_process(&pool, &project_dir, &media, "主播乙")
             .await
             .unwrap();
         assert_eq!(
-            pending_id, duplicate_pending,
+            pending_id, duplicate_pending.task_id,
             "同一媒体文件在 pending 时不应重复入队"
         );
+        assert!(!duplicate_pending.queued);
+        assert_eq!(duplicate_pending.status, "pending");
+        assert_eq!(duplicate_pending.disposition, "already_active");
 
         crate::db::update_task_status(&pool, pending_id, "done")
             .await
@@ -1090,9 +1472,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            after_done, pending_id,
+            after_done.task_id, pending_id,
             "同一媒体文件已完成时不应再创建重复 process 任务"
         );
+        assert!(!after_done.queued);
+        assert_eq!(after_done.status, "done");
+        assert_eq!(after_done.disposition, "already_done");
 
         crate::db::set_task_status(&pool, pending_id, "failed")
             .await
@@ -1100,7 +1485,12 @@ mod tests {
         let after_failed = enqueue_process(&pool, &project_dir, &media, "主播丁")
             .await
             .unwrap();
-        assert_ne!(after_failed, pending_id, "失败后手动重试应创建新任务");
+        assert!(after_failed.queued);
+        assert_eq!(after_failed.disposition, "queued");
+        assert_ne!(
+            after_failed.task_id, pending_id,
+            "失败后手动重试应创建新任务"
+        );
         assert_eq!(
             crate::db::list_tasks(&pool, "pending", 10)
                 .await
@@ -1112,7 +1502,12 @@ mod tests {
         let dup_retry = enqueue_process(&pool, &project_dir, &media, "主播戊")
             .await
             .unwrap();
-        assert_eq!(dup_retry, after_failed, "pending 中再次入队应去重");
+        assert_eq!(
+            dup_retry.task_id, after_failed.task_id,
+            "pending 中再次入队应去重"
+        );
+        assert!(!dup_retry.queued);
+        assert_eq!(dup_retry.disposition, "already_active");
         std::mem::forget(file);
     }
 
@@ -1199,20 +1594,92 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("只接受 downloads/ 或 fupan_output/")
-        );
+        assert!(err.to_string().contains("只接受可信媒体目录下的路径"));
 
         let traversal = "../etc/passwd";
         let err = enqueue_process(&pool, &project_dir, traversal, "穿越")
             .await
             .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("只接受 downloads/ 或 fupan_output/")
-        );
+        assert!(err.to_string().contains("只接受可信媒体目录下的路径"));
         std::mem::forget(file);
+    }
+
+    #[tokio::test]
+    async fn enqueue_process_rejects_missing_file_before_creating_task() {
+        let db_file = std::env::temp_dir().join(format!(
+            "zunzhe-process-missing-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pool = crate::db::open_pool(&db_file).await.unwrap();
+        let project_dir = std::env::temp_dir().join(format!(
+            "zunzhe-process-missing-project-{}",
+            std::process::id()
+        ));
+        let missing = project_dir
+            .join("downloads")
+            .join("短视频")
+            .join("不存在.mp4");
+
+        let err = enqueue_process(
+            &pool,
+            &project_dir,
+            &missing.display().to_string(),
+            "主播甲",
+        )
+        .await
+        .expect_err("不存在的媒体文件不应入队");
+        assert!(err.to_string().contains("不存在"), "{err}");
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE kind='process'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "失败校验不该留下假任务");
+        let _ = std::fs::remove_file(&db_file);
+    }
+
+    #[tokio::test]
+    async fn enqueue_process_rejects_corrupt_media_before_creating_task() {
+        let db_file = std::env::temp_dir().join(format!(
+            "zunzhe-process-corrupt-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pool = crate::db::open_pool(&db_file).await.unwrap();
+        let project_dir = std::env::temp_dir().join(format!(
+            "zunzhe-process-corrupt-project-{}",
+            std::process::id()
+        ));
+        let media_dir = project_dir.join("downloads").join("短视频").join("主播甲");
+        std::fs::create_dir_all(&media_dir).unwrap();
+        let corrupt = media_dir.join("坏文件.mp4");
+        std::fs::write(&corrupt, b"not an mp4").unwrap();
+
+        let err = enqueue_process(
+            &pool,
+            &project_dir,
+            &corrupt.display().to_string(),
+            "主播甲",
+        )
+        .await
+        .expect_err("损坏媒体不能进入复盘队列");
+        assert!(
+            err.to_string().contains("媒体文件损坏") || err.to_string().contains("无法读取"),
+            "错误必须说明媒体不可读，而不是只报任务失败: {err}"
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE kind='process'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "媒体校验失败不能在数据库留下假任务");
+        let _ = std::fs::remove_file(&db_file);
+        let _ = std::fs::remove_dir_all(&project_dir);
     }
 
     #[tokio::test]

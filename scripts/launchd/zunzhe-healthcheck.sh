@@ -6,22 +6,34 @@
 set -u
 
 # 不依赖 launchd 的 WorkingDirectory：TCC 场景下 pwd 可能返回损坏字节，
-# 也会被 set -u 当成未定义变量引用。统一从候选路径显式探测项目根。
-ROOT=""
-for candidate in "$HOME/Projects/尊者监控直播短视频" "$HOME/Documents/尊者监控直播短视频" "$HOME/Desktop/尊者监控直播短视频"; do
-  if [ -f "$candidate/config/config.ini.example" ] || [ -f "$candidate/config/config.ini" ]; then
-    ROOT="$candidate"
-    break
-  fi
-done
+# 也会被 set -u 当成未定义变量引用。安装时固化的项目根优先；候选路径只
+# 作为旧 plist 升级兼容的退路，且优先 Documents/Desktop，避免踩中
+# ~/Projects 符号链接导致旧 release 与当前配置分叉。
+ROOT="${ZUNZHE_PROJECT_ROOT:-}"
+if [ -z "$ROOT" ]; then
+  for candidate in "$HOME/Documents/尊者监控直播短视频" "$HOME/Desktop/尊者监控直播短视频"; do
+    if [ -f "$candidate/config/config.ini.example" ] || [ -f "$candidate/config/config.ini" ]; then
+      ROOT="$candidate"
+      break
+    fi
+  done
+fi
 
 if [ -z "$ROOT" ] || { [ ! -f "$ROOT/config/config.ini.example" ] && [ ! -f "$ROOT/config/config.ini" ]; }; then
   echo "找不到项目根（需要 config/config.ini(.example)）" >&2
   exit 1
 fi
 
+case "$ROOT" in
+  /*) ;;
+  *)
+    echo "ZUNZHE_PROJECT_ROOT 必须是绝对路径: $ROOT" >&2
+    exit 1
+    ;;
+esac
+
 # 日志目录解析（与 render-launchd-plists.sh / zunzhe-core paths.rs 同一套语义）：
-# 优先读 [路径设置] 日志目录；留空 = <项目根>/logs。
+# 优先读 [路径设置] 日志目录；留空 = <产物根目录>/logs。
 #
 # 历史坑（2026-09-20 修复）：launchd 下项目路径若是 ~/Projects/xxx 这类
 # 指向外置盘的符号链接，则在项目目录内 mkdir/重定向会被 TCC 拒绝
@@ -30,9 +42,16 @@ fi
 # 跟项目目录权限无关 —— 所以只要把「脚本自己写的日志」指向同一个
 # StandardOut 目标路径，就永远不会写失败。
 LOG_DIR=""
+MEDIA_ROOT=""
 CONFIG_FILE="$ROOT/config/config.ini"
 [ -f "$CONFIG_FILE" ] || CONFIG_FILE="$ROOT/config/config.ini.example"
 if [ -f "$CONFIG_FILE" ]; then
+  MEDIA_ROOT="$(awk -F= '
+    /^[[:space:]]*\[/ { section=$0; gsub(/^[[:space:]]*\[|[[:space:]]*\].*$/, "", section) }
+    section == "路径设置" && $1 ~ /^[[:space:]]*产物根目录[[:space:]]*$/ {
+      sub(/^[^=]*=/, ""); gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print; exit
+    }
+  ' "$CONFIG_FILE")"
   LOG_DIR="$(awk -F= '
     /^[[:space:]]*\[/ { section=$0; gsub(/^[[:space:]]*\[|[[:space:]]*\].*$/, "", section) }
     section == "路径设置" && $1 ~ /^[[:space:]]*日志目录[[:space:]]*$/ {
@@ -40,8 +59,18 @@ if [ -f "$CONFIG_FILE" ]; then
     }
   ' "$CONFIG_FILE")"
 fi
+if [ -z "$MEDIA_ROOT" ]; then
+  MEDIA_ROOT="$HOME/Documents/尊者产物"
+else
+  case "$MEDIA_ROOT" in
+    \~) MEDIA_ROOT="$HOME" ;;
+    \~/*) MEDIA_ROOT="$HOME/${MEDIA_ROOT#\~/}" ;;
+    /*) ;;
+    *) MEDIA_ROOT="$ROOT/$MEDIA_ROOT" ;;
+  esac
+fi
 if [ -z "$LOG_DIR" ]; then
-  LOG_DIR="$ROOT/logs"
+  LOG_DIR="$MEDIA_ROOT/logs"
 else
   case "$LOG_DIR" in
     \~) LOG_DIR="$HOME" ;;
@@ -69,8 +98,8 @@ fi
 readonly LOG_DIR_USABLE
 export LOG_DIR_USABLE
 
-# 后续 guard/audit/doctor 的输出统一落到 LOG_DIR。
-mkdir -p "$ROOT/logs" 2>/dev/null || true
+# 后续 guard/audit/doctor 的输出统一落到 LOG_DIR。不要把日志预创建到源码根，
+# 否则即使不再写入，也会继续制造“两份日志目录”的假象。
 
 # 先执行完全访问守卫：即使 launchd 因 TCC 无法读项目，也能自愈 Codex 的
 # 权限配置。优先使用随脚本一起安装到 LaunchAgents 的独立副本，避免 launchd

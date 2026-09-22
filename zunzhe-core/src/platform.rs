@@ -59,17 +59,25 @@ fn upload_list_failure_message(official: &str, rsshub: &str, ytdlp: &str) -> Str
     } else {
         parts.join("；")
     };
-    // 网络故障优先判断：即使 detail 里同时带“签名失败/请求失败”和
-    // “解析失败/超时”，根本原因也是网络，不能误导成配置 cookie。
+    // 判定顺序很有讲究：
+    // 1) 网络故障优先——即使同时带“请求失败”和“风控”，根因也是网络；
+    // 2) “-403 访问权限不足/需要登录态”单独成一档——此时风控已过，只差登录，
+    //    提示用户去配置 B站 cookie 才是唯一正解，不能笼统说“412 风控”；
+    // 3) 其余风控类（-352/-799/412/签名）再归为风控档。
     let hint = if detail.contains("解析失败")
         || detail.contains("请求失败")
         || detail.contains("DNS")
         || detail.contains("timed out")
         || detail.contains("Timeout")
         || detail.contains("超时")
+        || detail.contains("不可达")
     {
         "若为网络/DNS 故障请检查网络后重试".to_string()
-    } else if detail.contains("412")
+    } else if detail.contains("访问权限不足") || detail.contains("-403") {
+        "B站该接口需要登录态，请在桌面端「B站授权」中勾选登录账号后再试".to_string()
+    } else if detail.contains("-352")
+        || detail.contains("-799")
+        || detail.contains("412")
         || detail.contains("风控")
         || detail.contains("403")
         || detail.contains("wbi")
@@ -80,6 +88,18 @@ fn upload_list_failure_message(official: &str, rsshub: &str, ytdlp: &str) -> Str
         "可稍后重试或检查 B站 cookie".to_string()
     };
     format!("B站投稿列表拉取失败: {detail}（{hint}）")
+}
+
+/// 构造 RSSHub 路由 URL：空配置保留公共实例；非空配置允许本地/自建实例，
+/// 并容忍末尾斜杠，避免拼出 `//bilibili/...`。
+fn rsshub_url(configured: &str, mid: &str) -> String {
+    let base = configured.trim().trim_end_matches('/');
+    let base = if base.is_empty() {
+        "https://rsshub.app"
+    } else {
+        base
+    };
+    format!("{base}/bilibili/user/video/{mid}")
 }
 
 /// 用 B 站 WBI 公钥和投稿列表参数生成签名查询串。
@@ -111,6 +131,43 @@ fn build_wbi_query(
     let mixin = mixin_key(img_key, sub_key);
     let digest = md5_hex(&format!("{query}{mixin}"));
     format!("{query}&w_rid={digest}")
+}
+
+/// 合并两组 Cookie 头：以 `base` 为主，仅追加 `extra` 中 base 没有的键。
+///
+/// 用于「登录态 Cookie + 匿名设备指纹」叠加：登录态字段（如 SESSDATA）
+/// 绝不能被匿名指纹覆盖，缺失的设备字段（buvid3/buvid4/b_lsid）才补进来。
+fn merge_cookie_headers(base: &str, extra: &str) -> String {
+    let mut seen: Vec<String> = Vec::new();
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    // 先 base 后 extra：先到先得，同名键只保留第一次出现的值，
+    // 因此登录态字段（base）不会被匿名指纹（extra）覆盖。
+    for source in [base, extra] {
+        for pair in source.split(';') {
+            let pair = pair.trim();
+            if pair.is_empty() {
+                continue;
+            }
+            let Some((key, value)) = pair.split_once('=') else {
+                continue;
+            };
+            let key = key.trim();
+            let value = value.trim();
+            if key.is_empty() || value.is_empty() {
+                continue;
+            }
+            let lower = key.to_ascii_lowercase();
+            if !seen.contains(&lower) {
+                seen.push(lower);
+                pairs.push((key.to_string(), value.to_string()));
+            }
+        }
+    }
+    pairs
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// 判断 B站投稿列表是否应继续翻页。
@@ -154,7 +211,7 @@ pub struct BilibiliAdapter {
 impl Default for BilibiliAdapter {
     fn default() -> Self {
         Self {
-            client: reqwest::Client::builder()
+            client: crate::net::client_builder()
                 .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
                 .timeout(std::time::Duration::from_secs(20))
                 .build()
@@ -166,15 +223,19 @@ impl Default for BilibiliAdapter {
 }
 
 impl BilibiliAdapter {
-    /// 请求一次 B站官方投稿接口并解析完整元数据；返回 `(videos, total)`。
-    /// `total` 是 `data.page.count`（总投稿数，可能缺失），供分页判断是否
-    /// 还有下一页。空列表表示需要上层换下一组兜底。
-    async fn request_upload_ids(
+    /// 请求一次 B站官方投稿接口，解析完整元数据并返回可读失败原因。
+    ///
+    /// 返回 `((videos, total), reason)`：
+    /// - `total` 是 `data.page.count`（总投稿数，可能缺失），供分页判断；
+    /// - `reason` 非空表示本页确有可解释的失败（如 `-352 风控校验失败` /
+    ///   `-403 访问权限不足`），供顶层区分“风控”与“仅差登录”，避免日志
+    ///   一律归因为 412 误导用户；空列表表示需要上层换下一组兜底。
+    async fn request_upload_ids_reason(
         &self,
         signed_query: &str,
         headers: &reqwest::header::HeaderMap,
         count: u32,
-    ) -> (Vec<VideoMeta>, Option<u32>) {
+    ) -> ((Vec<VideoMeta>, Option<u32>), String) {
         let signed = format!("https://api.bilibili.com/x/space/wbi/arc/search?{signed_query}");
         let Ok(resp) = self
             .client
@@ -183,25 +244,49 @@ impl BilibiliAdapter {
             .send()
             .await
         else {
-            return (Vec::new(), None);
+            return ((Vec::new(), None), "官方接口请求发送失败".to_string());
         };
         // HTTP 层必须是成功状态，B站 412/5xx 时继续走 RSSHub/yt-dlp，
         // 不能让 HTML 或错误 JSON 被当成“空列表”。
-        if !resp.status().is_success() {
-            return (Vec::new(), None);
+        let status = resp.status();
+        if !status.is_success() {
+            return (
+                (Vec::new(), None),
+                format!("官方接口返回 HTTP {status}（多为 412 风控）"),
+            );
         }
         let Ok(data) = resp.json::<serde_json::Value>().await else {
-            return (Vec::new(), None);
+            return (
+                (Vec::new(), None),
+                "官方接口返回非 JSON（可能被风控页替换）".to_string(),
+            );
         };
+        let code = data["code"].as_i64().unwrap_or(-1);
+        if code != 0 {
+            let message = data["message"].as_str().unwrap_or("未知错误");
+            let hint = match code {
+                -352 => "（风控校验失败：设备指纹或出口 IP 被拦）",
+                -403 => "（风控已过但访问权限不足：该空间接口需要登录态，请配置 B站 cookie）",
+                -799 => "（请求过于频繁：出口 IP 被限流）",
+                _ => "",
+            };
+            return (
+                (Vec::new(), None),
+                format!("官方接口业务错误 code={code} {message}{hint}"),
+            );
+        }
         let total = data["data"]["page"]["count"]
             .as_u64()
             .and_then(|n| u32::try_from(n).ok());
-        (parse_official_upload_response(&data, count), total)
+        (
+            (parse_official_upload_response(&data, count), total),
+            String::new(),
+        )
     }
 
     /// 取 B 站 wbi 图片并生成查询签名（w_rid/wts）。失败返回空串，调用方走无签名兜底。
     async fn wbi_query(&self, mid: &str, count: u32, page: u32) -> anyhow::Result<String> {
-        let client = reqwest::Client::builder()
+        let client = crate::net::client_builder()
             .timeout(std::time::Duration::from_secs(20))
             .build()
             .unwrap_or_default();
@@ -338,6 +423,26 @@ impl BilibiliAdapter {
         }
     }
 
+    /// 在投稿列表 Cookie 之上合并匿名设备指纹（buvid3/buvid4/b_lsid）。
+    ///
+    /// - 先取账号/浏览器 Cookie（含 SESSDATA 等登录态）；
+    /// - 再补匿名设备指纹，仅追加缺失字段，绝不覆盖登录态字段；
+    /// - 设备指纹获取失败时退回原 Cookie，不影响原有行为。
+    async fn upload_list_cookie_with_fingerprint(&self) -> String {
+        let base = self.upload_list_cookie();
+        let Some(anon) = ensure_anon_cookie(&self.project_dir).await else {
+            return base;
+        };
+        let Ok(text) = std::fs::read_to_string(anon) else {
+            return base;
+        };
+        let fingerprint = cookie_header_from_netscape_public(&text);
+        if fingerprint.is_empty() {
+            return base;
+        }
+        merge_cookie_headers(&base, &fingerprint)
+    }
+
     pub fn with_cookie_and_project_dir(cookie: impl Into<String>, project_dir: PathBuf) -> Self {
         Self {
             cookie: cookie.into(),
@@ -462,13 +567,24 @@ impl Platform for BilibiliAdapter {
                 let (next, err) = self.upload_ids_rsshub(&mid, count).await;
                 bvids = next;
                 rsshub_err = err.clone();
-                tracing::warn!("B站 RSSHub 投稿列表返回 {} 条 ({err})", bvids.len());
+                // 这一层是前一级失败后的兜底：拿到了内容就说明链路救回来了，
+                // 不该按 WARN 记 —— 否则「返回 30 条」这种好消息会把日志刷成
+                // 一片红，真故障反而被淹没。真的 0 条才值得 WARN。
+                if bvids.is_empty() {
+                    tracing::warn!("B站 RSSHub 兜底也未返回投稿 (0 条) ({err})");
+                } else {
+                    tracing::debug!("B站 RSSHub 兜底返回 {} 条", bvids.len());
+                }
             }
             if bvids.is_empty() {
                 let (next, err) = self.upload_ids_ytdlp(&mid, count).await;
                 bvids = next;
                 ytdlp_err = err.clone();
-                tracing::warn!("B站 yt-dlp 投稿列表返回 {} 条 ({err})", bvids.len());
+                if bvids.is_empty() {
+                    tracing::warn!("B站 yt-dlp 兜底也未返回投稿 (0 条) ({err})");
+                } else {
+                    tracing::debug!("B站 yt-dlp 兜底返回 {} 条", bvids.len());
+                }
             }
             if bvids.is_empty() {
                 return Err(anyhow!(upload_list_failure_message(
@@ -499,8 +615,15 @@ impl BilibiliAdapter {
     /// 空串表示“无具体原因可描述”。
     async fn upload_ids_official(&self, mid: &str, count: u32) -> (Vec<VideoMeta>, String) {
         // 旧 Python 的投稿列表接口明确不使用匿名 buvid：那会更容易触发 412。
-        // 这里只使用用户配置或浏览器授权 Cookie，不补匿名设备 Cookie。
-        let cookie = self.upload_list_cookie();
+        // 这里在用户配置/浏览器授权 Cookie 之上，再补匿名设备指纹
+        // （buvid3/buvid4/b_lsid），但不覆盖已有的登录态字段。
+        //
+        // 24× 实测：space/wbi/arc/search 的风控是三级递进——
+        //   匿名无指纹            → HTTP 412 / -799 硬拦截
+        //   仅 buvid3             → -352 风控校验失败
+        //   buvid3+buvid4+b_lsid  → -403 访问权限不足（风控已过，仅差登录）
+        // 补齐指纹能让错误提示准确区分“风控”与“需登录”，不再误导用户。
+        let cookie = self.upload_list_cookie_with_fingerprint().await;
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             reqwest::header::REFERER,
@@ -537,13 +660,19 @@ impl BilibiliAdapter {
                     break;
                 }
             };
-            let (videos, page_total) = self.request_upload_ids(&signed, &headers, page_size).await;
+            let ((videos, page_total), page_reason) = self
+                .request_upload_ids_reason(&signed, &headers, page_size)
+                .await;
             if total.is_none() {
                 total = page_total;
             }
             if videos.is_empty() {
                 if reason.is_empty() {
-                    reason = "官方 wbi 接口未返回 BV（可能是 412 风控或接口变更）".to_string();
+                    reason = if page_reason.is_empty() {
+                        "官方 wbi 接口未返回 BV（可能是 412 风控或接口变更）".to_string()
+                    } else {
+                        page_reason
+                    };
                 }
                 break;
             }
@@ -560,7 +689,11 @@ impl BilibiliAdapter {
     }
 
     async fn upload_ids_rsshub(&self, mid: &str, count: u32) -> (Vec<String>, String) {
-        let rss = format!("https://rsshub.app/bilibili/user/video/{mid}");
+        let configured = crate::config::Config::load(&self.project_dir)
+            .ok()
+            .map(|c| c.get_main("网络", "RSSHub 地址"))
+            .unwrap_or_default();
+        let rss = rsshub_url(&configured, mid);
         match self.client.get(&rss).send().await {
             Ok(resp) => {
                 let status = resp.status();
@@ -635,6 +768,11 @@ impl BilibiliAdapter {
                 }
                 cmd.args(["--print", "%(id)s"])
                     .arg(format!("https://space.bilibili.com/{mid}/video"));
+                // 出站分流：按目标 URL 决定直连或走用户配置的出站代理。
+                cmd.args(
+                    crate::net::policy()
+                        .ytdlp_proxy_args(&format!("https://space.bilibili.com/{mid}/video")),
+                );
                 if let Some(cookie_file) = &cookie_file {
                     cmd.args(["--cookies", cookie_file.display().to_string().as_str()]);
                 }
@@ -893,7 +1031,7 @@ pub struct RssAdapter {
 impl Default for RssAdapter {
     fn default() -> Self {
         Self {
-            client: reqwest::Client::builder()
+            client: crate::net::client_builder()
                 .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
                 .timeout(std::time::Duration::from_secs(20))
                 .build()
@@ -1130,6 +1268,147 @@ fn normalize_rss_date(raw: Option<String>) -> String {
     }
 }
 
+/// 抖音适配器：用 Electron 内核加载抖音用户主页，拦截 `/web/aweme/post`
+/// 接口响应提取视频列表。抖音网页接口有严格 WAF 反爬且要求登录态，
+/// 纯 HTTP 请求会直接被拒，因此复用项目已有的 Electron 隐藏浏览器能力
+/// （与 B站 `bili-video-list.cjs` 同一套临时文件协议）。
+#[derive(Debug)]
+pub struct DouyinAdapter {
+    project_dir: PathBuf,
+}
+
+impl DouyinAdapter {
+    pub fn new(project_dir: PathBuf) -> Self {
+        Self { project_dir }
+    }
+
+    /// 抖音登录态 Cookie 的 Netscape 文件路径（由 douyin-cookie.cjs 导出）。
+    fn cookie_path(&self) -> PathBuf {
+        crate::paths::run_dir(&self.project_dir).join("douyin_browser_cookies.txt")
+    }
+
+    /// 从抖音用户主页 URL 提取 sec_uid（`MS4wLjABAAAA` 开头的加密 UID）。
+    /// 支持 `douyin.com/user/<sec_uid>` 长链；短链 `v.douyin.com/xxx` 需先解析，
+    /// 这里先只识别长链，短链返回 None 并提示用户换成完整主页链接。
+    fn sec_uid_from_url(url: &str) -> Option<String> {
+        if let Some(rest) = url.split("douyin.com/user/").nth(1) {
+            let uid = rest.split(['/', '?', '&']).next().unwrap_or("").trim();
+            if uid.starts_with("MS4wLjABAAAA") {
+                return Some(uid.to_string());
+            }
+        }
+        None
+    }
+
+    /// 把 Electron 返回的毫秒时间戳转成 `YYYY-MM-DD HH:MM:SS`。
+    fn ts_to_date(ts_ms: i64) -> String {
+        if ts_ms <= 0 {
+            return String::new();
+        }
+        chrono::DateTime::from_timestamp(ts_ms / 1000, 0)
+            .map(|dt| {
+                dt.with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string()
+            })
+            .unwrap_or_default()
+    }
+}
+
+impl Platform for DouyinAdapter {
+    fn name(&self) -> &'static str {
+        "douyin"
+    }
+
+    fn list_videos<'a>(
+        &'a self,
+        url: &'a str,
+        count: u32,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<VideoMeta>>> + Send + 'a>> {
+        Box::pin(async move {
+            let sec_uid = Self::sec_uid_from_url(url).ok_or_else(|| {
+                anyhow!(
+                    "抖音视频源需要「完整主页链接」（douyin.com/user/MS4wLjABAAAA... 开头），\
+                     短链或抖音号无法直接识别，请在抖音 App 打开博主主页 → 分享 → 复制链接"
+                )
+            })?;
+            let cookie_path = self.cookie_path();
+            if !cookie_path.exists() {
+                return Err(anyhow!(
+                    "尚未登录抖音：缺少 {}，请先在桌面端完成「抖音授权」扫码登录",
+                    cookie_path.display()
+                ));
+            }
+            let target = format!("https://www.douyin.com/user/{sec_uid}");
+            // Electron runner 自己读取 douyin_browser_cookies.txt 并注入；
+            // payload 只需要目标 URL（FUPAN_SCRIPT_FILE 存 URL，与 B站脚本约定一致）。
+            let result = crate::bilibili_electron::run_electron_script(
+                &self.project_dir,
+                &target,
+                &[],
+                std::time::Duration::from_secs(90),
+                "douyin-video-list.cjs",
+            )
+            .await
+            .with_context(|| format!("抖音 Electron 列表提取失败: {target}"))?;
+
+            let value = result.value;
+            let items = value
+                .get("items")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "抖音列表提取返回异常: {}",
+                        value
+                            .get("error")
+                            .and_then(|e| e.as_str())
+                            .unwrap_or("无 items 字段")
+                    )
+                })?;
+
+            let mut videos = Vec::with_capacity(items.len());
+            for item in items {
+                let id = item.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+                if id.is_empty() {
+                    continue;
+                }
+                let title = item
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let url = item
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&format!("https://www.douyin.com/video/{id}"))
+                    .to_string();
+                let cover = item
+                    .get("cover")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let created_at = item.get("created_at").and_then(|v| v.as_i64()).unwrap_or(0);
+                let duration = item.get("duration").and_then(|v| v.as_i64()).unwrap_or(0);
+                videos.push(VideoMeta {
+                    id: id.to_string(),
+                    platform: "douyin".to_string(),
+                    url,
+                    title,
+                    cover,
+                    published_at: Self::ts_to_date(created_at),
+                    duration,
+                });
+            }
+            if videos.is_empty() {
+                return Err(anyhow!(
+                    "抖音列表提取成功但为空（博主可能暂无作品或触发风控）"
+                ));
+            }
+            Ok(videos.into_iter().take(count as usize).collect())
+        })
+    }
+}
+
 /// 带项目根的平台注册表：yt-dlp 兜底按项目 .venv 查找，跨目录运行也可用。
 pub fn resolve_with_project_dir(url: &str, project_dir: &Path) -> Box<dyn Platform> {
     if url.contains("bilibili.com") || url.contains("b23.tv") {
@@ -1141,6 +1420,8 @@ pub fn resolve_with_project_dir(url: &str, project_dir: &Path) -> Box<dyn Platfo
             cookie,
             project_dir.to_path_buf(),
         ))
+    } else if url.contains("douyin.com") {
+        Box::new(DouyinAdapter::new(project_dir.to_path_buf()))
     } else {
         Box::new(RssAdapter::new())
     }
@@ -1151,9 +1432,97 @@ mod tests {
     use super::*;
 
     #[test]
+    fn merge_cookie_headers_keeps_login_state_and_appends_fingerprint() {
+        // 登录态字段（SESSDATA）必须保留；匿名指纹里缺失的 buvid 才补入。
+        let base = "SESSDATA=abc123; bili_jct=def456";
+        let extra = "buvid3=B3; buvid4=B4; b_lsid=LSID_1";
+        let merged = merge_cookie_headers(base, extra);
+        assert!(merged.contains("SESSDATA=abc123"));
+        assert!(merged.contains("bili_jct=def456"));
+        assert!(merged.contains("buvid3=B3"));
+        assert!(merged.contains("buvid4=B4"));
+        assert!(merged.contains("b_lsid=LSID_1"));
+    }
+
+    #[test]
+    fn merge_cookie_headers_never_overrides_base_values() {
+        // 同名键冲突时以 base（登录态）为准，绝不被匿名指纹覆盖。
+        let base = "buvid3=REAL_LOGIN_BUVID";
+        let extra = "buvid3=ANON_BUVID; buvid4=B4";
+        let merged = merge_cookie_headers(base, extra);
+        assert!(merged.contains("buvid3=REAL_LOGIN_BUVID"));
+        assert!(!merged.contains("ANON_BUVID"));
+        assert!(merged.contains("buvid4=B4"));
+    }
+
+    #[test]
+    fn merge_cookie_headers_handles_empty_sides() {
+        assert_eq!(merge_cookie_headers("", ""), "");
+        assert_eq!(merge_cookie_headers("A=1", ""), "A=1");
+        assert_eq!(merge_cookie_headers("", "B=2"), "B=2");
+        // 空片段与无等号片段被忽略，不产生残缺项。
+        assert_eq!(merge_cookie_headers("A=1; ; jUNK", ""), "A=1");
+    }
+
+    #[test]
+    fn failure_message_distinguishes_login_required_from_risk_control() {
+        // -403 访问权限不足：风控已过、仅差登录，提示必须指向“勾选登录账号”。
+        let login_msg = upload_list_failure_message(
+            "官方接口业务错误 code=-403 访问权限不足（风控已过但访问权限不足：该空间接口需要登录态，请配置 B站 cookie）",
+            "",
+            "",
+        );
+        assert!(login_msg.contains("勾选登录账号"), "实际: {login_msg}");
+
+        // -352 风控：仍归为风控档，提示配置 cookie。
+        let risk_msg = upload_list_failure_message("-352 风控校验失败", "", "");
+        assert!(risk_msg.contains("412 风控"), "实际: {risk_msg}");
+        assert!(!risk_msg.contains("勾选登录账号"));
+
+        // 网络故障优先于一切：即使同时含风控字样也提示检查网络。
+        let net_msg =
+            upload_list_failure_message("官方接口请求发送失败", "RSSHub 请求失败: 连接超时", "");
+        assert!(net_msg.contains("检查网络"), "实际: {net_msg}");
+    }
+
+    #[test]
+    fn rsshub_url_can_use_configured_local_instance() {
+        assert_eq!(
+            rsshub_url("", "946974"),
+            "https://rsshub.app/bilibili/user/video/946974"
+        );
+        assert_eq!(
+            rsshub_url("http://127.0.0.1:1200/", "946974"),
+            "http://127.0.0.1:1200/bilibili/user/video/946974"
+        );
+    }
+
+    #[test]
     fn extracts_bvids_ordered_unique() {
         let text = "BV1abcDEFghi BV1abcDEFghi BV1xyz123456";
         assert_eq!(extract_bvids(text), vec!["BV1abcDEFghi", "BV1xyz123456"]);
+    }
+
+    #[test]
+    fn douyin_sec_uid_extraction() {
+        // 完整主页长链可提取加密 sec_uid
+        let url = "https://www.douyin.com/user/MS4wLjABAAAAabc123def456";
+        assert_eq!(
+            DouyinAdapter::sec_uid_from_url(url).as_deref(),
+            Some("MS4wLjABAAAAabc123def456")
+        );
+        // 带查询参数/尾斜杠也能正确截断
+        let url2 = "https://www.douyin.com/user/MS4wLjABAAAAxyz?from_tab_name=main";
+        assert_eq!(
+            DouyinAdapter::sec_uid_from_url(url2).as_deref(),
+            Some("MS4wLjABAAAAxyz")
+        );
+        // 非加密 UID（抖音号/昵称）无法识别，返回 None 提示换完整链接
+        assert!(
+            DouyinAdapter::sec_uid_from_url("https://www.douyin.com/user/xiguahochi96").is_none()
+        );
+        // 非 user 路径不误判
+        assert!(DouyinAdapter::sec_uid_from_url("https://www.douyin.com/video/123").is_none());
     }
 
     #[test]

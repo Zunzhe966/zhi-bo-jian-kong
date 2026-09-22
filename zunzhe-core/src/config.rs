@@ -135,6 +135,43 @@ impl Config {
         }
     }
 
+    /// 视频源检查间隔（秒），取自 `config/fupan_config.ini [视频监控] 检查间隔秒`。
+    ///
+    /// 这个键曾经是个「死旋钮」：界面能改、配置文件能改，但调度器从不读它，
+    /// 实际节拍锁死在 CLI `--interval`（默认 60 秒）。后果是用户以为调成了
+    /// 15 分钟一轮，实际每 60 秒就打一轮 B站投稿接口，把 412 风控打了出来。
+    /// 现在调度器真的按它节流视频轮次（直播检测不受影响，仍按 CLI 节拍跑，
+    /// 因为开播要尽快发现）。
+    ///
+    /// 边界：下限 60 秒（再密就是自己找风控），上限 24 小时（写成 0 或负数时
+    /// 不至于变成「永远不再查」）。缺失或非法时回退 900 秒。
+    pub fn video_check_interval_secs(&self) -> u64 {
+        const DEFAULT_SECS: u64 = 900;
+        const MIN_SECS: u64 = 60;
+        const MAX_SECS: u64 = 24 * 3600;
+        self.get_fupan("视频监控", "检查间隔秒")
+            .trim()
+            .parse::<u64>()
+            .map(|v| v.clamp(MIN_SECS, MAX_SECS))
+            .unwrap_or(DEFAULT_SECS)
+    }
+
+    /// 复盘流水线超时（秒），取自 `config/fupan_config.ini [复盘] 任务超时秒数`。
+    ///
+    /// 58 分钟长视频在纯 CPU + small 模型上会接近旧 3600 秒上限；把上限
+    /// 写死会让“真实转写”反复撞线。这里允许用户按机器性能调整，默认 6 小时，
+    /// 同时保留下限（至少 60 秒）和上限（24 小时）避免配置成 0 或无限等待。
+    pub fn pipeline_timeout_secs(&self) -> u64 {
+        const DEFAULT_SECS: u64 = 6 * 3600;
+        const MIN_SECS: u64 = 60;
+        const MAX_SECS: u64 = 24 * 3600;
+        self.get_fupan("复盘", "任务超时秒数")
+            .trim()
+            .parse::<u64>()
+            .map(|v| v.clamp(MIN_SECS, MAX_SECS))
+            .unwrap_or(DEFAULT_SECS)
+    }
+
     pub fn is_yes_main(&self, section: &str, key: &str, default: bool) -> bool {
         let v = self.get_main(section, key);
         if v.is_empty() {
@@ -265,7 +302,9 @@ impl IniFile {
     /// 主配置 `config.ini` 与旧 Python 使用 `RawConfigParser(optionxform=str)`，
     /// 因此同一个键可能以 `SMTP` 或 `smtp` 混用；Rust 若严格匹配会漏读邮箱、
     /// SSL、推送通道等关键项。这里按现存键做一次大小写折叠匹配。
-    fn get_case_insensitive(&self, section: &str, key: &str) -> String {
+    /// 大小写不敏感取值。`paths` 模块直接读 `config.ini` 也要用同一套匹配规则，
+    /// 否则同一份文件在 `Config` 与路径解析里可能给出不同结果。
+    pub(crate) fn get_case_insensitive(&self, section: &str, key: &str) -> String {
         if let Some(map) = self.data.get(section) {
             if let Some(value) = map.get(key) {
                 return value.trim().to_string();
@@ -970,6 +1009,79 @@ SMTP邮件服务器端口 = 465
             fupan: ini,
         };
         assert!(!cfg.is_yes_fupan("视频监控", "自动下载新视频(是/否)", true));
+    }
+
+    /// 构造一个只带 fupan_config 的 Config，用于验证视频监控段取值。
+    fn cfg_with_fupan(text: &str) -> Config {
+        Config {
+            project_dir: PathBuf::from("."),
+            config_ini: PathBuf::from("config.ini"),
+            fupan_config_ini: PathBuf::from("fupan_config.ini"),
+            main: IniFile::default(),
+            fupan: IniFile::parse(text).unwrap(),
+        }
+    }
+
+    /// 「检查间隔秒」必须是调度器真读的活配置，不是能改却不生效的死旋钮。
+    #[test]
+    fn video_check_interval_reads_fupan_config() {
+        assert_eq!(
+            cfg_with_fupan("[视频监控]\n检查间隔秒 = 900\n").video_check_interval_secs(),
+            900
+        );
+        // 界面改小也生效
+        assert_eq!(
+            cfg_with_fupan("[视频监控]\n检查间隔秒 = 600\n").video_check_interval_secs(),
+            600
+        );
+    }
+
+    #[test]
+    fn video_check_interval_clamps_and_falls_back() {
+        // 缺失 → 默认 900，不能变成 0（0 会让视频检查永远不再执行）
+        assert_eq!(
+            cfg_with_fupan("[视频监控]\n").video_check_interval_secs(),
+            900
+        );
+        // 非数字 → 默认
+        assert_eq!(
+            cfg_with_fupan("[视频监控]\n检查间隔秒 = 十分钟\n").video_check_interval_secs(),
+            900
+        );
+        // 写 0 → 抬到下限 60，而不是永不检查
+        assert_eq!(
+            cfg_with_fupan("[视频监控]\n检查间隔秒 = 0\n").video_check_interval_secs(),
+            60
+        );
+        // 比 tick 更密 → 抬到下限 60，避免自己找风控
+        assert_eq!(
+            cfg_with_fupan("[视频监控]\n检查间隔秒 = 5\n").video_check_interval_secs(),
+            60
+        );
+        // 超大 → 封顶 24 小时
+        assert_eq!(
+            cfg_with_fupan("[视频监控]\n检查间隔秒 = 999999999\n").video_check_interval_secs(),
+            24 * 3600
+        );
+    }
+
+    /// 复盘长视频不能沿用写死的 60 分钟上限；配置缺省必须给足余量，非法值
+    /// 也不能变成 0 或无限等待。
+    #[test]
+    fn pipeline_timeout_reads_config_and_clamps() {
+        assert_eq!(
+            cfg_with_fupan("[复盘]\n任务超时秒数 = 21600\n").pipeline_timeout_secs(),
+            21600
+        );
+        assert_eq!(cfg_with_fupan("[复盘]\n").pipeline_timeout_secs(), 6 * 3600);
+        assert_eq!(
+            cfg_with_fupan("[复盘]\n任务超时秒数 = 0\n").pipeline_timeout_secs(),
+            60
+        );
+        assert_eq!(
+            cfg_with_fupan("[复盘]\n任务超时秒数 = 999999999\n").pipeline_timeout_secs(),
+            24 * 3600
+        );
     }
 
     #[test]

@@ -1,11 +1,17 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::{
     config, config_api, db, download, live_monitor, notify, pipeline_bridge, platform, scheduler,
     service, training_data, video_library, watchlist,
 };
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use serde_json::json;
+
+fn source_health_is_ok(failing: u64, cooling: u64) -> bool {
+    failing == 0 && cooling == 0
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "zunzhe-core", version, about = "尊者直播监控 Rust 核心 daemon")]
@@ -166,6 +172,8 @@ enum Command {
     SetConfigBulk { updates: String },
     /// 返回配置结构说明
     Schema,
+    /// 返回产物、日志和数据库等真实路径（只读，不打开数据库）
+    Paths,
     /// 打印 MCP 接入说明（Python 版兼容命令）
     McpInfo,
     /// 列出复盘产物
@@ -185,7 +193,8 @@ enum Command {
         interval: u64,
     },
     /// 启动 MCP stdio server
-    Mcp,
+    #[command(name = "extension", alias = "mcp")]
+    Extension,
     /// 启动 Rust 核心 daemon（统一接管直播与视频监控）
     Start,
     /// 确保服务运行（桌面端/兼容层入口）
@@ -217,14 +226,59 @@ enum Command {
     },
 }
 
+fn storage_paths_for(
+    project_dir: &std::path::Path,
+    db_override: Option<PathBuf>,
+) -> crate::paths::StoragePaths {
+    let mut paths = (*crate::paths::storage(project_dir)).clone();
+    if let Some(db) = db_override {
+        paths.database = db;
+    }
+    paths
+}
+
+fn paths_json(paths: &crate::paths::StoragePaths) -> serde_json::Value {
+    paths.as_json()
+}
+
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let start_dir = std::env::current_dir()?;
     let cfg = config::Config::load(&start_dir)?;
     // 所有路径以项目根为基准，避免从 zunzhe-core/ 运行时把 DB/下载写错位置。
     let project_dir = cfg.project_dir.clone();
-    let db_path = cli.db.unwrap_or_else(|| project_dir.join("zunzhe-core.db"));
-    let pool = db::open_pool(&db_path).await?;
-    let fupan_dir = project_dir.join("fupan_output");
+    let paths = storage_paths_for(&project_dir, cli.db);
+    // 桌面端启动时用 `paths` 刷新可信根；它必须是纯只读查询。若先执行
+    // ensure_dirs，用户只是打开界面就会在外部盘创建一整套尚未使用的目录。
+    if matches!(cli.command, Command::Paths) {
+        println!("{}", paths_json(&paths));
+        return Ok(());
+    }
+    // 用户可以把数据根改到一块全新的盘/目录。SQLite 不会替我们创建父目录，
+    // 所以所有入口都必须在 open_pool 前把受管目录补齐；否则第一次
+    // status/extension 就会报 “unable to open database file”，配置看起来
+    // 生效了却什么也跑不了。这一步只做目录创建，不碰数据库内容，不能和
+    // 后面的维护/迁移一起被 extension 冷启动分流跳过。
+    crate::paths::ensure_dirs(&project_dir)
+        .with_context(|| format!("创建数据目录失败: {}", paths.media_root.display()))?;
+    // MCP 客户端在冷启动时会先发 `initialize`，协议发现不能被数据库维护、
+    // 旧库合并或 daemon 探测拖住。extension 的历史迁移与维护改由
+    // run_mcp 在首行请求后异步执行；这里提前分流，保证首响应只依赖
+    // 项目配置和一条 SQLite 连接。
+    if matches!(cli.command, Command::Extension) {
+        let pool = db::open_pool(&paths.database).await?;
+        return crate::extension::run_mcp(pool, &project_dir, Arc::new(cfg)).await;
+    }
+    if let Some(source) =
+        crate::paths::migrate_legacy_database_if_needed(&project_dir, &paths.database).await?
+    {
+        eprintln!(
+            "已将旧数据库在线备份到新数据根：{} -> {}（旧库保留）",
+            source.display(),
+            paths.database.display()
+        );
+    }
+    let pool = db::open_pool(&paths.database).await?;
+    let fupan_dir = paths.fupan.clone();
     // CLI 是独立入口之一：daemon 已接管时由 daemon 主循环负责维护，未接管时
     // 这里低频收敛 WAL/通知/任务/录制历史，避免长期只跑 CLI/MCP 无限膨胀。
     // 哨兵节流保证每个 CLI 进程不会重复 checkpoint；失败只记日志。
@@ -401,7 +455,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     json!({"ok": true, "new_videos": stats.videos_notified + stats.downloads,
                            "checked": stats.anchors_checked, "notified": stats.videos_notified,
                            "downloads": stats.downloads,
-                           "skipped_cooldown": stats.skipped_cooldown})
+                           "skipped_cooldown": stats.skipped_cooldown,
+                           "skipped_proxy_off": stats.skipped_proxy_off,
+                           "skipped_missing_credential": stats.skipped_missing_credential})
                 ),
                 Err(e) => println!("{}", json!({"ok": false, "error": e.to_string()})),
             }
@@ -658,6 +714,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Schema => {
             println!("{}", api.schema());
         }
+        // 已在打开数据库前分流返回；保留 arm 让命令枚举保持穷尽。
+        Command::Paths => unreachable!("paths 已在数据库打开前返回"),
         Command::McpInfo => {
             println!(
                 "{}",
@@ -670,7 +728,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             );
         }
         Command::Notes { name } => {
-            let notes = pipeline_bridge::list_notes(&fupan_dir, &name)?;
+            let notes = pipeline_bridge::list_notes(&paths.media_root, &fupan_dir, &name)?;
             println!("{}", json!({"ok": true, "notes": notes}));
         }
         Command::Status => {
@@ -689,10 +747,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             scheduler::run_daemon(pool.clone(), &project_dir, &cfg, interval, once, duration)
                 .await?;
         }
-        Command::Mcp => {
+        Command::Extension => {
             use std::sync::Arc;
             let cfg = Arc::new(cfg);
-            crate::mcp::run_mcp(pool.clone(), &project_dir, cfg).await?;
+            crate::extension::run_mcp(pool.clone(), &project_dir, cfg).await?;
         }
         Command::Process {
             file_path,
@@ -703,30 +761,34 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             // 且失败/重试/超时状态由复盘 worker 统一维护。
             // daemon 未运行时先拉起，否则入队后任务会一直躺着，用户以为在
             // 转写实际没有执行；与 download-video 的自动拉起语义保持一致。
-            if !service::rust_daemon_alive(&project_dir)
-                && let Err(e) = service::ensure_core(&project_dir)
-            {
-                println!(
-                    "{}",
-                    serde_json::to_string(&json!({
-                        "ok": false,
-                        "queued": false,
-                        "error": format!("复盘任务未入队，且 daemon 启动失败: {e:#}"),
-                    }))?
-                );
-                return Ok(());
-            }
-            let task_id =
+            let result =
                 download::enqueue_process(&pool, &project_dir, &file_path, &anchor_name).await?;
+            // 入队先落库，daemon 健康只作为结果字段返回；不能因为 launchd
+            // 探测慢而让 CLI/MCP 长时间无响应，也不能把任务丢失说成启动失败。
+            // 入队先落库，再确保 worker 会消费它。这里不能只“探测” daemon：
+            // 未运行时任务会永远躺在 pending，用户点了「转写」却看不到结果。
+            // 启动失败也不能丢掉已入队任务，因此把错误作为独立字段返回。
+            let (daemon_running, startup_error) = if service::rust_daemon_alive(&project_dir) {
+                (true, None)
+            } else {
+                match service::ensure_core(&project_dir) {
+                    Ok(_) => (service::rust_daemon_alive(&project_dir), None),
+                    Err(e) => (false, Some(format!("{e:#}"))),
+                }
+            };
             println!(
                 "{}",
                 serde_json::to_string(&json!({
                     "ok": true,
-                    "queued": true,
-                    "task_id": task_id,
+                    "queued": result.queued,
+                    "task_id": result.task_id,
+                    "status": result.status,
+                    "disposition": result.disposition,
+                    "daemon_running": daemon_running,
+                    "startup_error": startup_error,
                     "file": file_path,
                     "anchor": anchor_name,
-                    "hint": "已加入 daemon 复盘队列，转写/提炼/切片由后台 worker 处理"
+                    "hint": result.hint
                 }))?
             );
         }
@@ -794,7 +856,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                         "total": total,
                         "failing": failing,
                         "cooling": cooling,
-                        "ok": cooling == 0,
+                        "ok": source_health_is_ok(failing, cooling),
                     }),
                 );
             }
@@ -953,9 +1015,75 @@ mod tests {
     }
 
     #[test]
+    fn extension_and_mcp_parse_to_stdio_server() {
+        let extension =
+            Cli::try_parse_from(["zunzhe-core", "extension"]).expect("extension 应可解析");
+        assert!(matches!(extension.command, Command::Extension));
+
+        let mcp = Cli::try_parse_from(["zunzhe-core", "mcp"]).expect("mcp 别名应可解析");
+        assert!(matches!(mcp.command, Command::Extension));
+    }
+
+    #[test]
     fn mcp_info_requires_no_extra_args() {
         let cli = Cli::try_parse_from(["zunzhe-core", "mcp-info"]).unwrap();
         assert!(matches!(cli.command, Command::McpInfo));
+    }
+
+    #[test]
+    fn source_health_requires_no_failures_even_before_cooldown() {
+        // 连续失败但还没到 3 次冷却阈值时，源已经不稳定；CLI doctor 不能
+        // 继续报“健康”，否则与 status/extension 的口径不一致。
+        assert!(!source_health_is_ok(1, 0));
+        assert!(source_health_is_ok(0, 0));
+    }
+
+    #[test]
+    fn paths_command_is_available_for_desktop_allowlist() {
+        // Electron 启动时调用 `zunzhe-core paths` 获取真实的产物/数据库目录。
+        // 这个命令必须是一等 CLI 能力，不能只藏在 status.paths 里，否则
+        // 外部产物按钮会退回项目目录白名单并被静默拒绝。
+        let cli = Cli::try_parse_from(["zunzhe-core", "paths"])
+            .expect("paths 应可解析，桌面端可信根依赖它");
+        assert!(matches!(cli.command, Command::Paths));
+    }
+
+    #[test]
+    fn cli_storage_paths_follow_config_overrides() {
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-cli-paths-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let database = dir.join("custom-data").join("core.db");
+        let fupan = dir.join("custom-notes");
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::write(
+            dir.join("config").join("fupan_config.ini"),
+            "[转写]\n是否启用转写(是/否) = 是\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("config").join("config.ini"),
+            format!(
+                "[路径设置]\n产物根目录 = {}\n数据库文件 = {}\n复盘输出目录 = {}\n",
+                dir.join("products").display(),
+                database.display(),
+                fupan.display()
+            ),
+        )
+        .unwrap();
+
+        let cfg = config::Config::load(&dir).unwrap();
+        let paths = storage_paths_for(&cfg.project_dir, None);
+        assert_eq!(paths.database, database);
+        assert_eq!(paths.fupan, fupan);
+        assert_eq!(paths.logs, dir.join("products").join("logs"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

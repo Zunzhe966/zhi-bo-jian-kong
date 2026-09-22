@@ -85,7 +85,14 @@ impl VideoLibrary {
         anchor: &str,
         downloaded_only: bool,
     ) -> Result<Vec<Video>> {
-        db::get_videos(&self.pool, source_url, anchor, downloaded_only).await
+        let mut videos = db::get_videos(&self.pool, source_url, anchor, downloaded_only).await?;
+        // 把库里的封面路径解析成当前项目下真实可用的绝对路径：
+        // 新数据是相对路径直接拼接；旧数据若因项目迁移而失效，按文件名在
+        // 当前 covers 目录里自动找回，避免历史 30 条记录全部变成碎图标。
+        for v in videos.iter_mut() {
+            v.cover_cache = resolve_cover_cache(&self.fupan_dir, &v.cover_cache);
+        }
+        Ok(videos)
     }
 }
 
@@ -476,6 +483,12 @@ fn rename_replace(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 
 /// 下载封面到 fupan_output/covers/，失败返回原 URL。
+///
+/// 返回值是**相对项目根**的路径（如 `fupan_output/covers/BV1xxx.jpg`），而不是
+/// 绝对路径。原实现把 `dest.display()`（绝对路径）写进 `videos.cover_cache`，
+/// 一旦项目目录被移动（例如从 ~/Desktop 换到移动硬盘 /Volumes/...），库里所有
+/// 封面路径立刻失效，桌面端 `<img src="file://...">` 全部变成碎图标，而封面
+/// 文件其实还好端端躺在新的 covers 目录里。相对路径与项目根无关，可随项目迁移。
 pub async fn cache_cover(fupan_dir: &Path, cover_url: &str, video_id: &str) -> Result<String> {
     if cover_url.is_empty() {
         return Ok(String::new());
@@ -488,12 +501,13 @@ pub async fn cache_cover(fupan_dir: &Path, cover_url: &str, video_id: &str) -> R
         "jpg"
     };
     let dest = covers.join(format!("{video_id}.{ext}"));
+    let relative = relative_cover_path(fupan_dir, video_id, ext);
     if dest.exists() && dest.metadata().map(|m| m.len() > 0).unwrap_or(false) {
-        return Ok(dest.display().to_string());
+        return Ok(relative);
     }
     // 异步下载小封面；失败保留原 URL 作为兜底。封面图偶尔会慢或不可达，
     // 必须给请求加显式超时，避免视频库 upsert 卡住拖慢整个监控轮次。
-    let client = reqwest::Client::builder()
+    let client = crate::net::client_builder()
         .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)")
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -503,12 +517,54 @@ pub async fn cache_cover(fupan_dir: &Path, cover_url: &str, video_id: &str) -> R
     match client.get(&cover).send().await {
         Ok(resp) if resp.status().is_success() => match resp.bytes().await {
             Ok(bytes) if !bytes.is_empty() => Ok(crate::config::atomic_write(&dest, bytes)
-                .map(|_| dest.display().to_string())
+                .map(|_| relative.clone())
                 .unwrap_or_else(|_| cover.clone())),
             _ => Ok(cover),
         },
         _ => Ok(cover),
     }
+}
+
+/// covers 目录下封面文件的相对项目根路径。`fupan_dir` 是 `<project>/fupan_output`。
+fn relative_cover_path(fupan_dir: &Path, video_id: &str, ext: &str) -> String {
+    let dir_name = fupan_dir
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "fupan_output".to_string());
+    format!("{dir_name}/covers/{video_id}.{ext}")
+}
+
+/// 把库里存的历史绝对路径封面解析成当前项目下可用的绝对路径。
+///
+/// 兼容两种历史数据：
+/// - 新数据：相对路径（原样拼到项目根）；
+/// - 旧数据：绝对路径。若该绝对路径仍存在则直接用；若已失效（项目搬过家），
+///   则用文件名在**当前** covers 目录里找回同名文件，实现自动修复。
+///
+/// 找不到时返回空串，让调用方回退到原始 cover URL，而不是给前端一个死链。
+pub fn resolve_cover_cache(fupan_dir: &Path, stored: &str) -> String {
+    let stored = stored.trim();
+    if stored.is_empty() {
+        return String::new();
+    }
+    // 相对路径：直接拼到 fupan_dir 的父目录（项目根）。
+    if !Path::new(stored).is_absolute() {
+        let project_root = fupan_dir.parent().unwrap_or(Path::new("."));
+        let candidate = project_root.join(stored);
+        return candidate.display().to_string();
+    }
+    let stored_path = Path::new(stored);
+    if stored_path.exists() {
+        return stored_path.display().to_string();
+    }
+    // 绝对路径已失效（项目迁移过）：按文件名在当前 covers 目录里回收。
+    if let Some(name) = stored_path.file_name() {
+        let recovered = fupan_dir.join("covers").join(name);
+        if recovered.exists() {
+            return recovered.display().to_string();
+        }
+    }
+    String::new()
 }
 
 /// 清理不再被视频库引用的封面缓存文件。
@@ -568,6 +624,71 @@ mod tests {
     async fn cover_cache_missing_url_returns_empty() {
         let dir = std::env::temp_dir();
         assert_eq!(cache_cover(&dir, "", "x").await.unwrap(), "");
+    }
+
+    /// 回归：封面必须落库为相对路径。原实现存绝对路径，项目一旦搬目录，
+    /// 库里所有封面路径全部失效（桌面端封面全变碎图标）。
+    #[tokio::test]
+    async fn cached_cover_is_stored_relative_to_project() {
+        let root = std::env::temp_dir().join(format!(
+            "zunzhe-cover-relative-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let fupan_dir = root.join("fupan_output");
+        std::fs::create_dir_all(fupan_dir.join("covers")).unwrap();
+        // 预置一个已存在的封面文件，走“命中缓存”分支。
+        std::fs::write(fupan_dir.join("covers").join("BV1x.jpg"), b"img").unwrap();
+        let stored = cache_cover(&fupan_dir, "https://x.test/c.jpg", "BV1x")
+            .await
+            .unwrap();
+        assert_eq!(stored, "fupan_output/covers/BV1x.jpg");
+        assert!(!Path::new(&stored).is_absolute(), "不得再存绝对路径");
+        // 解析回绝对路径后必须真实存在。
+        let resolved = resolve_cover_cache(&fupan_dir, &stored);
+        assert!(Path::new(&resolved).exists(), "相对路径应能解析回真实文件");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 回归：项目搬家后，旧的绝对路径封面要能按文件名自动找回。
+    #[tokio::test]
+    async fn legacy_absolute_cover_is_recovered_after_project_move() {
+        let root = std::env::temp_dir().join(format!(
+            "zunzhe-cover-move-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let fupan_dir = root.join("fupan_output");
+        std::fs::create_dir_all(fupan_dir.join("covers")).unwrap();
+        std::fs::write(fupan_dir.join("covers").join("BV1y.jpg"), b"img").unwrap();
+
+        // 模拟旧库里的绝对路径，指向一个已经不存在的旧项目目录。
+        let stale = "/nonexistent-old-project/fupan_output/covers/BV1y.jpg";
+        let resolved = resolve_cover_cache(&fupan_dir, stale);
+        assert_eq!(
+            resolved,
+            fupan_dir
+                .join("covers")
+                .join("BV1y.jpg")
+                .display()
+                .to_string(),
+            "应在新 covers 目录里按文件名找回封面"
+        );
+        assert!(Path::new(&resolved).exists());
+
+        // 实在找不到时返回空串，让调用方回退到原始 cover URL，而不是死链。
+        assert_eq!(
+            resolve_cover_cache(&fupan_dir, "/nope/covers/missing.jpg"),
+            ""
+        );
+        assert_eq!(resolve_cover_cache(&fupan_dir, ""), "");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

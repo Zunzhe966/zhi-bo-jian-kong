@@ -39,6 +39,66 @@ OptionalStr = str | None
 OptionalDict = dict | None
 
 
+_BANDWIDTH_RE = re.compile(r'BANDWIDTH=(\d+)')
+
+
+def _parse_m3u8_bandwidth(resp: str) -> dict:
+    """把 master.m3u8 里每个变体 URL 精确映射到它自己的 BANDWIDTH。
+
+    逐行扫描：记住最近一条 `#EXT-X-STREAM-INF` 的 BANDWIDTH，遇到紧跟的
+    非注释、非空行（变体 URL）时完成配对，然后清空待配对值。
+
+    这样做避免了两种真实故障：
+    1. `findall` 与 URL 列表整体 `zip` 的长度不一致导致整体错位（选错画质）；
+    2. `url_to_bandwidth[url]` 对缺失条目抛 KeyError（直播解析直接失败）。
+    缺少 BANDWIDTH 的变体不写入字典，调用方用默认值兜底。
+    """
+    mapping: dict = {}
+    pending: OptionalStr = None
+    for raw_line in resp.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith('#'):
+            match = _BANDWIDTH_RE.search(line)
+            if match and line.startswith('#EXT-X-STREAM-INF'):
+                pending = match.group(1)
+            continue
+        if pending is not None:
+            mapping[line] = int(pending)
+            pending = None
+    if not mapping:
+        # 退化为旧的宽松行为：仅为能对上的前缀部分建映射，绝不抛 KeyError。
+        for bandwidth, url in zip(
+            _BANDWIDTH_RE.findall(resp),
+            [ln.strip() for ln in resp.splitlines() if ln.strip().endswith('m3u8')],
+            strict=False,
+        ):
+            mapping.setdefault(url, int(bandwidth))
+    return mapping
+
+
+def _pick_play_urls(play_url_list: List[str], resp: str) -> List[str]:
+    """按码率从高到低排序变体 URL，缺失码率的排在最后，绝不因缺字段抛异常。
+
+    调用方可能给 play_url 拼过前缀（如 url_prefix + i），因此这里用 **后缀匹配**：
+    只要某个变体 URL 以 m3u8 里的原始相对路径结尾，就认为它们对应同一条流。
+    """
+    mapping = _parse_m3u8_bandwidth(resp)
+
+    def bandwidth_of(play_url: str) -> int:
+        direct = mapping.get(play_url)
+        if direct is not None:
+            return direct
+        best = -1
+        for raw, bw in mapping.items():
+            if play_url.endswith(raw):
+                best = max(best, bw)
+        return best
+
+    return sorted(play_url_list, key=bandwidth_of, reverse=True)
+
+
 def get_params(url: str, params: str) -> OptionalStr:
     parsed_url = urllib.parse.urlparse(url)
     query_params = urllib.parse.parse_qs(parsed_url.query)
@@ -58,11 +118,10 @@ async def get_play_url_list(m3u8: str, proxy: OptionalStr = None, header: Option
         for i in resp.split('\n'):
             if i.strip().endswith('m3u8'):
                 play_url_list.append(i.strip())
-    bandwidth_pattern = re.compile(r'BANDWIDTH=(\d+)')
-    bandwidth_list = bandwidth_pattern.findall(resp)
-    url_to_bandwidth = {url: int(bandwidth) for bandwidth, url in zip(bandwidth_list, play_url_list)}
-    play_url_list = sorted(play_url_list, key=lambda url: url_to_bandwidth[url], reverse=True)
-    return play_url_list
+    # 严格按「EXT-X-STREAM-INF 行 → 紧随的 URL」就近配对。原实现按 findall 顺序整体
+    # zip，一旦某个变体缺少 BANDWIDTH（音频轨/未知码率）就会整体错位，轻则选错画质，
+    # 重则 url_to_bandwidth[url] 抛 KeyError 直接中断直播解析。
+    return _pick_play_urls(play_url_list, resp)
 
 
 async def get_douyin_web_stream_data(url: str, proxy_addr: OptionalStr = None, cookies: OptionalStr = None):
@@ -341,12 +400,13 @@ async def get_kuaishou_stream_data(url: str, proxy_addr: OptionalStr = None, coo
         print(f"Failed URL: {url} Error message: {error_msg}")
         return result
 
-    if not play_list.get('liveStream'):
-        print("IP banned. Please change device or network.")
-        return result
-
-    anchor_name = play_list['author'].get('name', '')
+    # 主播名优先提取（未开播时 liveStream 为空但仍可尝试拿昵称），避免下游 KeyError
+    anchor_name = (play_list.get('author') or {}).get('name', '')
     result.update({"anchor_name": anchor_name})
+
+    # 未开播：liveStream 为空是正常状态（非必然 IP banned），直接返回结构完整的结果
+    if not play_list.get('liveStream'):
+        return result
 
     if play_list['liveStream'].get("playUrls"):
         if 'h264' in play_list['liveStream']['playUrls']:
@@ -1058,11 +1118,7 @@ async def _fetch_web_stream_data_global(url: str, proxy_addr: OptionalStr = None
             for i in resp.split('\n'):
                 if not i.startswith('#') and i.strip():
                     play_url_list.append(url_prefix + i.strip())
-            bandwidth_pattern = re.compile(r'BANDWIDTH=(\d+)')
-            bandwidth_list = bandwidth_pattern.findall(resp)
-            url_to_bandwidth = {purl: int(bandwidth) for bandwidth, purl in zip(bandwidth_list, play_url_list)}
-            play_url_list = sorted(play_url_list, key=lambda purl: url_to_bandwidth[purl], reverse=True)
-            return play_url_list
+            return _pick_play_urls(play_url_list, resp)
 
         m3u8_url = 'https://global-media.sooplive.com/live/' + str(bj_id) + '/master.m3u8'
         result |= {
@@ -1124,11 +1180,9 @@ async def get_sooplive_stream_data(
         for i in resp.split('\n'):
             if i.startswith('auth_playlist'):
                 play_url_list.append(url_prefix + i.strip())
-        bandwidth_pattern = re.compile(r'BANDWIDTH=(\d+)')
-        bandwidth_list = bandwidth_pattern.findall(resp)
-        url_to_bandwidth = {purl: int(bandwidth) for bandwidth, purl in zip(bandwidth_list, play_url_list)}
-        play_url_list = sorted(play_url_list, key=lambda purl: url_to_bandwidth[purl], reverse=True)
-        return play_url_list
+        # 注意：return 必须在 for 之外。原实现缩进进了循环体，导致只扫描 m3u8 的
+        # 第一行就返回，剧集列表几乎必然为空或不完整，直播源解析直接失效。
+        return _pick_play_urls(play_url_list, resp)
 
     if not anchor_name:
         async def handle_login() -> OptionalStr:

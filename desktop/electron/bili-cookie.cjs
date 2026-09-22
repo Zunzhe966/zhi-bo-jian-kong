@@ -5,10 +5,23 @@
 const path = require('path')
 const fs = require('fs')
 
-// 打包后 __dirname 在 app.asar 里，不能反推项目根；项目根由主进程 env 注入。
-const DEFAULT_OUT = process.env.ZUNZHE_PROJECT_ROOT
-  ? path.join(process.env.ZUNZHE_PROJECT_ROOT, 'fupan_output', 'run', 'bilibili_browser_cookies.txt')
-  : path.join(__dirname, '..', '..', 'fupan_output', 'run', 'bilibili_browser_cookies.txt')
+// Cookie 文件落点绝不能从 __dirname 推导：打包态下 __dirname 在 app.asar 内，
+// 写出来会落到 `Contents/Resources/fupan_output/run/`，既污染应用包（导致
+// codesign 报 "a sealed resource is missing or invalid"），又让 daemon 读不到
+// —— 用户点了「B站授权」但录制链路依然匿名，等于白做。
+//
+// 解析优先级：
+//   1. ZUNZHE_RUN_DIR      —— 核心/主进程解析出的真实运行目录（推荐）
+//   2. ZUNZHE_PROJECT_ROOT —— 项目根，回落 <root>/fupan_output/run
+//   3. __dirname/../..     —— 仅开发态源码目录可用
+function defaultOut() {
+  const name = 'bilibili_browser_cookies.txt'
+  const runDir = String(process.env.ZUNZHE_RUN_DIR || '').trim()
+  if (runDir) return path.join(runDir, name)
+  const root = String(process.env.ZUNZHE_PROJECT_ROOT || '').trim()
+  if (root) return path.join(root, 'fupan_output', 'run', name)
+  return path.join(__dirname, '..', '..', 'fupan_output', 'run', name)
+}
 
 /**
  * 在隐藏窗口里加载 B站首页，等风控 JS 跑完生成验证 Cookie，再导出。
@@ -16,7 +29,7 @@ const DEFAULT_OUT = process.env.ZUNZHE_PROJECT_ROOT
  * @param {string} outFile Netscape cookie 文件输出路径
  * @param {boolean} visible 是否显示窗口（用户想登录账号时传 true）
  */
-async function harvestBilibiliCookies(app, outFile = DEFAULT_OUT, visible = false) {
+async function harvestBilibiliCookies(app, outFile = defaultOut(), visible = false) {
   const { BrowserWindow, session } = require('electron')
   const ses = session.fromPartition('persist:bilibili')
   const win = new BrowserWindow({
@@ -133,4 +146,11 @@ async function extractBilibiliStreams(app, videoUrl) {
   }
 }
 
-module.exports = { harvestBilibiliCookies, extractBilibiliStreams, runStandalone, DEFAULT_OUT }
+module.exports = {
+  harvestBilibiliCookies,
+  extractBilibiliStreams,
+  runStandalone,
+  defaultOut,
+  // 兼容旧调用方：取用时才求值，保证 env 已就绪。
+  get DEFAULT_OUT() { return defaultOut() },
+}

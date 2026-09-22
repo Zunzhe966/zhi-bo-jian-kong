@@ -28,6 +28,7 @@ pub struct VideoSource {
     pub name: String,
     pub download: Option<bool>,
     pub notify: String,
+    pub enabled: bool,
 }
 
 /// 直播源在 `anchors` 兼容字段里的展示视图。
@@ -75,13 +76,15 @@ impl Watchlist {
         self.project_dir.join("config").join("监控偏好.json")
     }
 
+    /// 返回监控列表里的**所有**直播源，包括被暂停（`#` 注释）的项。
+    ///
+    /// 暂停项 `enabled=false`，由调用方决定是否参与检测/录制；桌面端界面需要
+    /// 把它们也显示出来（灰显“已暂停”），否则点“不监控”会让主播直接从列表消失。
+    /// 检测循环（`live_monitor::run_once`）会自行 `filter(|i| i.enabled)`，不受影响。
     pub fn list_live(&self) -> Vec<LiveItem> {
         read_lines(&self.url_config())
             .into_iter()
-            .filter(|line| {
-                let s = line.trim_start_matches('\u{feff}').trim();
-                !s.is_empty() && !s.starts_with('#')
-            })
+            .filter(|line| is_source_line(line))
             .map(|line| parse_live_line(&line))
             .filter(|item| !item.url.is_empty())
             .map(|mut item| {
@@ -158,13 +161,12 @@ impl Watchlist {
         Ok(true)
     }
 
+    /// 返回监控列表里的**所有**视频源，包括被暂停（`#` 注释）的项。
+    /// 暂停项 `enabled=false`，桌面端界面需要它们灰显“已暂停”而不是直接消失。
     pub fn list_video(&self) -> Vec<VideoSource> {
         read_lines(&self.video_config())
             .into_iter()
-            .filter(|line| {
-                let s = line.trim_start_matches('\u{feff}').trim();
-                !s.is_empty() && !s.starts_with('#')
-            })
+            .filter(|line| is_source_line(line))
             .map(|line| parse_video_line(&line))
             .filter(|item| !item.url.is_empty())
             .map(|mut item| {
@@ -371,7 +373,10 @@ fn parse_live_line(line: &str) -> LiveItem {
 }
 
 fn parse_video_line(line: &str) -> VideoSource {
-    let s = line.trim();
+    let raw = line.trim();
+    // 以 `#` 开头表示暂停监控：数据仍完整保留，只是 enabled=false。
+    let enabled = !raw.starts_with('#');
+    let s = raw.trim_start_matches('#').trim();
     // 配置格式为「地址,名称[,下载=是/否]」。地址是第一个分隔段；名称允许包含
     // 逗号，因此把剩余段里不是下载开关的部分合并回名称，避免“博主,老师”被切坏。
     let (url, rest) = split_first_video_field(s);
@@ -395,6 +400,7 @@ fn parse_video_line(line: &str) -> VideoSource {
                         },
                         download: None,
                         notify: String::new(),
+                        enabled,
                     };
                 }
             });
@@ -412,6 +418,7 @@ fn parse_video_line(line: &str) -> VideoSource {
         name,
         download,
         notify: String::new(),
+        enabled,
     }
 }
 
@@ -472,9 +479,75 @@ fn format_video_line(url: &str, name: &str, download: Option<bool>) -> String {
     }
 }
 
+/// 判断一段文本是否像一个监控地址。
+///
+/// 除了带协议的 `http(s)://...` 和 `www.` 前缀，还要识别**裸域名**——
+/// 用户常写 `live.bilibili.com/123`、`space.bilibili.com/456`。旧实现只认
+/// `://` 和 `www.`，导致 `原画,live.bilibili.com/123` 这种标准格式的行里，
+/// 两个字段都被判为非 URL，最终把画质 `原画` 当成地址写进监控列表。
+///
+/// 判定规则（保守，避免把中文备注误判成域名）：
+/// - 含 `://`，或
+/// - 以 `www.` 开头，或
+/// - 是「ASCII 域名 + 可选路径」形态：只含 ASCII 可见字符、不含空格/中文，
+///   且 `.` 后紧跟 2 个以上字母的 TLD（如 `live.bilibili.com/1`）。
 fn contains_url(text: &str) -> bool {
     let t = text.trim().to_lowercase();
-    t.contains("://") || t.starts_with("www.")
+    if t.contains("://") || t.starts_with("www.") {
+        return true;
+    }
+    looks_like_bare_domain(&t)
+}
+
+/// 裸域名判断：取 `,`/`/`/`?`/`#` 之前的主机部分，要求
+/// 全部是 ASCII（域名只能是 ASCII），且形如 `label.tld`（TLD ≥2 位字母）。
+fn looks_like_bare_domain(t: &str) -> bool {
+    if t.is_empty() || t.contains(char::is_whitespace) {
+        return false;
+    }
+    // 只取主机名部分，去掉路径/查询/锚点。
+    let host = t
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('.');
+    if host.is_empty() {
+        return false;
+    }
+    // 逐字符校验：仅允许 ASCII 字母数字、`-`、`.`。
+    // 重点是不把中文/emoji 等备注误判成域名。
+    if !host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+    {
+        return false;
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    // 至少 `label.tld` 两段，首段非空，末段是 ≥2 位纯字母的 TLD。
+    if labels.len() < 2 {
+        return false;
+    }
+    let first = labels[0];
+    let tld = labels[labels.len() - 1];
+    !first.is_empty() && tld.len() >= 2 && tld.chars().all(|c| c.is_ascii_alphabetic())
+}
+
+/// 判断一行是否是一个「真正的监控源」，而不是文件头的说明注释。
+///
+/// 说明文字（如 `# 以 # 开头的行会被暂停监控`、`# 支持三类直播监控地址...`）
+/// 去掉 `#` 后并没有真实 URL，`parse_*_line` 会给它强行拼出 `https://说明文字` 这样的
+/// 伪地址，污染监控列表。真正源（含暂停源）去掉 `#` 后，必有一个以 `http(s)://`
+/// 或 `www.` 开头的字段（直播源画质在前、URL 在后；视频源 URL 在行首）。
+fn is_source_line(line: &str) -> bool {
+    let clean = line
+        .trim_start_matches('\u{feff}')
+        .trim()
+        .trim_start_matches('#')
+        .trim();
+    clean
+        .split(['、', '，', ','])
+        .map(|p| p.trim().to_lowercase())
+        .any(|p| p.starts_with("http://") || p.starts_with("https://") || p.starts_with("www."))
 }
 
 fn is_quality(text: &str) -> bool {
@@ -507,6 +580,38 @@ mod tests {
         assert_eq!(legacy.quality, "高清");
         assert!(item.enabled);
         assert!(!parse_live_line("#https://live.bilibili.com/2").enabled);
+    }
+
+    #[test]
+    fn parses_bare_domain_live_lines() {
+        // 裸域名（无协议、无 www.）：标准格式「画质,域名/路径」。
+        // 旧实现会把「原画」误当成地址，这里锁定修复后的语义。
+        let item = parse_live_line("原画,live.bilibili.com/123");
+        assert_eq!(item.url, "https://live.bilibili.com/123");
+        assert_eq!(item.quality, "原画");
+
+        // 旧格式「域名/路径,备注」。
+        let legacy = parse_live_line("live.bilibili.com/456,主播乙");
+        assert_eq!(legacy.url, "https://live.bilibili.com/456");
+        assert_eq!(legacy.remark, "主播乙");
+
+        // 中文备注不能被误判成域名。
+        assert!(!super::contains_url("主播甲"));
+        assert!(!super::contains_url("原画"));
+        // 纯数字/无点也不能当域名。
+        assert!(!super::contains_url("123"));
+    }
+
+    #[test]
+    fn contains_url_recognizes_domains_conservatively() {
+        assert!(super::contains_url("https://live.bilibili.com/1"));
+        assert!(super::contains_url("www.example.com"));
+        assert!(super::contains_url("live.bilibili.com/1"));
+        assert!(super::contains_url("space.bilibili.com"));
+        // 中文、空格、无 TLD 的串都判否，避免污染监控列表。
+        assert!(!super::contains_url("说明文字"));
+        assert!(!super::contains_url("foo bar.com"));
+        assert!(!super::contains_url("v1.2"));
     }
 
     #[test]
@@ -650,12 +755,16 @@ mod tests {
         w.add_live("https://live.bilibili.com/1", "主播甲", "原画")
             .unwrap();
         assert_eq!(w.list_live().len(), 1, "启用状态应先出现在监控列表");
+        assert!(w.list_live()[0].enabled, "新增源应处于启用状态");
 
         assert!(w.remove_live("https://live.bilibili.com/1").unwrap());
-        assert!(
-            w.list_live().is_empty(),
-            "remove-live 后 disabled 项不应参与实际监控"
+        // 暂停后源仍在列表里（enabled=false），供桌面端灰显“已暂停”，而不是直接消失。
+        assert_eq!(
+            w.list_live().len(),
+            1,
+            "remove-live 后源应保留在列表（enabled=false）"
         );
+        assert!(!w.list_live()[0].enabled, "暂停的源 enabled 应为 false");
 
         let text = fs::read_to_string(w.url_config()).unwrap();
         assert!(
@@ -666,10 +775,11 @@ mod tests {
             "remove-live 应保留为注释项，便于恢复: {text}"
         );
 
-        // 恢复被暂停的主播，确认列表重新出现。
+        // 恢复被暂停的主播，确认列表仍只有一条且重新启用。
         w.add_live("https://live.bilibili.com/1", "主播甲", "原画")
             .unwrap();
         assert_eq!(w.list_live().len(), 1);
+        assert!(w.list_live()[0].enabled, "恢复后源应重新启用");
         let _ = fs::remove_dir_all(&dir);
     }
 }

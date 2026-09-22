@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 import json
+import io
 import os
 import random
 import shutil
 import string
+import tempfile
 from pathlib import Path
 import functools
 import hashlib
@@ -82,6 +84,34 @@ def read_config_value(file_path: str | Path, section: str, key: str) -> str | No
     return None
 
 
+def atomic_write_text(file_path: str | Path, text: str, encoding: str = 'utf-8-sig') -> None:
+    """原子写文本：先写同目录临时文件，fsync 后 os.replace 顶替。
+
+    直接 `open(path, 'w')` 覆盖有两个问题：
+      1. 写到一半进程被杀（daemon 被 kill -9、机器断电、看门狗强杀），
+         文件就被截断 —— 监控列表、Cookie、配置整份丢；
+      2. 并发读方可能读到写了一半的内容（部分行）。
+    `os.replace` 在同一文件系统内是原子的：读方要么看到旧内容，要么看到新内容。
+    临时文件必须放在同目录，跨盘 rename 不保证原子。
+    """
+    path = Path(file_path)
+    parent = path.parent if str(path.parent) else Path('.')
+    parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=f'.{path.name}.tmp.', dir=str(parent))
+    try:
+        with os.fdopen(fd, 'w', encoding=encoding) as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 def update_config(file_path: str | Path, section: str, key: str, new_value: str) -> None:
     config = configparser.ConfigParser()
 
@@ -100,8 +130,10 @@ def update_config(file_path: str | Path, section: str, key: str, new_value: str)
     config[section][key] = escaped_value
 
     try:
-        with open(file_path, 'w', encoding='utf-8-sig') as configfile:
-            config.write(configfile)
+        # 原子写：旧实现直接 open('w') 覆盖，写一半被杀就把整份配置截断。
+        buffer = io.StringIO()
+        config.write(buffer)
+        atomic_write_text(file_path, buffer.getvalue(), encoding='utf-8-sig')
         print(f"The value of {key} under [{section}] in the configuration file has been updated.")
     except Exception as e:
         print(f"Error occurred while writing to the configuration file: {e}")
@@ -141,9 +173,9 @@ def remove_duplicate_lines(file_path: str | Path) -> None:
     with open(file_path, 'r', encoding=text_encoding) as input_file:
         for line in input_file:
             unique_lines[line.strip()] = None
-    with open(file_path, 'w', encoding=text_encoding) as output_file:
-        for line in unique_lines:
-            output_file.write(line + '\n')
+    # 监控列表是「唯一权威」文件，截断=丢源，必须原子写。
+    atomic_write_text(
+        file_path, ''.join(line + '\n' for line in unique_lines), encoding=text_encoding)
 
 
 def check_disk_capacity(file_path: str | Path, show: bool = False) -> float:
@@ -190,8 +222,7 @@ def replace_url(file_path: str | Path, old: str, new: str) -> None:
     with open(file_path, 'r', encoding='utf-8-sig') as f:
         content = f.read()
     if old in content:
-        with open(file_path, 'w', encoding='utf-8-sig') as f:
-            f.write(content.replace(old, new))
+        atomic_write_text(file_path, content.replace(old, new), encoding='utf-8-sig')
 
 
 def get_query_params(url: str, param_name: OptionalStr) -> dict | list[str]:

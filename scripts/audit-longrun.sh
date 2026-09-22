@@ -21,7 +21,44 @@ if [ -z "$ROOT" ]; then
   exit 0
 fi
 
-LOG_DIR="$ROOT/logs"
+CONFIG_FILE="$ROOT/config/config.ini"
+[ -f "$CONFIG_FILE" ] || CONFIG_FILE="$ROOT/config/config.ini.example"
+MEDIA_ROOT=""
+LOG_DIR=""
+if [ -f "$CONFIG_FILE" ]; then
+  MEDIA_ROOT="$(awk -F= '
+    /^[[:space:]]*\[/ { section=$0; gsub(/^[[:space:]]*\[|[[:space:]]*\].*$/, "", section) }
+    section == "路径设置" && $1 ~ /^[[:space:]]*产物根目录[[:space:]]*$/ {
+      sub(/^[^=]*=/, ""); gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print; exit
+    }
+  ' "$CONFIG_FILE")"
+  LOG_DIR="$(awk -F= '
+    /^[[:space:]]*\[/ { section=$0; gsub(/^[[:space:]]*\[|[[:space:]]*\].*$/, "", section) }
+    section == "路径设置" && $1 ~ /^[[:space:]]*日志目录[[:space:]]*$/ {
+      sub(/^[^=]*=/, ""); gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print; exit
+    }
+  ' "$CONFIG_FILE")"
+fi
+if [ -z "$MEDIA_ROOT" ]; then
+  MEDIA_ROOT="$HOME/Documents/尊者产物"
+else
+  case "$MEDIA_ROOT" in
+    \~) MEDIA_ROOT="$HOME" ;;
+    \~/*) MEDIA_ROOT="$HOME/${MEDIA_ROOT#\~/}" ;;
+    /*) ;;
+    *) MEDIA_ROOT="$ROOT/$MEDIA_ROOT" ;;
+  esac
+fi
+if [ -z "$LOG_DIR" ]; then
+  LOG_DIR="$MEDIA_ROOT/logs"
+else
+  case "$LOG_DIR" in
+    \~) LOG_DIR="$HOME" ;;
+    \~/*) LOG_DIR="$HOME/${LOG_DIR#\~/}" ;;
+    /*) ;;
+    *) LOG_DIR="$ROOT/$LOG_DIR" ;;
+  esac
+fi
 LOG="$LOG_DIR/zunzhe-core.audit.log"
 RUST_BIN="$ROOT/zunzhe-core/target/release/zunzhe-core"
 if [ ! -x "$RUST_BIN" ]; then
@@ -202,14 +239,15 @@ rotate_if_large() {
     size=0
   fi
   if [ "$size" -ge 5242880 ]; then
-    for i in 5 4 3 2 1; do
+    # 保留最近 5 份（.1~.5）：先丢最老的 .5，再整体后移，最后 file→.1。
+    # 旧实现 `for i in 5 4 3 2 1` 会把 .5 挪成 .6（多留一份且永不复用），
+    # 且末尾那段 .1→.2 是重复移动的死代码。
+    rm -f "$file.5" 2>/dev/null || true
+    for i in 4 3 2 1; do
       if [ -f "$file.$i" ]; then
         mv -f "$file.$i" "$file.$((i+1))" 2>/dev/null || true
       fi
     done
-    if [ -f "$file.1" ]; then
-      mv -f "$file.1" "$file.2" 2>/dev/null || true
-    fi
     mv -f "$file" "$file.1" 2>/dev/null || true
   fi
 }

@@ -390,3 +390,168 @@ body {
   white-space: pre-wrap;
   word-break: break-all;
 }
+
+/* 平台标签：贴在卡片上，让用户一眼看出「这条监控的是哪个网站」。
+   以前只有图标，抖音/快手是图片、其余是灰色小图标，扫一眼分不清。 */
+.meta-platform {
+  color: #c7d2fe;
+  border-color: rgba(129, 140, 248, 0.45);
+  background: rgba(99, 102, 241, 0.16);
+  font-weight: 500;
+}
+
+/* ---------- 存放位置 / 主播详情 ---------- */
+/* 卡片上的地址行改成可真点：以前是纯文本，用户点了没反应，以为界面是假的。 */
+.person-url-link { cursor: pointer; }
+.person-url-link:hover { color: #93c5fd; text-decoration: underline; }
+
+/* 卡片第二行按钮（打开存放位置 / 查看内容）：不重复画上边框 */
+.person-actions-sub {
+  border-top: none !important;
+  padding-top: 8px !important;
+}
+
+/* 注意：界面用的是 antd 深色主题（main.jsx 里 theme.darkAlgorithm），
+   Modal 也是深色底。所以这一组样式必须走浅色文字，不能写深灰/深蓝，
+   否则弹窗一打开字全是黑的、看不见。 */
+.stash-box {
+  margin-top: 16px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border);
+}
+.stash-box-title { font-size: 13px; font-weight: 600; color: var(--text); margin-bottom: 6px; }
+.stash-box-path {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: #93c5fd;
+  word-break: break-all;
+  cursor: pointer;
+  margin-bottom: 10px;
+  line-height: 1.5;
+}
+.stash-box-path:hover { text-decoration: underline; }
+.stash-box-hint { font-size: 12px; color: var(--muted); margin-top: 8px; }
+
+.detail-block { margin-bottom: 18px; }
+.detail-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 4px;
+  display: flex;
+  align-items: center;
+}
+.detail-link {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: #93c5fd;
+  word-break: break-all;
+  cursor: pointer;
+}
+.detail-link:hover { text-decoration: underline; }
+.detail-hint { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.detail-empty { font-size: 13px; color: var(--muted); padding: 14px 0; line-height: 1.7; }
+
+.file-list {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  max-height: 320px;
+  overflow-y: auto;
+}
+.file-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  font-size: 13px;
+}
+.file-row:last-child { border-bottom: none; }
+.file-row:hover { background: rgba(255, 255, 255, 0.05); }
+.file-icon { display: inline-flex; flex-shrink: 0; }
+.file-name {
+  flex: 1;
+  min-width: 0;
+  cursor: pointer;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.file-name:hover { color: #93c5fd; text-decoration: underline; }
+.file-size { color: var(--muted); font-size: 12px; flex-shrink: 0; min-width: 64px; text-align: right; }
+.file-time { color: var(--muted); font-size: 12px; flex-shrink: 0; }
+
+/* ============ 复盘笔记页（深色主题，同上面弹窗那一组）============ */
+.notes-wrap { padding: 4px 0; }
+.notes-dir-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  margin-bottom: 14px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border);
+}
+.notes-dir-label { font-size: 13px; font-weight: 600; color: var(--text); flex-shrink: 0; }
+.notes-dir-bar .detail-link { flex: 1; min-width: 0; }
+
+.notes-transcribe-panel {
+  margin-bottom: 14px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: rgba(99, 102, 241, 0.08);
+  border: 1px solid rgba(129, 140, 248, 0.28);
+}
+.notes-transcribe-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.notes-transcribe-title { font-size: 14px; font-weight: 600; color: var(--text); }
+.notes-transcribe-hint { font-size: 12px; color: var(--muted); margin-top: 3px; line-height: 1.6; }
+.notes-transcribe-panel .file-list { max-height: 260px; }
+
+@media (max-width: 720px) {
+  .notes-transcribe-head { flex-direction: column; }
+  .notes-transcribe-panel .file-row { flex-wrap: wrap; }
+  .notes-transcribe-panel .file-name { flex-basis: 100%; }
+}
+
+.notes-groups { display: flex; flex-direction: column; gap: 10px; }
+.notes-group {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.03);
+  overflow: hidden;
+}
+.notes-group-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  cursor: pointer;
+  user-select: none;
+}
+.notes-group-head:hover { background: rgba(255, 255, 255, 0.05); }
+.notes-group-arrow { color: var(--muted); width: 14px; flex-shrink: 0; }
+.notes-group-name { font-size: 14px; font-weight: 600; color: var(--text); word-break: break-all; }
+.notes-group-body { padding: 4px 14px 14px 38px; }
+.notes-session { margin-top: 10px; }
+.notes-session-name { font-size: 12px; color: var(--muted); margin-bottom: 6px; word-break: break-all; }
+.notes-clips {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.file-kind { color: var(--muted); font-size: 12px; flex-shrink: 0; min-width: 48px; }

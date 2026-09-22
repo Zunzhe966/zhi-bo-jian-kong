@@ -25,13 +25,25 @@ if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/cargo" ]; then
   exit 1
 fi
 
-# 每次启动都确保 release 二进制与最新代码一致；构建失败立即报错，不自欺。
-echo "[rust-daemon] 构建 release 版本..."
-(cd "$ROOT/zunzhe-core" && cargo build --release)
+# 只在二进制缺失时构建，不在每次启动时重建。
+#
+# 这里曾经是「每次启动都 cargo build --release」。对 24×7 常驻服务来说这是错的：
+# 开机/重启后 launchd 会先跑一次 1~2 分钟的编译，这期间监控是断的；构建失败还会
+# 直接让 daemon 起不来（构建属于发布步骤，不该是启动步骤）。
+# 正常的发布流程由 scripts/setup-macos.sh 负责构建；需要手动重建时跑
+# `cd zunzhe-core && cargo build --release` 即可。
+BIN="$ROOT/zunzhe-core/target/release/zunzhe-core"
+if [ ! -x "$BIN" ]; then
+  echo "[rust-daemon] 未找到 $BIN，先构建一次 release..."
+  (cd "$ROOT/zunzhe-core" && cargo build --release)
+fi
+if [ ! -x "$BIN" ]; then
+  echo "[rust-daemon] 构建后仍未找到二进制，放弃启动" >&2
+  exit 1
+fi
 
-mkdir -p "$ROOT/logs"
 export RUST_LOG="${RUST_LOG:-info}"
 # 不显式重定向项目日志：launchd 场景下 TCC 会拒绝写 ~/Desktop，脚本会在
 # 重定向时直接失败。由 com.zunzhe.monitor.plist 的 StandardOut/Err 把日志
 # 接到 ~/Library/Logs/zunzhe/；手动运行时自然落在当前终端。
-exec "$ROOT/zunzhe-core/target/release/zunzhe-core" run-daemon "$@"
+exec "$BIN" run-daemon "$@"

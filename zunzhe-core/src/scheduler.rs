@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use futures_util::FutureExt;
 use sqlx::sqlite::SqlitePool;
 use tracing::{error, info, warn};
 
@@ -13,7 +14,7 @@ use crate::live_monitor::{LiveCheckStats, LiveMonitor};
 use crate::notify::Notifier;
 use crate::platform;
 use crate::video_library::VideoLibrary;
-use crate::watchlist::Watchlist;
+use crate::watchlist::{self, Watchlist};
 
 /// 每轮从平台列表窗口拉取的视频数量。
 ///
@@ -22,6 +23,34 @@ use crate::watchlist::Watchlist;
 /// 与 CLI 浏览历史视频默认 30 条一致，覆盖绝大多数单轮发布量，同时单源
 /// 50 秒护栏仍能兜底网络卡顿。
 const SCHEDULER_VIDEO_WINDOW: u32 = 30;
+
+/// 短视频「按时间窗口下载」：只下载发布时间距今 N 天以内的新视频。
+///
+/// 用户需求「以 3 天为周期下载 3 天以内的视频」——平台列表接口会返回博主
+/// 全部历史作品，如果见一个下一个，会把老视频也全量补下。这里在通知/下载前
+/// 按 `published_at` 过滤：超过 N 天的旧视频只写入视频库作为基线，不通知不下载。
+const SCHEDULER_VIDEO_MAX_AGE_DAYS: i64 = 3;
+
+/// 解析平台返回的 `published_at`（`YYYY-MM-DD HH:MM:SS` 或 `YYYY-MM-DD`），
+/// 判断是否在 `max_age_days` 天内。解析失败视为「旧视频」，只写库不下载，
+/// 避免把时间缺失的占位记录误当新片下载。
+fn published_within_days(published_at: &str, max_age_days: i64) -> bool {
+    let published_at = published_at.trim();
+    if published_at.is_empty() {
+        return false;
+    }
+    let parsed =
+        chrono::NaiveDateTime::parse_from_str(published_at, "%Y-%m-%d %H:%M:%S").or_else(|_| {
+            chrono::NaiveDate::parse_from_str(published_at, "%Y-%m-%d")
+                .map(|d| d.and_hms_opt(0, 0, 0).unwrap_or_default())
+        });
+    let Ok(published) = parsed else {
+        return false;
+    };
+    let now = chrono::Local::now().naive_local();
+    let age = now.signed_duration_since(published);
+    age.num_days() >= 0 && age.num_days() <= max_age_days
+}
 
 /// 视频源并发检查上限。
 ///
@@ -74,7 +103,7 @@ pub async fn run_daemon(
     let _lock = lock;
     let _pid_guard = DaemonPidGuard(project_dir);
     // 启动即写一条 uptime 日志记录：外部 doctor/桌面端据此计算连续运行时长。
-    let uptime_log = project_dir.join("logs").join("zunzhe-core.uptime.log");
+    let uptime_log = crate::paths::logs(project_dir).join("zunzhe-core.uptime.log");
     if let Some(parent) = uptime_log.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -91,7 +120,7 @@ pub async fn run_daemon(
         use std::io::Write;
         let _ = writeln!(f, "{now} started pid={}", std::process::id());
     }
-    let fupan_dir = project_dir.join("fupan_output");
+    let fupan_dir = crate::paths::fupan(project_dir);
     // daemon 启动时合并旧 Python 独立视频库，确保 `已下载` 标记与历史视频
     // 元数据不会因切换主 DB 而丢失；迁移幂等，只补缺失 id，不覆盖主库字段。
     if let Err(e) = crate::video_library::migrate_legacy_video_db(&pool, &fupan_dir).await {
@@ -129,6 +158,11 @@ pub async fn run_daemon(
         // 哨兵缺失/损坏：立即执行一次维护，让新目录或异常状态尽快收敛。
         _ => 0,
     };
+    // 视频源检查节流：`config/fupan_config.ini [视频监控] 检查间隔秒` 才是视频
+    // 轮次的真实节拍。直播检查不受它约束——开播要尽快发现，仍按 CLI
+    // `--interval`（默认 60 秒）跑；视频检查是打外部接口的重活，必须尊重配置。
+    // 0 表示尚未检查过，首轮立即查一次，避免刚启动就干等 15 分钟。
+    let mut last_video_check: i64 = 0;
     // 独立下载队列 worker：不参与 70 秒 tick 护栏，每个任务自身有 600 秒超时。
     // 下载耗时不会阻塞直播/视频检查，也不会被 tick abort 后永远卡 processing。
     let download_pool = pool.clone();
@@ -161,7 +195,7 @@ pub async fn run_daemon(
                 pipeline_pool.clone(),
                 pipeline_project.clone(),
                 rx,
-                std::time::Duration::from_secs(3600),
+                std::time::Duration::from_secs(6 * 3600),
                 std::time::Duration::from_secs(5),
             )
         },
@@ -211,6 +245,12 @@ pub async fn run_daemon(
     let watchdog_stop_rx = stop.1.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(watchdog_interval));
+        // tokio interval 第一次 tick() 会立即返回。若不丢弃这一次，daemon 刚
+        // 启动、心跳还没来得及刷新（尤其是上次崩溃残留的旧心跳文件）时，
+        // 这里会误判“调度僵死”并触发优雅退出；而退出后外部 watchdog 又会
+        // 重新拉起，形成“拉起→误判自杀→再拉起”的死循环（已实测复现）。
+        // 丢弃首次立即返回，让第一次检查真正等到 watchdog_interval 之后。
+        interval.tick().await;
         loop {
             interval.tick().await;
             if *watchdog_stop_rx.borrow() {
@@ -287,7 +327,19 @@ pub async fn run_daemon(
                 config.clone()
             }
         };
-        let tick = run_tick_with_timeout(&pool, project_dir, &fupan_dir, &current_config, &watch);
+        // 视频轮次是否到点：`检查间隔秒` 是唯一权威（下限 60 秒、上限 24 小时）。
+        // 未到点就只跑直播检测，把外部接口压力降下来。
+        let video_interval = current_config.video_check_interval_secs();
+        let run_videos = last_video_check == 0
+            || now_ts.saturating_sub(last_video_check) >= video_interval as i64;
+        if !run_videos {
+            info!(
+                "视频源检查未到间隔（{}s，上次 {}），本轮只跑直播检测",
+                video_interval, last_video_check
+            );
+        }
+        let tick =
+            run_tick_with_timeout(&pool, project_dir, &fupan_dir, &current_config, run_videos);
         tokio::pin!(tick);
         let mut exited = false;
         tokio::select! {
@@ -303,6 +355,12 @@ pub async fn run_daemon(
         }
         // tick 结束后立即刷新心跳：即使本轮被 70 秒护栏截断，也证明调度器仍活跃。
         crate::service::touch_heartbeat(project_dir);
+        // 只有真的跑了视频检查才推进计时。放在 tick 结束后而不是发起前：
+        // 本轮失败/超时也算「查过了」，否则会退化成每 60 秒重试一次，
+        // 反而比配置的间隔更密（单源冷却机制挡不住整轮重试）。
+        if run_videos {
+            last_video_check = now_ts;
+        }
         if once || exited || *stop.1.borrow() {
             return shutdown_daemon(
                 &pool,
@@ -494,27 +552,33 @@ async fn run_tick_with_timeout(
     project_dir: &Path,
     fupan_dir: &Path,
     config: &Config,
-    watch: &Watchlist,
+    run_videos: bool,
 ) {
     // 用 owned 快照 + tokio::task::spawn 隔离：单个 tick panic 不会拖垮主循环。
     let pool = pool.clone();
     let project_dir = project_dir.to_path_buf();
     let fupan_dir = fupan_dir.to_path_buf();
     let config = config.clone();
-    let watch = Watchlist::new(
-        watch
-            .url_config()
-            .parent()
-            .unwrap_or(project_dir.as_path())
-            .to_path_buf(),
-    );
+    // 直播检测必须用项目根构造 Watchlist，才能读到 config/URL_config.ini。
+    // 旧实现误用 url_config().parent()（= config/ 目录），导致 Watchlist
+    // 去读不存在的 config/config/URL_config.ini，list_live() 永远返回空、
+    // live tick 每轮 checked=0，直播监控彻底失效。用 project_dir 后
+    // list_live() 正确读取 config/URL_config.ini。
+    let watch = Watchlist::new(project_dir.clone());
     let mut live_task = tokio::task::spawn(run_live_tick(
         pool.clone(),
         project_dir.clone(),
         config.clone(),
         watch,
     ));
-    let mut videos_task = tokio::task::spawn(tick_owned(pool, project_dir, fupan_dir, config));
+    let mut videos_task = tokio::task::spawn(async move {
+        // 未到「检查间隔秒」就不打外部接口：直接返回空统计，交由上层决定
+        // 是否记日志。直播任务照跑，不受影响。
+        if !run_videos {
+            return Ok(TickStats::default());
+        }
+        tick_owned(pool, project_dir, fupan_dir, config).await
+    });
 
     let outcome = tokio::time::timeout(Duration::from_secs(70), async {
         // 借用句柄而不是移动：超时分支发生后仍然能 abort 两个子任务。
@@ -536,9 +600,12 @@ async fn run_tick_with_timeout(
             Ok(stats) => info!("live monitor tick ok: {:?}", stats),
             Err(e) => error!("live monitor tick failed: {e:#}"),
         }
-        match videos {
-            Ok(stats) => info!("daemon tick ok: {:?}", stats),
-            Err(e) => error!("daemon tick failed: {e:#}"),
+        // 跳过的轮次不记统计日志，否则每 60 秒刷一条空 tick 噪声。
+        if run_videos {
+            match videos {
+                Ok(stats) => info!("daemon tick ok: {:?}", stats),
+                Err(e) => error!("daemon tick failed: {e:#}"),
+            }
         }
     } else {
         warn!("daemon tick 超过 70 秒，终止本轮子任务并跳过");
@@ -579,6 +646,21 @@ async fn tick_owned(
     tick(&pool, &project_dir, &fupan_dir, &config).await
 }
 
+/// 取「本轮真正要检查」的视频源。
+///
+/// `Watchlist::list_video()` 刻意返回全部条目（含以 `#` 开头的暂停行），
+/// 因为状态快照要靠它把暂停源也显示给界面；因此启用与否必须由调用方决定。
+/// 视频 tick 曾经忘了这层过滤，后果是：配置文件里注释掉的源照样每轮被拉取、
+/// 照样通知和下载，「以 # 开头 = 暂停监控」对视频源形同虚设（注释掉一个
+/// 没登录的抖音源，只会换来每轮一条「尚未登录抖音」的 ERROR 和持续冷却计数）。
+fn enabled_video_sources(watch: &Watchlist) -> Vec<watchlist::VideoSource> {
+    watch
+        .list_video()
+        .into_iter()
+        .filter(|s| s.enabled)
+        .collect()
+}
+
 async fn tick(
     pool: &SqlitePool,
     project_dir: &Path,
@@ -597,19 +679,20 @@ async fn tick(
     // 每轮重新读列表：桌面端/CLI 新增或暂停视频源后下一轮立即生效，
     // 不需要重启 daemon；与直播列表（URL_config.ini）每轮热加载保持一致。
     let watch = Watchlist::new(project_dir.to_path_buf());
-    let sources = watch.list_video();
+    let sources = enabled_video_sources(&watch);
     let library = VideoLibrary::new(pool.clone(), fupan_dir.to_path_buf());
     let mut checked = 0usize;
     let mut notified = 0usize;
     let mut enqueued = 0usize;
     let mut skipped_cooldown = 0usize;
+    let mut skipped_missing_credential = 0usize;
     let items: Vec<(String, String, Option<bool>)> = sources
         .into_iter()
         .map(|s| (s.url, s.name, s.download))
         .collect();
     let auto_download = config.is_yes_fupan("视频监控", "自动下载新视频(是/否)", true);
     let notify_enabled = config.is_yes_fupan("复盘邮件", "发现新视频时发送通知(是/否)", true);
-    let (outcomes, skipped_in_concurrent) = check_video_sources_concurrent(
+    let (outcomes, skipped_in_concurrent, skipped_proxy_off) = check_video_sources_concurrent(
         pool,
         project_dir,
         items,
@@ -623,97 +706,22 @@ async fn tick(
     let mut known_ids: Option<std::collections::HashSet<String>> = None;
     let only_source = outcomes.len() == 1;
     for outcome in outcomes {
-        let source_url = outcome.source_url;
-        let name = outcome.name;
-        let item_download = outcome.item_download;
-        match outcome.videos {
-            Ok(videos) => {
-                // 成功即清零冷却状态；即使本轮返回空，只要平台接口明确成功，
-                // 也说明网络/风控已恢复，不应继续被旧失败计数拖累。
-                let _ = db::reset_source_failures(pool, &source_url).await;
-                if known_ids.is_none() {
-                    let all = db::get_videos(pool, "", "", false).await?;
-                    known_ids = Some(all.iter().map(|v| v.id.clone()).collect());
-                }
-                let first_run = !db::is_source_baselined(pool, &source_url).await?;
-                // 同源一轮返回的视频里，平台兜底链偶尔会重复同一个 BV/链接。
-                // 每轮每个源只处理一次，避免同轮重复写库、重复通知和重复入队。
-                let mut seen_this_round = std::collections::HashSet::new();
-                for v in videos
-                    .iter()
-                    .filter(|v| seen_this_round.insert(v.id.clone()))
-                {
-                    // view 接口失败时只返回占位标题，跳过不写库，避免污染视频库。
-                    if v.title == v.id {
-                        continue;
-                    }
-                    let known = known_ids.as_mut().expect("本轮已初始化视频库快照");
-                    let is_new = !known.contains(&v.id);
-                    match library.upsert(v, &name, &source_url).await {
-                        // 首次监控：只把现有视频写入库作为基线，不通知、不下载。
-                        Ok(_) if is_new && first_run => {
-                            known.insert(v.id.clone());
-                        }
-                        Ok(_) if is_new => {
-                            known.insert(v.id.clone());
-                            if notify_enabled {
-                                let title = new_video_notify_title(&name, &v.title);
-                                let content =
-                                    format!("博主：{}\n标题：{}\n链接：{}", name, v.title, v.url);
-                                match notifier
-                                    .send(
-                                        "video",
-                                        &name,
-                                        &title,
-                                        &content,
-                                        &watch.notify_for(&source_url, &name),
-                                    )
-                                    .await
-                                {
-                                    Ok(_) => notified += 1,
-                                    Err(e) => warn!("通知新视频失败: {e:#}"),
-                                }
-                            }
-                            let should_download = item_download.unwrap_or(auto_download);
-                            if should_download {
-                                match db::enqueue_task(pool, "download", &v.url, &name).await {
-                                    Ok(_) => enqueued += 1,
-                                    Err(e) => warn!("下载任务入队失败: {e:#}"),
-                                }
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(e) => warn!("写入视频库失败: {e:#}"),
-                    }
-                }
-                if first_run {
-                    db::mark_source_baselined(pool, &source_url).await?;
-                    info!(
-                        "source {source_url} first baseline recorded ({})",
-                        videos.len()
-                    );
-                }
-                checked += 1;
-            }
-            Err(e) => {
-                if outcome.timed_out {
-                    error!("source {source_url} check timeout (50s)");
-                } else {
-                    error!("source {source_url} check failed: {e:#}");
-                }
-                let fails = db::bump_source_failures(pool, &source_url)
-                    .await
-                    .unwrap_or(0);
-                info!("source {source_url} 失败冷却计数: {fails}");
-                if only_source {
-                    // 单源且是用户手动 check-videos：把失败直接暴露，便于排查。
-                    if outcome.timed_out {
-                        return Err(anyhow!("视频监控源检查超时（50 秒）: {source_url}"));
-                    }
-                    return Err(anyhow!("视频监控源检查失败 {source_url}: {e:#}"));
-                }
-            }
-        }
+        apply_source_outcome(
+            pool,
+            &watch,
+            &library,
+            &notifier,
+            outcome,
+            only_source,
+            auto_download,
+            notify_enabled,
+            &mut known_ids,
+            &mut checked,
+            &mut notified,
+            &mut enqueued,
+            &mut skipped_missing_credential,
+        )
+        .await?;
     }
 
     Ok(TickStats {
@@ -722,7 +730,140 @@ async fn tick(
         videos_notified: notified,
         notify_retried: notified_retry,
         skipped_cooldown,
+        skipped_proxy_off,
+        skipped_missing_credential,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_source_outcome(
+    pool: &SqlitePool,
+    watch: &Watchlist,
+    library: &VideoLibrary,
+    notifier: &Notifier<'_>,
+    outcome: SourceCheckOutcome,
+    only_source: bool,
+    auto_download: bool,
+    notify_enabled: bool,
+    known_ids: &mut Option<std::collections::HashSet<String>>,
+    checked: &mut usize,
+    notified: &mut usize,
+    enqueued: &mut usize,
+    skipped_missing_credential: &mut usize,
+) -> Result<()> {
+    let source_url = outcome.source_url;
+    let name = outcome.name;
+    let item_download = outcome.item_download;
+    match outcome.videos {
+        Ok(videos) => {
+            // 只有拿到明确内容才算“恢复”。平台在风控/接口异常时可能返回
+            // 空列表；若已有连续失败计数，空成功不能把计数清零，否则
+            // B站间歇性 412 会让失败永远停在 1。真实恢复（有内容成功）
+            // 或无历史失败时仍立即清零。
+            let (source_fails, _) = db::source_failure_state(pool, &source_url).await?;
+            if should_reset_source_failures(source_fails, videos.is_empty()) {
+                let _ = db::reset_source_failures(pool, &source_url).await;
+            }
+            if known_ids.is_none() {
+                let all = db::get_videos(pool, "", "", false).await?;
+                *known_ids = Some(all.iter().map(|v| v.id.clone()).collect());
+            }
+            let first_run = !db::is_source_baselined(pool, &source_url).await?;
+            // 同源一轮返回的视频里，平台兜底链偶尔会重复同一个 BV/链接。
+            // 每轮每个源只处理一次，避免同轮重复写库、重复通知和重复入队。
+            let mut seen_this_round = std::collections::HashSet::new();
+            for v in videos
+                .iter()
+                .filter(|v| seen_this_round.insert(v.id.clone()))
+            {
+                // view 接口失败时只返回占位标题，跳过不写库，避免污染视频库。
+                if v.title == v.id {
+                    continue;
+                }
+                let known = known_ids.as_mut().expect("本轮已初始化视频库快照");
+                let is_new = !known.contains(&v.id);
+                match library.upsert(v, &name, &source_url).await {
+                    // 首次监控：只把现有视频写入库作为基线，不通知、不下载。
+                    Ok(_) if is_new && first_run => {
+                        known.insert(v.id.clone());
+                    }
+                    Ok(_) if is_new => {
+                        known.insert(v.id.clone());
+                        // 时间窗口过滤：只下载/通知 3 天以内的新视频；更早的
+                        // 视频只写库作为基线，避免把博主历史作品全量补下。
+                        if !published_within_days(&v.published_at, SCHEDULER_VIDEO_MAX_AGE_DAYS) {
+                            continue;
+                        }
+                        if notify_enabled {
+                            let title = new_video_notify_title(&name, &v.title);
+                            let content =
+                                format!("博主：{}\n标题：{}\n链接：{}", name, v.title, v.url);
+                            match notifier
+                                .send(
+                                    "video",
+                                    &name,
+                                    &title,
+                                    &content,
+                                    &watch.notify_for(&source_url, &name),
+                                )
+                                .await
+                            {
+                                Ok(_) => *notified += 1,
+                                Err(e) => warn!("通知新视频失败: {e:#}"),
+                            }
+                        }
+                        let should_download = item_download.unwrap_or(auto_download);
+                        if should_download {
+                            match db::enqueue_task(pool, "download", &v.url, &name).await {
+                                Ok(_) => *enqueued += 1,
+                                Err(e) => warn!("下载任务入队失败: {e:#}"),
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!("写入视频库失败: {e:#}"),
+                }
+            }
+            if first_run {
+                db::mark_source_baselined(pool, &source_url).await?;
+                info!(
+                    "source {source_url} first baseline recorded ({})",
+                    videos.len()
+                );
+            }
+            *checked += 1;
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            // 缺凭据（未登录/缺 cookie）是确定性错误：重试不会自愈，
+            // 累计失败冷却没有意义，只会每轮刷 ERROR 并占用并发槽位。
+            // 这里直接跳过、不计失败，提示用户去授权；授权后下一轮自动恢复。
+            if is_missing_credential_error(&msg) {
+                warn!(
+                    "source {source_url} 未完成授权，本轮跳过（不计失败冷却，授权后自动恢复）: {msg}"
+                );
+                *skipped_missing_credential += 1;
+                return Ok(());
+            }
+            if outcome.timed_out {
+                error!("source {source_url} check timeout (50s)");
+            } else {
+                error!("source {source_url} check failed: {msg}");
+            }
+            let fails = db::bump_source_failures(pool, &source_url)
+                .await
+                .unwrap_or(0);
+            info!("source {source_url} 失败冷却计数: {fails}");
+            if only_source {
+                // 单源且是用户手动 check-videos：把失败直接暴露，便于排查。
+                if outcome.timed_out {
+                    return Err(anyhow!("视频监控源检查超时（50 秒）: {source_url}"));
+                }
+                return Err(anyhow!("视频监控源检查失败 {source_url}: {msg}"));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 有界并发检查视频源，结果按列表顺序返回。
@@ -736,7 +877,7 @@ async fn check_video_sources_concurrent<F>(
     items: Vec<(String, String, Option<bool>)>,
     concurrency: usize,
     resolve: F,
-) -> Result<(Vec<SourceCheckOutcome>, usize)>
+) -> Result<(Vec<SourceCheckOutcome>, usize, usize)>
 where
     F: Fn(&str, &Path) -> Box<dyn platform::Platform> + Clone + Send + Sync + 'static,
 {
@@ -744,8 +885,27 @@ where
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
     let mut pending: Vec<(usize, PendingVideoSource)> = Vec::with_capacity(items.len());
     let mut skipped_cooldown = 0usize;
+    let mut skipped_proxy_off = 0usize;
+    // 代理健康预检：代理软件没开时，本机代理端口 Connection refused，依赖
+    // 代理的国外源（rsshub.app 等）每轮都会“失败”——这不是源故障，不应
+    // 累计失败冷却，也不该刷错误日志。这里探测一次代理端口，不通则明确
+    // 跳过、不计失败；代理恢复后下一轮自动继续检查这些源。
+    let mut proxy_state: Option<bool> = None;
     for (idx, item) in items.into_iter().enumerate() {
         let (source_url, name, item_download) = item;
+        if crate::net::policy().needs_proxy(&source_url) {
+            // 每轮最多探测一次：所有需要代理的源共用同一个结果。
+            if proxy_state.is_none() {
+                proxy_state = Some(crate::net::policy().proxy_alive().await.unwrap_or(false));
+            }
+            if proxy_state == Some(false) {
+                info!(
+                    "source {source_url} 出站代理未运行，本轮跳过（不计失败冷却，开代理后自动恢复）"
+                );
+                skipped_proxy_off += 1;
+                continue;
+            }
+        }
         // B站风控/网络故障不是一次就能恢复；连续失败后给该源冷却时间，
         // 避免每轮都走完整的官方+RSSHub+yt-dlp 兜底链，既拖慢 daemon 又
         // 更容易加重 412。连续失败 3 次起冷却 15 分钟，指数增长，上限 2 小时；
@@ -766,17 +926,27 @@ where
         pending.push((idx, (source_url, name, item_download)));
     }
 
-    let mut handles = Vec::with_capacity(pending.len());
-    for (idx, (source_url, name, item_download)) in pending.iter() {
+    // JoinSet 负责托管所有源任务：外层 tick 被 70 秒护栏取消时，JoinSet
+    // Drop 会 abort 尚未完成的子任务，避免网络请求脱离本轮继续占用资源。
+    let mut tasks = tokio::task::JoinSet::new();
+    for (idx_ref, (source_url, name, item_download)) in pending.iter() {
+        let idx = *idx_ref;
         let sem = semaphore.clone();
         let project_dir = project_dir.to_path_buf();
         let resolve = resolve.clone();
         let source_url = source_url.clone();
         let name = name.clone();
         let item_download = *item_download;
-        handles.push((
-            idx,
-            tokio::spawn(async move {
+        tasks.spawn(async move {
+            let fallback = || SourceCheckOutcome {
+                source_url: source_url.clone(),
+                name: name.clone(),
+                item_download,
+                videos: Err(anyhow!("视频监控源检查任务 panic: {source_url}")),
+                timed_out: false,
+            };
+            // 单个适配器 panic 也只影响它自己；JoinSet 仍可继续收集其它源。
+            let result = std::panic::AssertUnwindSafe(async {
                 let _permit = sem.acquire_owned().await.expect("信号量不会关闭");
                 let adapter = resolve(&source_url, &project_dir);
                 // 首次基线未建立时仍然检查；B站空间接口 403 等失败要明确返回错误，
@@ -790,8 +960,8 @@ where
                 .await
                 {
                     Ok(videos) => SourceCheckOutcome {
-                        source_url,
-                        name,
+                        source_url: source_url.clone(),
+                        name: name.clone(),
                         item_download,
                         videos,
                         timed_out: false,
@@ -799,44 +969,33 @@ where
                     Err(_) => {
                         let err = anyhow!("视频监控源检查超时（50 秒）: {source_url}");
                         SourceCheckOutcome {
-                            source_url,
-                            name,
+                            source_url: source_url.clone(),
+                            name: name.clone(),
                             item_download,
                             videos: Err(err),
                             timed_out: true,
                         }
                     }
                 }
-            }),
-        ));
+            })
+            .catch_unwind()
+            .await;
+            (idx, result.unwrap_or_else(|_| fallback()))
+        });
     }
 
-    let mut outcomes = Vec::with_capacity(handles.len());
-    for (idx, handle) in handles {
-        let item = match handle.await {
-            Ok(item) => item,
-            Err(e) => {
-                // 单个源任务 panic 不能让整轮 tick 崩溃；按失败记一次并继续。
-                let (source_url, name, item_download) = pending
-                    .iter()
-                    .find(|(i, _)| *i == *idx)
-                    .map(|(_, item)| item.clone())
-                    .unwrap_or_default();
-                SourceCheckOutcome {
-                    source_url,
-                    name,
-                    item_download,
-                    videos: Err(anyhow!("视频监控源检查任务 panic: {e}")),
-                    timed_out: false,
-                }
-            }
-        };
-        outcomes.push((idx, item));
+    let mut outcomes = Vec::with_capacity(pending.len());
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(item) => outcomes.push(item),
+            Err(e) => warn!("视频监控源任务被取消: {e}"),
+        }
     }
     outcomes.sort_by_key(|(idx, _)| *idx);
     Ok((
         outcomes.into_iter().map(|(_, item)| item).collect(),
         skipped_cooldown,
+        skipped_proxy_off,
     ))
 }
 
@@ -846,7 +1005,7 @@ pub async fn check_video_sources(
     project_dir: &Path,
     config: &Config,
 ) -> Result<TickStats> {
-    let fupan_dir = project_dir.join("fupan_output");
+    let fupan_dir = crate::paths::fupan(project_dir);
     // CLI 手动检查也要有护栏：单源最多 50 秒、整体 70 秒，避免网络卡死挂住命令。
     match tokio::time::timeout(
         Duration::from_secs(70),
@@ -872,6 +1031,11 @@ pub struct TickStats {
     pub videos_notified: usize,
     pub notify_retried: usize,
     pub skipped_cooldown: usize,
+    /// 因出站代理未运行而跳过的源数（不计失败冷却，开代理自动恢复）。
+    pub skipped_proxy_off: usize,
+    /// 因未完成授权（缺 cookie 凭据）而跳过的源数（确定性错误，不计失败冷却，
+    /// 授权后下一轮自动恢复）。
+    pub skipped_missing_credential: usize,
 }
 
 /// 连续失败次数对应的冷却秒数：3 次起 15 分钟，之后按失败次数线性增加，上限 2 小时。
@@ -886,6 +1050,30 @@ fn source_cooldown_secs(fails: u32) -> u64 {
         .as_secs()
 }
 
+fn should_reset_source_failures(previous_fails: u32, empty_success: bool) -> bool {
+    previous_fails == 0 || !empty_success
+}
+
+/// 判断源检查失败是否属于「确定性缺失凭据/配置」——即不论重试多少次都不会
+/// 自行恢复的用户侧问题（未登录、缺 cookie 文件等）。
+///
+/// 这类错误和 B站 412 风控/网络抖动有本质区别：
+/// - 风控/网络是**暂时性**的，值得累计失败并指数冷却，等条件恢复；
+/// - 缺凭据是**确定性**的，重试一万次也一样失败，累计冷却毫无意义，
+///   只会每轮刷一条 ERROR 并让该源长期占据并发槽位。
+///
+/// 因此调用方应对这类错误直接跳过、**不计失败冷却**，只提示一次让用户去授权；
+/// 用户完成授权后，下一轮 `cookie_path.exists()` 即为真，自动恢复正常检查，
+/// 不需要任何手动重置。这与「代理未运行则跳过源」是同一种设计。
+fn is_missing_credential_error(message: &str) -> bool {
+    // 与平台适配器的错误文案约定（见 platform.rs 各适配器 missing-cookie 分支）。
+    // 用「尚未登录」/「未登录」+「缺少/缺」等关键词覆盖 B站/抖音/快手等适配器，
+    // 避免各平台文案不一致时漏判。
+    let has_login = message.contains("尚未登录") || message.contains("未登录");
+    let has_missing = message.contains("缺少") || message.contains("缺");
+    has_login && has_missing
+}
+
 /// 冷却是否仍生效：`now >= last_failed_at + cooldown` 时允许重试。
 fn source_cooldown_active(now_secs: i64, last_failed_at: i64, cooldown_secs: u64) -> bool {
     cooldown_secs > 0 && now_secs.saturating_sub(last_failed_at) < cooldown_secs as i64
@@ -894,6 +1082,83 @@ fn source_cooldown_active(now_secs: i64, last_failed_at: i64, cooldown_secs: u64
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_watchlist_must_be_constructed_from_project_root_not_config_dir() {
+        // 回归：run_tick_with_timeout 曾用 url_config().parent()（= config/ 目录）
+        // 构造 Watchlist，导致它去读不存在的 config/config/URL_config.ini，
+        // list_live() 永远返回空、live tick 每轮 checked=0、直播监控彻底失效。
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-sched-watch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::write(
+            dir.join("config").join("URL_config.ini"),
+            "原画,https://live.bilibili.com/24931109,侯翠翠\n",
+        )
+        .unwrap();
+        // 修复后的构造方式：项目根
+        let fixed = Watchlist::new(dir.clone());
+        let rooms = fixed.list_live();
+        assert_eq!(rooms.len(), 1, "从项目根构造必须能读到直播间");
+        assert_eq!(rooms[0].url, "https://live.bilibili.com/24931109");
+        assert!(rooms[0].enabled);
+        // 旧实现（config/ 目录）必须读不到，防止回归
+        let broken = Watchlist::new(fixed.url_config().parent().unwrap().to_path_buf());
+        assert!(
+            broken.list_live().is_empty(),
+            "旧实现（config/ 目录）应读不到直播间"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn paused_video_sources_are_not_checked() {
+        // 回归：视频 tick 曾直接使用 `list_video()`，漏掉 `enabled` 过滤，
+        // 导致「以 # 开头 = 暂停监控」对视频源不生效——注释掉的源照样每轮
+        // 被拉取、照样通知下载。直播链路一直有这层过滤（见 live_monitor），
+        // 视频链路漏了，两条路径行为不一致。
+        let dir = std::env::temp_dir().join(format!(
+            "zunzhe-sched-paused-video-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::write(
+            dir.join("config").join("视频监控列表.ini"),
+            concat!(
+                "# 注释说明行，不含地址，不该被当成源\n",
+                "https://space.bilibili.com/1458143131,侯翠翠,下载=是\n",
+                "#https://space.bilibili.com/946974,测试UP主,下载=是\n",
+                "#https://www.douyin.com/user/MS4wLjABAAAAfake,关立新,下载=是\n",
+            ),
+        )
+        .unwrap();
+        let watch = Watchlist::new(dir.clone());
+
+        // 状态快照仍要看得到全部条目（含暂停），否则界面没法把暂停源灰显出来。
+        let all = watch.list_video();
+        assert_eq!(all.len(), 3, "list_video 应保留暂停行供界面展示");
+        assert_eq!(all.iter().filter(|s| s.enabled).count(), 1);
+
+        // 真正要检查的只能有一个：停掉的测试源和未登录的抖音源都不许进列表。
+        let checked = enabled_video_sources(&watch);
+        assert_eq!(checked.len(), 1, "暂停的视频源不得进入待检查列表");
+        assert_eq!(checked[0].url, "https://space.bilibili.com/1458143131");
+        assert!(checked[0].enabled);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn maintenance_cleans_stale_electron_files_in_run_dir() {
@@ -929,18 +1194,9 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_once_without_anchors() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let file =
-            std::env::temp_dir().join(format!("zunzhe-daemon-{}-{nonce}", std::process::id()));
-        let dir =
-            std::env::temp_dir().join(format!("zunzhe-daemon-dir-{}-{nonce}", std::process::id()));
-        let _ = std::fs::remove_file(&file);
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let run_dir = dir.join("fupan_output").join("run");
+        let dir = crate::test_support::isolated_project("daemon-once");
+        let file = crate::paths::database(&dir);
+        let run_dir = crate::paths::run_dir(&dir);
         std::fs::create_dir_all(&run_dir).unwrap();
         // 首轮 tick 应执行一次到期维护并刷新哨兵，同时清理旧版本 Electron
         // 协议残留；防止“启动后维护永远推迟”这类回归再次出现。
@@ -983,6 +1239,38 @@ mod tests {
         // 条，否则新视频会被误判成“已基线”而永久漏通知。
         const _: () = assert!(SCHEDULER_VIDEO_WINDOW >= 11, "窗口过小会漏掉爆发式发布");
         assert_eq!(SCHEDULER_VIDEO_WINDOW, 30);
+    }
+
+    #[test]
+    fn published_within_days_accepts_recent_and_rejects_old() {
+        use chrono::Local;
+        let now = Local::now().naive_local();
+        // 刚发布的（1 天前）应判为「窗口内」
+        let recent = now - chrono::Duration::days(1);
+        assert!(published_within_days(
+            &recent.format("%Y-%m-%d %H:%M:%S").to_string(),
+            3
+        ));
+        // 恰好 3 天前（边界）应判为「窗口内」
+        let edge = now - chrono::Duration::days(3);
+        assert!(published_within_days(
+            &edge.format("%Y-%m-%d %H:%M:%S").to_string(),
+            3
+        ));
+        // 4 天前应判为「窗口外」
+        let old = now - chrono::Duration::days(4);
+        assert!(!published_within_days(
+            &old.format("%Y-%m-%d %H:%M:%S").to_string(),
+            3
+        ));
+        // 只有日期没有时间也能解析
+        assert!(published_within_days(
+            &recent.format("%Y-%m-%d").to_string(),
+            3
+        ));
+        // 空字符串/非法日期视为「窗口外」，避免误下载
+        assert!(!published_within_days("", 3));
+        assert!(!published_within_days("not-a-date", 3));
     }
 
     #[tokio::test]
@@ -1102,24 +1390,12 @@ mod tests {
 
     #[tokio::test]
     async fn second_daemon_rejected_and_keeps_first_pid() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let file =
-            std::env::temp_dir().join(format!("zunzhe-daemon-dup-{}-{nonce}", std::process::id()));
-        let _ = std::fs::remove_file(&file);
+        let dir = crate::test_support::isolated_project("daemon-duplicate");
+        let file = crate::paths::database(&dir);
         let pool = crate::db::open_pool(&file).await.unwrap();
         db::init_db(&pool).await.unwrap();
         let cfg = crate::config::Config::load(Path::new(env!("CARGO_MANIFEST_DIR")))
             .unwrap_or_else(|_| crate::config::Config::defaults_for_test());
-        let dir = std::env::temp_dir().join(format!(
-            "zunzhe-daemon-dup-dir-{}-{nonce}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
         // 第一个实例持有锁并写入自己的 pid（真实进程才能通过存活检查）。
         let lock = DaemonLock::try_acquire(&dir).unwrap().unwrap();
         crate::service::write_rust_daemon_pid(&dir, std::process::id());
@@ -1127,8 +1403,7 @@ mod tests {
         let second = run_daemon(pool.clone(), &dir, &cfg, 1, true, None).await;
         assert!(second.is_err(), "同一项目根下第二个 daemon 必须被拒绝");
         let pid_text =
-            std::fs::read_to_string(dir.join("fupan_output").join("run").join("zunzhe-core.pid"))
-                .unwrap();
+            std::fs::read_to_string(crate::paths::run_dir(&dir).join("zunzhe-core.pid")).unwrap();
         assert_eq!(
             pid_text.trim(),
             std::process::id().to_string(),
@@ -1177,6 +1452,136 @@ mod tests {
             title.contains("你被AI内容骗过吗？"),
             "标题必须带上视频标题，避免多条不同视频看起来像同一条: {title}"
         );
+    }
+
+    #[test]
+    fn empty_success_does_not_clear_existing_failure_state() {
+        assert!(!should_reset_source_failures(2, true));
+        assert!(should_reset_source_failures(2, false));
+        assert!(should_reset_source_failures(0, true));
+    }
+
+    #[tokio::test]
+    async fn empty_success_between_failures_still_accumulates_cooldown() {
+        use crate::db;
+
+        let root = crate::test_support::isolated_project("source-failure-accumulation");
+        let file = crate::paths::database(&root);
+        let pool = db::open_pool(&file).await.unwrap();
+        db::init_db(&pool).await.unwrap();
+        let source = "https://space.bilibili.com/946974";
+        let watch = Watchlist::new(root.clone());
+        let library = VideoLibrary::new(pool.clone(), crate::paths::fupan(&root));
+        let config = Config::defaults_for_test();
+        let notifier = Notifier::for_project(&pool, &config, &root);
+        let mut known_ids = None;
+        let mut checked = 0usize;
+        let mut notified = 0usize;
+        let mut enqueued = 0usize;
+        let mut skipped_missing_credential = 0usize;
+
+        // 第一次真实失败：必须写 1，并记录失败时间。
+        apply_source_outcome(
+            &pool,
+            &watch,
+            &library,
+            &notifier,
+            SourceCheckOutcome {
+                source_url: source.to_string(),
+                name: "测试UP主".to_string(),
+                item_download: None,
+                videos: Err(anyhow!("官方接口返回 HTTP 412")),
+                timed_out: false,
+            },
+            false,
+            false,
+            false,
+            &mut known_ids,
+            &mut checked,
+            &mut notified,
+            &mut enqueued,
+            &mut skipped_missing_credential,
+        )
+        .await
+        .unwrap();
+        let (fails, last) = db::source_failure_state(&pool, source).await.unwrap();
+        assert_eq!(fails, 1);
+        assert!(last > 0);
+
+        // 平台风控有时会返回“成功但空列表”。这不是恢复信号：若这里清零，
+        // 下一轮失败仍会显示 1，冷却永远不会达到 3，B站会被无限重打。
+        apply_source_outcome(
+            &pool,
+            &watch,
+            &library,
+            &notifier,
+            SourceCheckOutcome {
+                source_url: source.to_string(),
+                name: "测试UP主".to_string(),
+                item_download: None,
+                videos: Ok(Vec::new()),
+                timed_out: false,
+            },
+            false,
+            false,
+            false,
+            &mut known_ids,
+            &mut checked,
+            &mut notified,
+            &mut enqueued,
+            &mut skipped_missing_credential,
+        )
+        .await
+        .unwrap();
+
+        // 第二次真实失败必须累加到 2。
+        apply_source_outcome(
+            &pool,
+            &watch,
+            &library,
+            &notifier,
+            SourceCheckOutcome {
+                source_url: source.to_string(),
+                name: "测试UP主".to_string(),
+                item_download: None,
+                videos: Err(anyhow!("官方接口返回 HTTP 412")),
+                timed_out: false,
+            },
+            false,
+            false,
+            false,
+            &mut known_ids,
+            &mut checked,
+            &mut notified,
+            &mut enqueued,
+            &mut skipped_missing_credential,
+        )
+        .await
+        .unwrap();
+        let (fails, last_failed_at) = db::source_failure_state(&pool, source).await.unwrap();
+        assert_eq!(fails, 2, "空成功不得把连续失败计数清零");
+        assert!(last_failed_at > 0, "失败时间必须保留: {last_failed_at}");
+
+        std::mem::forget(pool);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn missing_credential_errors_skip_without_cooldown() {
+        // 真实的「未登录」文案（抖音适配器）应被识别为确定性错误。
+        assert!(is_missing_credential_error(
+            "尚未登录抖音：缺少 /path/douyin_browser_cookies.txt，请先在桌面端完成「抖音授权」扫码登录"
+        ));
+        // B站/快手风格的同类文案也应命中。
+        assert!(is_missing_credential_error(
+            "尚未登录：缺少 bilibili cookie 文件"
+        ));
+        // 只有「未登录」没有「缺少」时不算（避免把别的语义误判）。
+        assert!(!is_missing_credential_error("尚未登录"));
+        // 暂时性错误不能被误判成确定性错误，否则会绕过冷却。
+        assert!(!is_missing_credential_error("官方接口返回 HTTP 412"));
+        assert!(!is_missing_credential_error("请求超时（50 秒）"));
+        assert!(!is_missing_credential_error("RSSHub 请求失败: 连接超时"));
     }
 
     #[test]
@@ -1278,7 +1683,7 @@ mod tests {
         let pool = crate::db::open_pool(&db_file).await.unwrap();
         db::init_db(&pool).await.unwrap();
 
-        let (outcomes, _skipped) = check_video_sources_concurrent(
+        let (outcomes, _skipped, _proxy_off) = check_video_sources_concurrent(
             &pool,
             &root,
             vec![
@@ -1307,6 +1712,33 @@ mod tests {
             "快源不应被慢源阻塞：并发上限 2 时两者同时执行"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn proxy_off_precheck_only_targets_proxied_domains() {
+        // needs_proxy 语义：未配置代理恒 false；配置代理后仅“非直连域名”为 true。
+        let directs = vec!["bilibili.com".to_string()];
+        let no_proxy = crate::net::OutboundPolicy::for_test(None, directs.clone());
+        assert!(!no_proxy.needs_proxy("https://rsshub.app/douyin/user/x"));
+        assert!(!no_proxy.needs_proxy("https://space.bilibili.com/1"));
+
+        let with_proxy =
+            crate::net::OutboundPolicy::for_test(Some("http://127.0.0.1:7891"), directs);
+        assert!(with_proxy.needs_proxy("https://rsshub.app/douyin/user/x"));
+        assert!(!with_proxy.needs_proxy("https://space.bilibili.com/1"));
+
+        // 未配置代理时 proxy_alive 返回 None（无需探测），调度器跳过逻辑不触发。
+        // 用当前测试进程的全局策略（未 init 时默认全直连）验证 None 分支。
+        let default_alive = futures_executor_block_on(crate::net::policy().proxy_alive());
+        assert_eq!(default_alive, None, "全直连策略不应有代理可探测");
+    }
+
+    fn futures_executor_block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(fut)
     }
 
     #[tokio::test]
