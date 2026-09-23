@@ -1020,10 +1020,11 @@ export default function App() {
 
   /** 点「打开文件夹」＝马上进到那个人/那个内容自己的文件夹，没有中间页。 */
   const openNoteAnchorDir = async (anchor) => {
-    const root = (paths.fupan_output || '').replace(/\/+$/, '')
-    if (!root) return message.warning('还没解析出复盘目录，请先在「全局设置」里确认产物根目录')
-    const err = await window.desktop.openPath(`${root}/${anchor}`)
-    if (err) message.error(`打不开文件夹：${err}`)
+    const root = (paths.media_root || paths.fupan_output || '').replace(/\/+$/, '')
+    if (!root) return message.warning('还没解析出产物根目录，请先在「全局设置」里确认')
+    const dir = `${root}/${anchor}`
+    const err = await window.desktop.openPath(dir)
+    if (err) message.error(`打不开文件夹：${err}（该主播还没有产物目录时，可先确认是否录过/下载过）`)
   }
 
   /** 「换个目录」：复盘输出目录是可自由选择的，改完立刻按新目录重新拉数据。 */
@@ -1170,7 +1171,7 @@ export default function App() {
               {/* 目录本身就摆在最上面：能点、能直接打开、也能随时换。
                   用户要的「地址可以自由选择」就是这个「换个目录」。 */}
               <div className="notes-dir-bar">
-                <span className="notes-dir-label">复盘目录</span>
+                <span className="notes-dir-label">复盘输出目录（全局数据）</span>
                 <a className="detail-link" title="点击打开这个文件夹"
                   onClick={() => window.desktop.openPath(paths.fupan_output || '')}>
                   {paths.fupan_output || '（未解析）'}
@@ -1271,10 +1272,10 @@ export default function App() {
                 </div>
               ) : (
                 <div className="empty-wrap">
-                  <Empty description="这个目录下还没有复盘内容。录过一段直播、或下载过视频并转写之后，转写和笔记会出现在上面这个目录里。" />
+                  <Empty description="还没有复盘内容。录过一段直播、或下载过视频并转写之后，转写和笔记会出现在该主播自己的文件夹里。" />
                   <Space size={8}>
                     <Button icon={<FolderOpenFilled />}
-                      onClick={() => window.desktop.openPath(paths.fupan_output || '')}>打开这个目录看看</Button>
+                      onClick={() => window.desktop.openPath(paths.media_root || paths.fupan_output || '')}>打开产物目录看看</Button>
                     <Button onClick={changeFupanDir}>换个目录</Button>
                   </Space>
                 </div>
@@ -1463,13 +1464,13 @@ export default function App() {
 
         <div className="detail-block">
           <div className="detail-label">文字稿与复盘</div>
-          <a className="detail-link" onClick={() => window.desktop.openPath(paths.fupan_output || '')}>
-            {paths.fupan_output || '（未解析）'}
+          <a className="detail-link" onClick={() => detailRow && openItemStash(detailRow, detailType)}>
+            {stashOf(detailRow, detailType) || '（未解析）'}
           </a>
-          <div className="detail-hint">转写出来的文字稿、复盘结果都落在这个文件夹里</div>
+          <div className="detail-hint">转写文字稿落在该主播自己的文件夹里（与视频同目录），不是全局目录</div>
           <Space size={8} style={{ marginTop: 6 }} wrap>
             <Button size="small" icon={<FolderOpenFilled />}
-              onClick={() => window.desktop.openPath(paths.fupan_output || '')}>打开文字稿文件夹</Button>
+              onClick={() => detailRow && openItemStash(detailRow, detailType)}>打开文字稿文件夹</Button>
             <Button size="small"
               onClick={() => { setDetailOpen(false); setMainTab('notes') }}>看全部复盘笔记</Button>
           </Space>
