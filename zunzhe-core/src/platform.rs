@@ -1468,13 +1468,88 @@ pub async fn search_anchor(
             }));
         }
     }
-    candidates.push(json!({
-        "platform": "douyin",
-        "name": name,
-        "url": "",
-        "hint": "抖音主播搜索需 P4 接入 sec_uid 接口；可直接粘贴抖音主页链接给 monitor_add",
-    }));
+    // 抖音：带登录态 cookie 尝试 discover/search，无 cookie 或风控时给明确提示。
+    let dy = DouyinAdapter::new(_project_dir.to_path_buf());
+    let cookie_file = dy.cookie_path();
+    if cookie_file.exists() {
+        let keyword_url = reqwest::Url::parse(&format!(
+            "https://www.douyin.com/aweme/v1/web/discover/search/?keyword={name}&search_channel=aweme_user&search_type=user"
+        ))?;
+        let dy_req = client
+            .get(keyword_url)
+            .header(
+                reqwest::header::USER_AGENT,
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+            )
+            .header(reqwest::header::REFERER, "https://www.douyin.com/");
+        let dy_resp: serde_json::Value = dy_req.send().await?.json().await?;
+        let dy_code = dy_resp.get("status_code").and_then(|v| v.as_i64()).unwrap_or(-1);
+        if dy_code == 0 {
+            let mut dy_count = 0usize;
+            collect_douyin_users(&dy_resp, &mut candidates, &mut dy_count);
+            if dy_count == 0 {
+                candidates.push(json!({
+                    "platform": "douyin",
+                    "name": name,
+                    "url": "",
+                    "hint": "抖音搜索无结果；可直接粘贴抖音主页链接给 monitor_add",
+                }));
+            }
+        } else {
+            candidates.push(json!({
+                "platform": "douyin",
+                "name": name,
+                "url": "",
+                "hint": "抖音搜索被风控（status_code={dy_code}）。可先在桌面端完成「抖音授权」后重试，或直接粘贴抖音主页链接给 monitor_add",
+            }));
+        }
+    } else {
+        candidates.push(json!({
+            "platform": "douyin",
+            "name": name,
+            "url": "",
+            "hint": "抖音未授权（缺 douyin_browser_cookies.txt）。先在桌面端「抖音授权」扫码，或直接粘贴抖音主页链接给 monitor_add",
+        }));
+    }
     Ok(json!({"ok": true, "count": candidates.len(), "candidates": candidates}))
+}
+
+
+/// 从抖音搜索响应中宽松收集用户条目（字段结构因接口版本而异，递归扫描）。
+fn collect_douyin_users(
+    value: &serde_json::Value,
+    out: &mut Vec<serde_json::Value>,
+    count: &mut usize,
+) {
+    if *count >= 10 {
+        return;
+    }
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(sec_uid) = map.get("sec_uid").and_then(|v| v.as_str())
+                && let Some(nickname) = map.get("nickname").and_then(|v| v.as_str())
+                && !sec_uid.is_empty()
+            {
+                out.push(serde_json::json!({
+                    "platform": "douyin",
+                    "name": nickname,
+                    "url": format!("https://www.douyin.com/user/{sec_uid}"),
+                    "sec_uid": sec_uid,
+                    "signature": map.get("signature").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                }));
+                *count += 1;
+            }
+            for v in map.values() {
+                collect_douyin_users(v, out, count);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                collect_douyin_users(v, out, count);
+            }
+        }
+        _ => {}
+    }
 }
 
 pub fn resolve_with_project_dir(url: &str, project_dir: &Path) -> Box<dyn Platform> {
