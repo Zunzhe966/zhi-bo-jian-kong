@@ -510,7 +510,7 @@ export default function App() {
       const g = by.get(anchor)
       const files = []
       // 笔记（LLM 复盘结论）排最前，转写其次，知识点最后——用户最关心的先露脸。
-      if (n.notes_file) files.push({ path: n.notes_file, name: fileBaseName(n.notes_file), kind: 'notes', kindLabel: '复盘笔记' })
+      if (n.notes_file) files.push({ path: n.notes_file, name: fileBaseName(n.notes_file), kind: 'notes', kindLabel: '转写文本' })
       if (n.transcript_file) files.push({ path: n.transcript_file, name: fileBaseName(n.transcript_file), kind: 'txt', kindLabel: '转写' })
       if (n.points_file) files.push({ path: n.points_file, name: fileBaseName(n.points_file), kind: 'json', kindLabel: '知识点' })
       g.sessions.push({ session: n.session || '', files, clips: n.clips || [] })
@@ -1029,7 +1029,7 @@ export default function App() {
     live_monitor: { running: serviceRunning },
     video_monitor: { running: serviceRunning },
   }
-  const tabTitles = { live: '直播监控', video: '发布视频监控', notes: '复盘笔记', logs: '运行日志' }
+  const tabTitles = { live: '直播监控', video: '发布视频监控', notes: '转写文本', logs: '运行日志' }
   const tabHints = {
     live: '每个主播一张卡片，点「主播设置」改画质、通知、删除',
     video: '每个博主一张卡片，点「博主设置」改下载、通知、历史视频、删除',
@@ -1055,21 +1055,18 @@ export default function App() {
           <CloudDownloadOutlined /> 视频监控 <span className="nav-badge">{videoRows.length}</span>
         </button>
         <button type="button" className={`nav-item ${mainTab === 'notes' ? 'active' : ''}`} onClick={() => setMainTab('notes')}>
-          <FileTextOutlined /> 复盘笔记 <span className="nav-badge">{noteSessionCount}</span>
+          <FileTextOutlined /> 转写文本 <span className="nav-badge">{noteSessionCount}</span>
         </button>
         <button type="button" className={`nav-item ${mainTab === 'logs' ? 'active' : ''}`} onClick={() => setMainTab('logs')}>
           <UnorderedListOutlined /> 运行日志
         </button>
         <div className="sidebar-foot">
-          <Button block icon={<ReloadOutlined />} onClick={reloadUi}>重新加载界面</Button>
           <Button block icon={<ControlFilled />} onClick={openSettings}>全局设置</Button>
           {/* 两个按钮必须一眼分得清：产物是用户自己的文件，程序是安装目录。
               以前叫「打开保存目录 / 打开数据目录」，用户点了后者跳到程序目录，
               看不出是故意的还是出错——名字直接说清就好了。 */}
           <Button block icon={<FolderOpenFilled />} onClick={() => window.desktop.openPath(status?.paths?.media_root || status?.paths?.recordings || '')}>打开产物目录</Button>
           <Button block icon={<CloudSyncOutlined />} loading={updateBusy} onClick={checkUpdate}>检查更新</Button>
-          <Button block icon={<AppstoreOutlined />} onClick={() => window.desktop.openPath(status?.paths?.project_dir || '')}>打开程序目录</Button>
-          <div className="hotkey-tip">快捷键 Ctrl+Shift+L 唤出窗口</div>
           <div className="app-version">界面 v2 · v{APP_VERSION} · 构建于 {BUILD_LABEL}</div>
         </div>
       </aside>
@@ -1457,7 +1454,7 @@ export default function App() {
             <Button size="small" icon={<FolderOpenFilled />}
               onClick={() => detailRow && openItemStash(detailRow, detailType)}>打开文字稿文件夹</Button>
             <Button size="small"
-              onClick={() => { setDetailOpen(false); setMainTab('notes') }}>看全部复盘笔记</Button>
+              onClick={() => { setDetailOpen(false); setMainTab('notes') }}>看全部转写文本</Button>
           </Space>
         </div>
 

@@ -71,7 +71,7 @@ export const LiveCard = memo(function LiveCard({
 })
 
 export const VideoCard = memo(function VideoCard({
-  row, platformIcon, platformLabel, onSettings, onHistory, onToggleDownload, onOpenStash, onDetail,
+  row, platformIcon, platformLabel, onSettings, onOpenStash, onDetail,
 }) {
   const platName = platformLabel ? platformLabel(row.platform) : ''
   // 平台图标以前是写死的 B站图标：不管监控的是哪个站，卡片长得一模一样，
