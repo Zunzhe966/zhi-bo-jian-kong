@@ -83,26 +83,34 @@ async fn stdio_control_plane_exposes_all_tools_and_central_risk_classes() {
         .iter()
         .filter_map(|tool| tool["name"].as_str())
         .collect();
-    assert_eq!(tools.len(), 43, "源码控制面必须暴露 43 个工具");
-    assert!(names.contains("control_list"));
-    assert!(names.contains("audit_list"));
+    assert_eq!(tools.len(), 18, "源码控制面必须暴露 18 个工具（产品手册第 6 章）");
+    assert!(names.contains("monitor_add"));
+    assert!(names.contains("monitor_list"));
+    assert!(names.contains("anchor_search"));
+    assert!(!names.contains("control_list"), "旧工具 control_list 必须移除");
+    assert!(!names.contains("audit_list"), "旧工具 audit_list 必须移除");
+    assert!(!names.contains("live_add"), "旧工具 live_add 必须移除");
 
-    let controlled = call(
+    // 每个现役工具必须有 name/description/inputSchema。
+    for tool in tools {
+        let name = tool["name"].as_str().unwrap();
+        assert!(!name.is_empty(), "工具缺 name");
+        assert!(tool["description"].as_str().map(|s| !s.is_empty()).unwrap_or(false), "工具 {name} 缺 description");
+        assert!(tool["inputSchema"].is_object(), "工具 {name} 缺 inputSchema");
+    }
+
+    // 抽查一个真实工具调用可用。
+    let monitored = call(
         &mut stdin,
         &mut stdout,
-        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"control_list","arguments":{}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"monitor_list","arguments":{}}}),
     )
     .await;
-    assert_eq!(controlled["result"]["isError"], false);
+    assert_eq!(monitored["result"]["isError"], false);
     let body: Value =
-        serde_json::from_str(controlled["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        serde_json::from_str(monitored["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(body["ok"], true);
-    assert_eq!(body["count"], 43);
-    let controls = body["controls"].as_array().unwrap();
-    for control in controls {
-        let name = control["name"].as_str().unwrap();
-        assert_ne!(control["risk"], "unknown", "工具 {name} 未登记风险级别");
-    }
+    assert!(body.get("live").is_some() && body.get("video").is_some(), "monitor_list 必须返回 live+video 两张表");
 
     drop(stdin);
     let _ = child.start_kill();

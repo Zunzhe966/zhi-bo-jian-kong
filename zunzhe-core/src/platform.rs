@@ -1410,6 +1410,73 @@ impl Platform for DouyinAdapter {
 }
 
 /// 带项目根的平台注册表：yt-dlp 兜底按项目 .venv 查找，跨目录运行也可用。
+
+/// 按名字搜索主播（P4 起点：B 站搜索接口基础版；抖音 sec_uid 搜索后续完善）。
+///
+/// 返回结构：`{ok, candidates: [{platform, name, url, mid?, room_id?, sign?, hint?}]}`
+/// - B 站：`api.bilibili.com/x/web-interface/search/type?search_type=bili_user`
+///   风控（-352/412）时返回明确错误而不是静默空结果。
+/// - 抖音：当前返回提示条目，等 P4 接入 sec_uid 搜索。
+pub async fn search_anchor(
+    name: &str,
+    _project_dir: &Path,
+    cfg: &crate::config::Config,
+) -> anyhow::Result<serde_json::Value> {
+    use serde_json::json;
+    let client = reqwest::Client::new();
+    let keyword = reqwest::Url::parse(&format!(
+        "https://api.bilibili.com/x/web-interface/search/type?search_type=bili_user&keyword={name}"
+    ))?;
+    let mut req = client
+        .get(keyword)
+        .header(
+            reqwest::header::USER_AGENT,
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+        )
+        .header(reqwest::header::REFERER, "https://search.bilibili.com/");
+    let cookie = cfg.get_main("Cookie", "b站cookie");
+    if !cookie.is_empty() {
+        if let Ok(v) = reqwest::header::HeaderValue::from_str(&cookie) {
+            req = req.header(reqwest::header::COOKIE, v);
+        }
+    }
+    let resp: serde_json::Value = req.send().await?.json().await?;
+    let code = resp.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+    if code != 0 {
+        let msg = resp
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("未知错误")
+            .to_string();
+        anyhow::bail!("B站搜索被风控（code={code}，{msg}）。可稍后再试或直接提供主页 URL 给 monitor_add");
+    }
+    let mut candidates = Vec::new();
+    if let Some(users) = resp.pointer("/data/result").and_then(|v| v.as_array()) {
+        for u in users.iter().take(10) {
+            let uname = u.get("uname").and_then(|v| v.as_str()).unwrap_or_default();
+            let mid = u.get("mid").and_then(|v| v.as_i64()).unwrap_or(0);
+            if mid == 0 {
+                continue;
+            }
+            candidates.push(json!({
+                "platform": "bilibili",
+                "name": uname,
+                "url": format!("https://space.bilibili.com/{mid}"),
+                "mid": mid,
+                "room_id": u.get("room_id").and_then(|v| v.as_i64()).unwrap_or(0),
+                "sign": u.get("sign").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            }));
+        }
+    }
+    candidates.push(json!({
+        "platform": "douyin",
+        "name": name,
+        "url": "",
+        "hint": "抖音主播搜索需 P4 接入 sec_uid 接口；可直接粘贴抖音主页链接给 monitor_add",
+    }));
+    Ok(json!({"ok": true, "count": candidates.len(), "candidates": candidates}))
+}
+
 pub fn resolve_with_project_dir(url: &str, project_dir: &Path) -> Box<dyn Platform> {
     if url.contains("bilibili.com") || url.contains("b23.tv") {
         let cookie = crate::config::Config::load(project_dir)

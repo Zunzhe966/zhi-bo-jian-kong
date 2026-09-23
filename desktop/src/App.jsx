@@ -39,16 +39,10 @@ const notifyOptions = [
 ]
 
 const platformOptions = [
-  { label: '自动识别（推荐，支持40+平台）', value: 'Auto' },
+  { label: '自动识别（推荐）', value: 'Auto' },
   { label: '抖音', value: 'DouYin' },
   { label: '快手', value: 'KuaiShou' },
   { label: 'B站', value: 'Bilibili' },
-  { label: '虎牙', value: 'Huya' },
-  { label: '斗鱼', value: 'Douyu' },
-  { label: '小红书', value: 'Xiaohongshu' },
-  { label: 'TikTok', value: 'TikTok' },
-  { label: 'YouTube', value: 'Youtube' },
-  { label: 'Twitch', value: 'Twitch' },
   { label: '其他（直接粘贴完整链接）', value: 'Other' },
 ]
 

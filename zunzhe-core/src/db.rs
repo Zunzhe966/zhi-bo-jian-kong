@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS videos (
     published_at  TEXT NOT NULL DEFAULT '',
     duration      INTEGER NOT NULL DEFAULT 0,
     anchor        TEXT NOT NULL DEFAULT '',
+    anchor_id     TEXT NOT NULL DEFAULT '',
     source_url    TEXT NOT NULL DEFAULT '',
     downloaded    INTEGER NOT NULL DEFAULT 0,
     downloaded_at TEXT NOT NULL DEFAULT '',
@@ -57,6 +58,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     kind       TEXT NOT NULL DEFAULT '',
     url        TEXT NOT NULL DEFAULT '',
     name       TEXT NOT NULL DEFAULT '',
+    anchor_id  TEXT NOT NULL DEFAULT '',
     status     TEXT NOT NULL DEFAULT 'pending',
     attempts      INTEGER NOT NULL DEFAULT 0,
     payload       TEXT NOT NULL DEFAULT '',
@@ -78,6 +80,7 @@ CREATE TABLE IF NOT EXISTS live_sessions (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     url        TEXT NOT NULL,
     anchor     TEXT NOT NULL DEFAULT '',
+    anchor_id  TEXT NOT NULL DEFAULT '',
     title      TEXT NOT NULL DEFAULT '',
     platform   TEXT NOT NULL DEFAULT '',
     stream_url TEXT NOT NULL DEFAULT '',
@@ -201,6 +204,35 @@ pub async fn init_db(pool: &SqlitePool) -> anyhow::Result<()> {
         .execute(pool)
         .await
         .context("迁移监控源失败时间字段")?;
+    }
+    // 选项 A：Anchor 一等公民 —— 给 videos / tasks / live_sessions 增加 anchor_id 列，
+    // 作为贯穿采集→转写→产物树的稳定主播身份（当前稳定身份 = 主播名）。
+    for (table, ddl) in [
+        (
+            "videos",
+            "ALTER TABLE videos ADD COLUMN anchor_id TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "tasks",
+            "ALTER TABLE tasks ADD COLUMN anchor_id TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "live_sessions",
+            "ALTER TABLE live_sessions ADD COLUMN anchor_id TEXT NOT NULL DEFAULT ''",
+        ),
+    ] {
+        let exists = sqlx::query_scalar::<_, i64>(
+            &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name='anchor_id'"),
+        )
+        .fetch_one(pool)
+        .await
+        .with_context(|| format!("检查 {table}.anchor_id 字段"))?;
+        if exists == 0 {
+            sqlx::query(ddl)
+                .execute(pool)
+                .await
+                .with_context(|| format!("迁移 {table}.anchor_id 字段"))?;
+        }
     }
     Ok(())
 }
@@ -1212,11 +1244,12 @@ pub async fn start_live_session(
 ) -> anyhow::Result<i64> {
     let result = sqlx::query(
         r#"INSERT INTO live_sessions
-           (url, anchor, title, platform, stream_url, status, pid, file_path)
-           VALUES (?,?,?,?,?, 'recording', ?, ?)"#,
+           (url, anchor, anchor_id, title, platform, stream_url, status, pid, file_path)
+           VALUES (?,?,?,?,?,?, 'recording', ?, ?)"#,
     )
     .bind(url)
     .bind(anchor)
+    .bind(resolve_anchor_id(anchor))
     .bind(title)
     .bind(platform)
     .bind(stream_url)
@@ -1426,13 +1459,13 @@ pub async fn upsert_video(
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     sqlx::query(
         r#"INSERT INTO videos
-           (id, platform, url, title, cover, cover_cache, published_at, duration, anchor, source_url, updated_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?)
+           (id, platform, url, title, cover, cover_cache, published_at, duration, anchor, anchor_id, source_url, updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(id) DO UPDATE SET
              platform=excluded.platform, url=excluded.url, title=excluded.title,
              cover=excluded.cover, cover_cache=excluded.cover_cache,
              published_at=excluded.published_at, duration=excluded.duration,
-             anchor=excluded.anchor, source_url=excluded.source_url, updated_at=excluded.updated_at"#,
+             anchor=excluded.anchor, anchor_id=excluded.anchor_id, source_url=excluded.source_url, updated_at=excluded.updated_at"#,
     )
     .bind(&video.id)
     .bind(&video.platform)
@@ -1443,6 +1476,7 @@ pub async fn upsert_video(
     .bind(&video.published_at)
     .bind(video.duration)
     .bind(anchor)
+    .bind(resolve_anchor_id(anchor))
     .bind(source_url)
     .bind(now)
     .execute(pool)
@@ -1616,13 +1650,14 @@ pub async fn ensure_video_row(
 ) -> anyhow::Result<()> {
     sqlx::query(
         r#"INSERT OR IGNORE INTO videos
-           (id, platform, url, title, anchor, source_url, updated_at)
-           VALUES (?, '', ?, ?, ?, ?, ?)"#,
+           (id, platform, url, title, anchor, anchor_id, source_url, updated_at)
+           VALUES (?, '', ?, ?, ?, ?, ?, ?)"#,
     )
     .bind(video_id)
     .bind(url)
     .bind(title)
     .bind(anchor)
+    .bind(resolve_anchor_id(anchor))
     .bind(url)
     .bind(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string())
     .execute(pool)
@@ -1760,6 +1795,15 @@ pub async fn list_videos(
 }
 
 #[allow(dead_code)] // daemon 下载队列入队接口
+/// 选项 A：Anchor 一等公民 —— 主播身份的唯一解析点。
+///
+/// 当前稳定身份取主播名（与产物目录一级=主播名、R2 规则一致）。
+/// 返回值是写入 `videos.anchor_id` / `tasks.anchor_id` / `live_sessions.anchor_id`
+/// 的稳定主键；未来若要改成哈希 id 或查 `anchors` 表，只改这一处。
+pub fn resolve_anchor_id(name: &str) -> String {
+    name.to_string()
+}
+
 pub async fn enqueue_task(
     pool: &SqlitePool,
     kind: &str,
@@ -1781,11 +1825,12 @@ pub async fn enqueue_task(
         return Ok(id);
     }
     let result =
-        sqlx::query("INSERT INTO tasks (kind, url, name, status) VALUES (?, ?, ?, 'pending')")
-            .bind(kind)
-            .bind(url)
-            .bind(name)
-            .execute(pool)
+        sqlx::query("INSERT INTO tasks (kind, url, name, anchor_id, status) VALUES (?, ?, ?, ?, 'pending')")
+    .bind(kind)
+    .bind(url)
+    .bind(name)
+    .bind(resolve_anchor_id(name))
+    .execute(pool)
             .await
             .context("写入 tasks")?;
     Ok(result.last_insert_rowid())

@@ -111,7 +111,7 @@ Electron 桌面端  →  Rust daemon（zunzhe-core，主控）  →  Python 工�
 | **产物根** | `/Volumes/A区/尊者产物` |
 | 数据库 | `/Volumes/A区/尊者产物/database/zunzhe-core.db` |
 | Rust 二进制 | `<项目>/zunzhe-core/target/release/zunzhe-core` |
-| MCP 工具数 | **43 个**（运行时 `tools/list` 实测；`.神经总账/控制面.json` 是**快照，会过期**） |
+| MCP 工具数 | **18 个**（2026-09-23 实测新 release 二进制 `tools/list`；`.神经总账/控制面.json` 是**快照，会过期**） |
 | MCP 控制面快照 | `.神经总账/控制面.json`（**不是** `.神经/控制面.json`，后者是旧残留） |
 | **守护职责** | **桌面端 watchdog**（GUI 会话进程）。launchd 域（gui/501）进程**无法访问外置盘** `/Volumes/A区`（2026-09-23 实测 `launchctl submit` 跑 `ls /Volumes/A区/...` = `Operation not permitted`）→ **launchd 无法托管本 daemon**；`scripts/launchd/*` 与磁盘 plist 仅备用 |
 | **日志目录** | `~/Library/Logs/zunzhe`（config.ini `[路径设置] 日志目录` 显式配置，2026-09-23 起） |
@@ -149,7 +149,7 @@ npm test --prefix desktop                        # 桌面端测试
 ## 五、智能体与本软件的协作方式
 
 ```
-1. 智能体通过 MCP 让软件去监控（当前工具 `live_add` / `video_add`，规划统一为 `monitor_add`）
+1. 智能体通过 MCP 让软件去监控（`monitor_add` / `monitor_remove` / `monitor_list` / `monitor_set`，P3 已完成 43→18 收敛）
 2. 软件自动录制 / 下载
 3. 软件自动调本地 whisper 转写               → 落盘 .转写.txt
 4. 智能体通过 MCP 调 notes_list              → 拿到转写文件绝对路径

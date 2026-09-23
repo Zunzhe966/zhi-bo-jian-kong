@@ -10,6 +10,7 @@ pub mod download;
 pub mod extension;
 pub mod live_monitor;
 pub mod live_python_bridge;
+pub mod contract;
 pub mod mcp_audit;
 pub mod model;
 pub mod net;

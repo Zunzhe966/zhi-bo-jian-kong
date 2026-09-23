@@ -5,7 +5,6 @@
 //! audit trail because it is unstructured and does not survive log rotation in
 //! a queryable form.  This module keeps a small, redacted record in SQLite.
 
-use std::time::Instant;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -36,27 +35,7 @@ pub struct McpCall {
 /// display both consume it, so a new tool cannot silently appear as "read only"
 /// merely because its caller forgot to annotate it.
 pub fn risk_for(tool: &str) -> &'static str {
-    match tool {
-        "live_status" | "live_list" | "service_status" | "status" | "tail_logs" | "video_list"
-        | "video_library" | "email_status" | "app_prefs_get" | "config_get"
-        | "config_schema_tool" | "notes_list" | "doctor" | "notify_list" | "audit_list"
-        | "control_list" => "read_only",
-        "live_check" | "video_check_now" | "blogger_videos" | "test_email" | "test_notify" => {
-            "network"
-        }
-        "live_add" | "live_remove" | "live_delete" | "live_set_notify" | "video_add"
-        | "video_remove" | "email_setup" | "app_prefs_set" | "config_set" | "config_set_bulk"
-        | "wizard_done" => "config_write",
-        "record_live"
-        | "download_video"
-        | "video_download"
-        | "download_videos"
-        | "process_media"
-        | "export_training_data" => "queue_write",
-        "service_start" | "ensure_services" | "service_stop" => "service_lifecycle",
-        "notify_retry" | "notify_prune" => "record_delete",
-        _ => "unknown",
-    }
+    crate::contract::risk_for(tool)
 }
 
 /// Redact credentials before persisting or returning an argument summary.
@@ -203,55 +182,6 @@ pub async fn list_calls(pool: &SqlitePool, limit: i64) -> anyhow::Result<Vec<Mcp
     Ok(out)
 }
 
-/// Build the JSON payload for the `audit_list` tool.
-///
-/// Keeping this in the stable audit module means the extension entry only has to
-/// dispatch to it; redaction and query semantics are covered by the module's
-/// own tests even if the large extension source is being read under load.
-pub async fn list_calls_json(pool: &SqlitePool, limit: i64) -> anyhow::Result<Value> {
-    let calls = list_calls(pool, limit).await?;
-    Ok(serde_json::json!({
-        "ok": true,
-        "count": calls.len(),
-        "calls": calls,
-    }))
-}
-
-/// 根据已经暴露的工具定义生成控制面清单。
-///
-/// `control_list` 必须复用 `tools_list()` 和 `risk_for()`，不能在另一个地方
-/// 手写一份工具数组；否则新增工具时会出现“能调用但控制面看不见”或风险
-/// 级别漂移。这里只做投影，不执行任何工具。
-pub fn controls_json(tools: &[Value]) -> Value {
-    let controls: Vec<Value> = tools
-        .iter()
-        .filter_map(|tool| {
-            let name = tool.get("name").and_then(Value::as_str)?;
-            Some(serde_json::json!({
-                "name": name,
-                "description": tool.get("description").and_then(Value::as_str).unwrap_or(""),
-                "inputSchema": tool.get("inputSchema").cloned().unwrap_or_else(|| serde_json::json!({
-                    "type": "object",
-                    "properties": {}
-                })),
-                "risk": risk_for(name),
-            }))
-        })
-        .collect();
-    let count = controls.len();
-    serde_json::json!({
-        "ok": true,
-        "count": count,
-        "controls": controls,
-    })
-}
-
-/// Measure a synchronous section and return both its result and duration.
-pub fn timed<T>(f: impl FnOnce() -> T) -> (T, std::time::Duration) {
-    let start = Instant::now();
-    let result = f();
-    (result, start.elapsed())
-}
 
 #[cfg(test)]
 mod tests {
@@ -323,52 +253,5 @@ mod tests {
         assert!(!calls[1].arguments_summary.contains("top-secret"));
     }
 
-    #[tokio::test]
-    async fn json_payload_contains_no_secret_argument_values() {
-        let pool = test_pool().await;
-        record_call(
-            &pool,
-            "email_setup",
-            &json!({"email": "me@example.test", "auth": "mail-secret"}),
-            true,
-            "",
-            std::time::Duration::from_millis(3),
-        )
-        .await
-        .unwrap();
-        let payload = list_calls_json(&pool, 10).await.unwrap();
-        assert_eq!(payload["ok"], true);
-        assert_eq!(payload["count"], 1);
-        let text = payload.to_string();
-        assert!(text.contains("me@example.test"));
-        assert!(!text.contains("mail-secret"));
-    }
 
-    #[test]
-    fn controls_json_projects_tool_metadata_and_risk() {
-        let tools = vec![
-            json!({
-                "name": "control_list",
-                "description": "list controls",
-                "inputSchema": {"type": "object", "properties": {}}
-            }),
-            json!({
-                "name": "doctor",
-                "description": "diagnose",
-                "inputSchema": {"type": "object", "properties": {}}
-            }),
-            json!({"name": "future_tool"}),
-        ];
-
-        let payload = controls_json(&tools);
-
-        assert_eq!(payload["ok"], true);
-        assert_eq!(payload["count"], 3);
-        assert_eq!(payload["controls"][0]["name"], "control_list");
-        assert_eq!(payload["controls"][0]["risk"], "read_only");
-        assert_eq!(payload["controls"][1]["risk"], "read_only");
-        assert_eq!(payload["controls"][2]["risk"], "unknown");
-        assert_eq!(payload["controls"][2]["description"], "");
-        assert_eq!(payload["controls"][2]["inputSchema"]["type"], "object");
-    }
 }

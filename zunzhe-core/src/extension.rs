@@ -7,14 +7,11 @@ use sqlx::sqlite::SqlitePool;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::error;
 
-use crate::app_prefs;
 use crate::config::Config;
 use crate::config_api::ConfigApi;
 use crate::db;
 use crate::mcp_audit;
-use crate::platform;
 use crate::scheduler;
-use crate::training_data;
 use crate::video_library::VideoLibrary;
 use crate::watchlist::Watchlist;
 
@@ -199,56 +196,12 @@ async fn write_response(writer: &mut tokio::io::Stdout, value: Value) -> std::io
 }
 
 pub fn tools_list() -> Vec<Value> {
-    vec![
-        json!({"name":"live_status","description":"查看整体状态：监控、视频库、邮箱","inputSchema":{"type":"object","properties":{}}}),
-        json!({"name":"live_list","description":"列出直播监控项","inputSchema":{"type":"object","properties":{}}}),
-        json!({"name":"live_add","description":"添加直播监控","inputSchema":{"type":"object","properties":{"url":{"type":"string"},"name":{"type":"string"},"quality":{"type":"string"}},"required":["url"]}}),
-        json!({"name":"live_remove","description":"移除直播监控","inputSchema":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}),
-        json!({"name":"live_delete","description":"彻底删除直播监控","inputSchema":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}),
-        json!({"name":"live_check","description":"检查直播监控项","inputSchema":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}),
-        json!({"name":"live_set_notify","description":"设置直播监控通知通道","inputSchema":{"type":"object","properties":{"url":{"type":"string"},"channel":{"type":"string"},"name":{"type":"string"}},"required":["url"]}}),
-        json!({"name":"record_live","description":"手动录制一次直播（秒数，0=一直录到结束）","inputSchema":{"type":"object","properties":{"url":{"type":"string"},"duration_secs":{"type":"number"}},"required":["url"]}}),
-        json!({"name":"service_status","description":"查看 Python 服务、Rust daemon 与直播录制会话","inputSchema":{"type":"object","properties":{}}}),
-        json!({"name":"tail_logs","description":"读取后台服务日志末尾","inputSchema":{"type":"object","properties":{"name":{"type":"string"},"lines":{"type":"number"}}}}),
-        json!({"name":"video_add","description":"添加博主发视频监控","inputSchema":{"type":"object","properties":{"url":{"type":"string"},"name":{"type":"string"},"download":{"type":"string"}},"required":["url"]}}),
-        json!({"name":"video_remove","description":"移除发视频监控","inputSchema":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}),
-        json!({"name":"video_list","description":"列出发视频监控","inputSchema":{"type":"object","properties":{}}}),
-        json!({"name":"video_check_now","description":"立即检查一轮新视频","inputSchema":{"type":"object","properties":{}}}),
-        json!({"name":"blogger_videos","description":"列出博主历史视频（count=0 表示全部）","inputSchema":{"type":"object","properties":{"url":{"type":"string"},"count":{"type":"number"}},"required":["url"]}}),
-        json!({"name":"download_video","description":"下载视频到 downloads/短视频/","inputSchema":{"type":"object","properties":{"url":{"type":"string"},"name":{"type":"string"}},"required":["url"]}}),
-        json!({"name":"video_download","description":"下载视频到 downloads/短视频/（Python 兼容别名）","inputSchema":{"type":"object","properties":{"url":{"type":"string"},"name":{"type":"string"}},"required":["url"]}}),
-        json!({"name":"download_videos","description":"批量下载多个视频（跳过已下载与空 URL）","inputSchema":{"type":"object","properties":{"items_json":{"type":"string"}},"required":["items_json"]}}),
-        json!({"name":"video_library","description":"查询视频库","inputSchema":{"type":"object","properties":{"source_url":{"type":"string"},"downloaded_only":{"type":"boolean"}}}}),
-        json!({"name":"status","description":"桌面端状态快照（含最近录制、复盘产物与目录）","inputSchema":{"type":"object","properties":{}}}),
-        json!({"name":"export_training_data","description":"导出训练数据 JSONL","inputSchema":{"type":"object","properties":{"anchor":{"type":"string"},"output":{"type":"string"}}}}),
-        json!({"name":"email_status","description":"查看邮箱配置状态","inputSchema":{"type":"object","properties":{}}}),
-        json!({"name":"email_setup","description":"写入 QQ 邮箱配置","inputSchema":{"type":"object","properties":{"email":{"type":"string"},"auth":{"type":"string"},"to":{"type":"string"}},"required":["email","auth"]}}),
-        json!({"name":"app_prefs_get","description":"读取桌面应用偏好","inputSchema":{"type":"object","properties":{}}}),
-        json!({"name":"app_prefs_set","description":"写入桌面应用偏好","inputSchema":{"type":"object","properties":{"updates":{"type":"object"}}}}),
-        json!({"name":"config_get","description":"读取配置","inputSchema":{"type":"object","properties":{"file":{"type":"string"},"section":{"type":"string"},"key":{"type":"string"}}}}),
-        json!({"name":"config_set","description":"写入配置","inputSchema":{"type":"object","properties":{"file":{"type":"string"},"section":{"type":"string"},"key":{"type":"string"},"value":{"type":"string"}},"required":["file","section","key","value"]}}),
-        json!({"name":"config_set_bulk","description":"批量写入配置","inputSchema":{"type":"object","properties":{"updates_json":{"type":"string"}}}}),
-        json!({"name":"config_schema_tool","description":"配置结构说明","inputSchema":{"type":"object","properties":{}}}),
-        json!({"name":"notes_list","description":"列出复盘产物","inputSchema":{"type":"object","properties":{"name":{"type":"string"}}}}),
-        json!({"name":"process_media","description":"对音视频跑复盘流水线","inputSchema":{"type":"object","properties":{"file_path":{"type":"string"},"anchor_name":{"type":"string"}},"required":["file_path"]}}),
-        json!({"name":"service_start","description":"启动 Rust 核心 daemon（统一直播+视频监控）","inputSchema":{"type":"object","properties":{}}}),
-        json!({"name":"service_stop","description":"停止 Rust 核心 daemon","inputSchema":{"type":"object","properties":{}}}),
-        json!({"name":"ensure_services","description":"确保 Rust 核心 daemon 运行（桌面端/watchdog 入口）","inputSchema":{"type":"object","properties":{}}}),
-        json!({"name":"doctor","description":"运行环境诊断（日志/磁盘/ffmpeg/守护心跳/监控源健康）","inputSchema":{"type":"object","properties":{}}}),
-        json!({"name":"wizard_done","description":"标记桌面向导完成","inputSchema":{"type":"object","properties":{}}}),
-        json!({"name":"test_email","description":"发送测试邮件","inputSchema":{"type":"object","properties":{}}}),
-        json!({"name":"test_notify","description":"发送测试通知（Python 兼容别名）","inputSchema":{"type":"object","properties":{}}}),
-        json!({"name":"notify_list","description":"列出最近通知记录（status 可填 pending/sent/failed/空）","inputSchema":{"type":"object","properties":{"status":{"type":"string"},"limit":{"type":"number"}}}}),
-        json!({"name":"notify_retry","description":"把失败通知重新放回队列（配置补齐后手动重发）","inputSchema":{"type":"object","properties":{"limit":{"type":"number"}}}}),
-        json!({"name":"notify_prune","description":"清理已发送/已失败的通知记录（limit=0 表示全部）","inputSchema":{"type":"object","properties":{"status":{"type":"string"},"limit":{"type":"number"}}}}),
-        json!({"name":"audit_list","description":"列出最近的 MCP 工具调用审计（参数已脱敏）","inputSchema":{"type":"object","properties":{"limit":{"type":"number"}}}}),
-        json!({"name":"control_list","description":"列出所有 MCP 工具、参数与风险级别","inputSchema":{"type":"object","properties":{}}}),
-    ]
+    crate::contract::tools_list()
 }
 
 async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<String> {
     let ToolContext {
-        library,
+        library: _library,
         fupan_dir,
         cfg,
         pool,
@@ -257,179 +210,129 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
         project_dir,
     } = ctx;
     match name {
-        "live_status" => Ok(serde_json::to_string(
-            &crate::status_snapshot::build(project_dir, pool, cfg).await?,
-        )?),
         "status" => Ok(serde_json::to_string(
             &crate::status_snapshot::build(project_dir, pool, cfg).await?,
         )?),
-        "live_list" => Ok(serde_json::to_string(
-            &json!({"ok":true,"rooms":watch.list_live()}),
+        "monitor_list" => Ok(serde_json::to_string(
+            &json!({"ok":true,"live":watch.list_live(),"video":watch.list_video()}),
         )?),
-        "live_add" => {
-            let url = args.get("url").and_then(|v| v.as_str()).unwrap_or_default();
-            let name = args
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            let quality = args
-                .get("quality")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            watch.add_live(url, &format!("主播: {name}"), quality)?;
-            Ok(serde_json::to_string(
-                &json!({"ok":true,"url":url,"name":name}),
-            )?)
-        }
-        "live_remove" => {
-            let url = args.get("url").and_then(|v| v.as_str()).unwrap_or_default();
-            let removed = watch.remove_live(url)?;
-            Ok(serde_json::to_string(&json!({"ok":removed,"url":url}))?)
-        }
-        "live_delete" => {
-            let url = args.get("url").and_then(|v| v.as_str()).unwrap_or_default();
-            let deleted = watch.delete_live(url)?;
-            Ok(serde_json::to_string(
-                &json!({"ok": deleted, "url": url, "action": "delete-live"}),
-            )?)
-        }
-        "live_set_notify" => {
-            let url = args.get("url").and_then(|v| v.as_str()).unwrap_or_default();
-            let channel = args
-                .get("channel")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            let name = args
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            match watch.set_notify(url, channel, name) {
-                Ok(_) => Ok(serde_json::to_string(
-                    &json!({"ok": true, "url": url, "channel": channel, "name": name}),
-                )?),
-                Err(e) => Ok(serde_json::to_string(
-                    &json!({"ok": false, "url": url, "error": e.to_string()}),
-                )?),
-            }
-        }
-        "record_live" => {
-            let url = args.get("url").and_then(|v| v.as_str()).unwrap_or_default();
-            let duration_secs = args
-                .get("duration_secs")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let file =
-                crate::live_monitor::record_live_once(pool, project_dir, cfg, url, duration_secs)
-                    .await?;
-            Ok(serde_json::to_string(
-                &json!({"ok":true,"url":url,"file":file,"duration_secs":duration_secs}),
-            )?)
-        }
-        "tail_logs" => {
-            let name = args
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("live_monitor");
-            let lines = args.get("lines").and_then(|v| v.as_u64()).unwrap_or(200);
-            Ok(serde_json::to_string(&crate::service::tail_logs(
-                project_dir,
-                name,
-                lines,
-            ))?)
-        }
-        "app_prefs_get" => Ok(serde_json::to_string(
-            &json!({"ok": true, "prefs": app_prefs::read_app_prefs(project_dir)}),
-        )?),
-        "app_prefs_set" => {
-            let updates = args.get("updates").cloned().unwrap_or_else(|| json!({}));
-            let prefs = app_prefs::write_app_prefs(project_dir, &updates)?;
-            Ok(serde_json::to_string(&json!({"ok": true, "prefs": prefs}))?)
-        }
-        "live_check" => {
-            let url = args.get("url").and_then(|v| v.as_str()).unwrap_or_default();
-            let room = watch.list_live().into_iter().find(|r| r.url == url);
-            let status = if let Some(r) = &room {
-                let adapter = crate::live_monitor::resolve_live_for_project(
-                    &r.url,
-                    project_dir,
-                    &cfg.get_main("Cookie", "b站cookie"),
-                );
-                match adapter.check(&r.url).await {
-                    Ok(s) => serde_json::to_value(&s).ok(),
-                    Err(e) => Some(json!({"error": e.to_string()})),
-                }
-            } else {
-                None
-            };
-            Ok(serde_json::to_string(
-                &json!({"ok":true,"url":url,"found":room.is_some(),"room":room,
-                        "status":status,"hint":"Rust daemon 运行中会自动检测并录制开播"}),
-            )?)
-        }
-        "video_add" => {
-            let url = args.get("url").and_then(|v| v.as_str()).unwrap_or_default();
-            let name = args
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            let download = args
-                .get("download")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            let download_opt = match download {
-                "" => None,
-                "是" | "yes" | "true" | "1" => Some(true),
-                "否" | "no" | "false" | "0" => Some(false),
-                _ => None,
-            };
-            watch.add_video(url, name, download_opt, None)?;
-            Ok(serde_json::to_string(
-                &json!({"ok":true,"url":url,"name":name,"download":download}),
-            )?)
-        }
-        "video_remove" => {
-            let url = args.get("url").and_then(|v| v.as_str()).unwrap_or_default();
-            let removed = watch.remove_video(url)?;
-            Ok(serde_json::to_string(&json!({"ok":removed,"url":url}))?)
-        }
-        "video_list" => Ok(serde_json::to_string(
-            &json!({"ok":true,"sources":watch.list_video()}),
-        )?),
-        "video_check_now" => {
-            let stats = scheduler::check_video_sources(pool, project_dir, cfg).await?;
-            Ok(serde_json::to_string(
-                &json!({"ok":true,"new_videos":stats.videos_notified+stats.downloads,
-                        "notified":stats.videos_notified,"downloads":stats.downloads}),
-            )?)
-        }
-        "blogger_videos" => {
+        "monitor_add" => {
             let url = args
                 .get("url")
                 .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let count = args.get("count").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            let cookie = cfg.get_fupan("视频监控", "b站cookie");
-            let adapter: Box<dyn platform::Platform> = if url.contains("bilibili.com") {
-                Box::new(platform::BilibiliAdapter::with_cookie_and_project_dir(
-                    cookie,
-                    project_dir.to_path_buf(),
-                ))
+                .unwrap_or_default();
+            let name = args
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if url.trim().is_empty() {
+                anyhow::bail!("url 不能为空");
+            }
+            let lower = url.to_lowercase();
+            let live_domain = lower.contains("live.bilibili")
+                || lower.contains("live.kuaishou")
+                || lower.contains("live.douyin")
+                || lower.contains("live_");
+            let video_domain = lower.contains("space.bilibili")
+                || lower.contains("douyin.com/user")
+                || lower.contains("v.douyin")
+                || lower.contains("/user/");
+            let mut added_live = false;
+            let mut added_video = false;
+            if live_domain && !video_domain {
+                let remark = if name.is_empty() { url } else { name };
+                watch.add_live(url, &format!("主播: {remark}"), "")?;
+                added_live = true;
+            } else if video_domain && !live_domain {
+                let vname = if name.is_empty() { url } else { name };
+                watch.add_video(url, vname, None, None)?;
+                added_video = true;
             } else {
-                Box::new(platform::RssAdapter::new())
-            };
-            // 与 CLI blogger-videos 共用同一浏览入口：成功入库，失败回退缓存。
-            let outcome = crate::video_library::browse_with_fallback(
-                library,
-                adapter.list_videos(&url, count).await,
-                &url,
-            )
-            .await?;
+                // 主播主页或无法区分：直播+短视频一起挂，宁多勿漏。
+                let remark = if name.is_empty() { url } else { name };
+                watch.add_live(url, &format!("主播: {remark}"), "")?;
+                added_live = true;
+                let vname = if name.is_empty() { url } else { name };
+                watch.add_video(url, vname, None, None)?;
+                added_video = true;
+            }
             Ok(serde_json::to_string(
-                &json!({"ok":true,"platform":adapter.name(),"count":outcome.videos.len(),"from_cache":outcome.from_cache,"warning":outcome.warning,"videos":crate::video_library::videos_compat_json(&outcome.videos)}),
+                &json!({"ok":true,"url":url,"name":name,"added_live":added_live,"added_video":added_video,"hint":"daemon 运行中会自动检测；短视频需 视频监控列表.ini 与平台 cookie"}),
             )?)
         }
-        "download_video" | "video_download" => {
+        "monitor_remove" => {
+            let url = args
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let removed_live = watch.remove_live(url)?;
+            let removed_video = watch.remove_video(url)?;
+            Ok(serde_json::to_string(
+                &json!({"ok":removed_live||removed_video,"url":url,"removed_live":removed_live,"removed_video":removed_video}),
+            )?)
+        }
+        "monitor_set" => {
+            let url = args
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let key = args.get("key").and_then(|v| v.as_str()).unwrap_or_default();
+            let value = args
+                .get("value")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if url.trim().is_empty() || key.trim().is_empty() {
+                anyhow::bail!("url 与 key 不能为空");
+            }
+            let is_live = watch
+                .list_live()
+                .iter()
+                .any(|i| i.url.trim_end_matches('/') == url.trim_end_matches('/'));
+            let is_video = watch
+                .list_video()
+                .iter()
+                .any(|i| i.url.trim() == url.trim());
+            if is_live {
+                let changed = watch.set_live(url, key, value)?;
+                Ok(serde_json::to_string(&json!({"ok":true,"kind":"live","url":url,"key":key,"value":value,"changed":changed}))?)
+            } else if is_video {
+                let changed = watch.set_video(url, key, value)?;
+                Ok(serde_json::to_string(&json!({"ok":true,"kind":"video","url":url,"key":key,"value":value,"changed":changed}))?)
+            } else {
+                anyhow::bail!("监控源不存在: {url}（先 monitor_list 确认）");
+            }
+        }
+        "check_now" => {
+            // 直播逐个实况探测；短视频走 scheduler 全量检查（通知+自动下载）。
+            let cookie = cfg.get_main("Cookie", "b站cookie");
+            let mut rooms = Vec::new();
+            for room in watch.list_live() {
+                let adapter = crate::live_monitor::resolve_live_for_project(
+                    &room.url,
+                    project_dir,
+                    &cookie,
+                );
+                match adapter.check(&room.url).await {
+                    Ok(s) => rooms.push(json!({
+                        "url": room.url,
+                        "remark": room.remark,
+                        "ok": true,
+                        "status": serde_json::to_value(&s).ok(),
+                    })),
+                    Err(e) => rooms.push(json!({"url": room.url, "remark": room.remark, "ok": false, "error": e.to_string()})),
+                }
+            }
+            let stats = scheduler::check_video_sources(pool, project_dir, cfg).await?;
+            Ok(serde_json::to_string(&json!({
+                "ok":true,
+                "live":rooms,
+                "new_videos":stats.videos_notified+stats.downloads,
+                "notified":stats.videos_notified,
+                "downloads":stats.downloads,
+                "hint":"Rust daemon 运行中会自动检测并录制开播"
+            }))?)
+        }
+        "download_video" => {
             let url = args
                 .get("url")
                 .and_then(|v| v.as_str())
@@ -455,113 +358,6 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
                 "hint": "已加入 daemon 下载队列，下载完成后会自动标记已下载",
             }))?)
         }
-        "download_videos" => {
-            let items_json = args
-                .get("items_json")
-                .and_then(|v| v.as_str())
-                .unwrap_or("[]");
-            let parsed: Vec<serde_json::Value> = serde_json::from_str(items_json)?;
-            let items: Vec<(String, String)> = parsed
-                .iter()
-                .map(|v| {
-                    let url = v.get("url").and_then(|u| u.as_str()).unwrap_or_default();
-                    let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("手动下载");
-                    (url.to_string(), name.to_string())
-                })
-                .collect();
-            if !crate::service::rust_daemon_alive(project_dir) {
-                crate::service::ensure_core(project_dir)?;
-            }
-            let summary = crate::download::enqueue_downloads(pool, &items).await?;
-            Ok(serde_json::to_string(&summary)?)
-        }
-        "video_library" => {
-            let source = args
-                .get("source_url")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            let done = args
-                .get("downloaded_only")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let videos = library.list(source, "", done).await?;
-            Ok(serde_json::to_string(
-                &json!({"ok":true,"count":videos.len(),"videos":crate::video_library::videos_compat_json(&videos)}),
-            )?)
-        }
-        "export_training_data" => {
-            let anchor = args
-                .get("anchor")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            let output = args
-                .get("output")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            Ok(serde_json::to_string(&training_data::export(
-                fupan_dir, anchor, output,
-            )?)?)
-        }
-        "email_status" => Ok(serde_json::to_string(&cfg.email_status())?),
-        "email_setup" => {
-            let email = args
-                .get("email")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            let auth = args
-                .get("auth")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            let to = args.get("to").and_then(|v| v.as_str()).unwrap_or_default();
-            crate::config::write_qq_email(project_dir, email, auth, to)?;
-            Ok(serde_json::to_string(
-                &json!({"ok":true,"email":email,"to":if to.is_empty(){email}else{to}}),
-            )?)
-        }
-        "config_get" => {
-            let file = args.get("file").and_then(|v| v.as_str()).unwrap_or("all");
-            let section = args.get("section").and_then(|v| v.as_str()).unwrap_or("");
-            let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("");
-            Ok(serde_json::to_string(&api.get(file, section, key)?)?)
-        }
-        "config_set" => {
-            let file = args
-                .get("file")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            let section = args
-                .get("section")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            let key = args.get("key").and_then(|v| v.as_str()).unwrap_or_default();
-            let value = args
-                .get("value")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            Ok(serde_json::to_string(&api.set(file, section, key, value)?)?)
-        }
-        "config_set_bulk" => {
-            let updates = args
-                .get("updates_json")
-                .cloned()
-                .unwrap_or_else(|| json!({}));
-            let parsed = if updates.is_string() {
-                serde_json::from_str(updates.as_str().unwrap_or("{}"))?
-            } else {
-                updates
-            };
-            Ok(serde_json::to_string(&api.set_bulk(&parsed)?)?)
-        }
-        "config_schema_tool" => Ok(serde_json::to_string(&api.schema())?),
-        "notes_list" => {
-            let name = args
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            let media_root = crate::paths::media_root(project_dir);
-            let notes = crate::pipeline_bridge::list_notes(&media_root, fupan_dir, name)?;
-            Ok(serde_json::to_string(&json!({"ok":true,"notes":notes}))?)
-        }
         "process_media" => {
             let started = std::time::Instant::now();
             let file_path = args
@@ -580,10 +376,6 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
                 result.queued,
                 started.elapsed().as_millis()
             );
-            // 只读探测，不在这里同步拉起 daemon。MCP 调用必须按数据库事实
-            // 及时返回；launchd/TCC/二进制探测可能阻塞数秒，不能把“已入队”
-            // 和“守护正在运行”混成一次不可控的启动等待。worker 由外部
-            // ensure_services 或下一次 daemon tick 接管。
             let daemon_running = crate::service::rust_daemon_alive(project_dir);
             tracing::info!(
                 "process_media daemon probe finished daemon_running={} elapsed_ms={}",
@@ -602,15 +394,18 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
                 "hint": result.hint
             }))?)
         }
-        "service_start" => Ok(serde_json::to_string(&crate::service::ensure_core(
-            project_dir,
-        )?)?),
-        "ensure_services" => Ok(serde_json::to_string(&crate::service::ensure_core(
-            project_dir,
-        )?)?),
-        "service_stop" => Ok(serde_json::to_string(&crate::service::stop_rust_daemon(
-            project_dir,
-        )?)?),
+        "notes_list" => {
+            let name = args
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let media_root = crate::paths::media_root(project_dir);
+            let notes = crate::pipeline_bridge::list_notes(&media_root, fupan_dir, name)?;
+            Ok(serde_json::to_string(&json!({"ok":true,"notes":notes}))?)
+        }
+        "paths" => Ok(serde_json::to_string(
+            &crate::paths::storage(project_dir).as_json(),
+        )?),
         "doctor" => {
             // 与 CLI doctor 共用同一口径：源进入冷却后，该博主的新视频会
             // 静默不通知/不下载，必须让 MCP 调用方也能一眼看到平台风控。
@@ -655,23 +450,45 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
             }
             Ok(serde_json::to_string(&diag)?)
         }
-        "wizard_done" => {
-            let mut updates = serde_json::Map::new();
-            updates.insert("wizardDone".to_string(), Value::Bool(true));
-            let prefs =
-                app_prefs::write_app_prefs(project_dir, &serde_json::Value::Object(updates))?;
-            Ok(serde_json::to_string(&json!({"ok":true,"prefs":prefs}))?)
+        "config_get" => {
+            let file = args.get("file").and_then(|v| v.as_str()).unwrap_or("all");
+            let section = args.get("section").and_then(|v| v.as_str()).unwrap_or("");
+            let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("");
+            Ok(serde_json::to_string(&api.get(file, section, key)?)?)
         }
-        "service_status" => {
-            // 与 CLI `service-status` 共用同一个轻量入口：只读 pid/心跳/uptime，
-            // 不递归扫描 downloads 和 fupan_output。调用方要完整桌面快照应使用 `status`。
-            let mut result = crate::service::status(project_dir)?;
-            let sessions = db::list_live_sessions(pool, "recording", 100).await?;
-            result
-                .as_object_mut()
-                .unwrap()
-                .insert("live_sessions".to_string(), serde_json::to_value(sessions)?);
-            Ok(serde_json::to_string(&result)?)
+        "config_set" => {
+            let file = args
+                .get("file")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let section = args
+                .get("section")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let key = args.get("key").and_then(|v| v.as_str()).unwrap_or_default();
+            let value = args
+                .get("value")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            Ok(serde_json::to_string(&api.set(file, section, key, value)?)?)
+        }
+        "service_start" => Ok(serde_json::to_string(&crate::service::ensure_core(
+            project_dir,
+        )?)?),
+        "service_stop" => Ok(serde_json::to_string(&crate::service::stop_rust_daemon(
+            project_dir,
+        )?)?),
+        "tail_logs" => {
+            let name = args
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("live_monitor");
+            let lines = args.get("lines").and_then(|v| v.as_u64()).unwrap_or(200);
+            Ok(serde_json::to_string(&crate::service::tail_logs(
+                project_dir,
+                name,
+                lines,
+            ))?)
         }
         "test_email" => {
             let status = cfg.email_status();
@@ -687,70 +504,17 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
             )?;
             Ok(serde_json::to_string(&json!({"ok":true,"sent":true}))?)
         }
-        "test_notify" => {
-            let notifier = crate::notify::Notifier::for_project(pool, cfg, project_dir);
-            match notifier
-                .send_test(
-                    "【尊者直播监控】通知测试",
-                    "收到这条消息说明通知通道配置成功。",
-                )
-                .await
-            {
-                Ok(test) => Ok(serde_json::to_string(&json!({
-                    "ok": true,
-                    "sent": test.sent,
-                    "channels": test.channels,
-                }))?),
-                Err(e) => Ok(serde_json::to_string(
-                    &json!({"ok": false, "sent": false, "error": e.to_string()}),
-                )?),
-            }
-        }
-        "notify_list" => {
-            let status = args
-                .get("status")
+        "anchor_search" => {
+            let name = args
+                .get("name")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
-            let limit = if limit <= 0 { 200 } else { limit };
-            let events = db::list_notify(pool, status, limit).await?;
-            Ok(serde_json::to_string(
-                &json!({"ok":true,"count":events.len(),"notify":events}),
-            )?)
+            if name.trim().is_empty() {
+                anyhow::bail!("name 不能为空");
+            }
+            let result = crate::platform::search_anchor(name, project_dir, cfg).await?;
+            Ok(serde_json::to_string(&result)?)
         }
-        "notify_retry" => {
-            let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(100);
-            let limit = if limit <= 0 { 100 } else { limit };
-            let retried = db::retry_failed_notify(pool, limit).await?;
-            let pending = db::list_pending_notify(pool, limit).await?;
-            Ok(serde_json::to_string(&json!({
-                "ok":true,
-                "retried":retried,
-                "pending_count":pending.len(),
-                "hint":"已把失败通知放回队列，daemon 下一轮按退避重试；也可再执行 notify-retry 立即重发",
-            }))?)
-        }
-        "notify_prune" => {
-            let status = args
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("failed");
-            let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(0);
-            let limit = if limit <= 0 { i64::MAX } else { limit };
-            let removed = db::prune_notify(pool, status, limit).await?;
-            Ok(serde_json::to_string(
-                &json!({"ok":true,"removed":removed,"status":status}),
-            )?)
-        }
-        "audit_list" => {
-            let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(100);
-            Ok(serde_json::to_string(
-                &mcp_audit::list_calls_json(pool, limit).await?,
-            )?)
-        }
-        "control_list" => Ok(serde_json::to_string(&mcp_audit::controls_json(
-            &tools_list(),
-        ))?),
         _ => anyhow::bail!("工具未实现: {name}"),
     }
 }
@@ -762,7 +526,7 @@ mod tests {
     #[test]
     fn tools_list_has_unique_names_and_required_args() {
         let tools = tools_list();
-        assert_eq!(tools.len(), 43, "源码控制面必须暴露 43 个工具");
+        assert_eq!(tools.len(), 18, "源码控制面必须暴露 18 个工具（产品手册第 6 章）");
         let mut names = std::collections::HashSet::new();
         for tool in &tools {
             let name = tool["name"].as_str().unwrap_or_default();
@@ -787,30 +551,24 @@ mod tests {
             .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
             .collect();
         for expected in [
-            "live_status",
-            "live_add",
-            "live_remove",
-            "live_list",
-            "live_check",
-            "video_add",
-            "video_download",
-            "download_videos",
-            "blogger_videos",
-            "video_remove",
-            "video_list",
-            "video_check_now",
-            "service_start",
-            "service_stop",
+            "anchor_search",
+            "monitor_add",
+            "monitor_remove",
+            "monitor_list",
+            "monitor_set",
+            "check_now",
+            "download_video",
+            "process_media",
+            "notes_list",
+            "status",
+            "paths",
+            "doctor",
             "config_get",
             "config_set",
-            "config_set_bulk",
-            "config_schema_tool",
-            "notes_list",
-            "process_media",
+            "service_start",
+            "service_stop",
+            "tail_logs",
             "test_email",
-            "notify_list",
-            "notify_retry",
-            "notify_prune",
         ] {
             assert!(names.contains(expected), "MCP 缺工具: {expected}");
         }
@@ -1114,88 +872,6 @@ mod tests {
             "MCP 应读到热更新后的邮箱配置"
         );
         assert_eq!(second.email_status().host, "smtp.qq.com");
-
-        std::mem::forget(file);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn audit_list_returns_recorded_calls_without_secrets() {
-        let dir = std::env::temp_dir().join(format!(
-            "zunzhe-extension-audit-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("config")).unwrap();
-        std::fs::create_dir_all(dir.join("fupan_output").join("run")).unwrap();
-        std::fs::write(
-            dir.join("config").join("config.ini"),
-            "[推送配置]\nSMTP邮件服务器 = smtp.qq.com\n",
-        )
-        .unwrap();
-        std::fs::write(dir.join("config").join("fupan_config.ini"), "[视频监控]\n").unwrap();
-        std::fs::write(
-            dir.join("config").join("config.ini.example"),
-            "[推送配置]\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("config").join("fupan_config.ini.example"),
-            "[视频监控]\n",
-        )
-        .unwrap();
-        let file = std::env::temp_dir().join(format!(
-            "zunzhe-extension-audit-{}-{}.db",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let pool = crate::db::open_pool(&file).await.unwrap();
-        crate::db::init_db(&pool).await.unwrap();
-        crate::mcp_audit::record_call(
-            &pool,
-            "config_set",
-            &json!({"key": "auth", "value": "never-show-this"}),
-            true,
-            "",
-            std::time::Duration::from_millis(7),
-        )
-        .await
-        .unwrap();
-
-        let fupan_dir = dir.join("fupan_output");
-        let library = VideoLibrary::new(pool.clone(), fupan_dir.clone());
-        let watch = Watchlist::new(dir.to_path_buf());
-        let api = ConfigApi::new(dir.to_path_buf());
-        let cfg = Config::load(&dir).unwrap();
-        let ctx = ToolContext {
-            library: &library,
-            fupan_dir: &fupan_dir,
-            cfg: &cfg,
-            pool: &pool,
-            watch: &watch,
-            api: &api,
-            project_dir: &dir,
-        };
-        let out = call_tool("audit_list", &json!({"limit": 10}), &ctx)
-            .await
-            .unwrap();
-        let body: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(body["ok"], true);
-        assert_eq!(body["count"], 1);
-        assert_eq!(body["calls"][0]["tool"], "config_set");
-        assert!(
-            !body["calls"][0]["arguments_summary"]
-                .as_str()
-                .unwrap()
-                .contains("never-show-this")
-        );
 
         std::mem::forget(file);
         let _ = std::fs::remove_dir_all(&dir);

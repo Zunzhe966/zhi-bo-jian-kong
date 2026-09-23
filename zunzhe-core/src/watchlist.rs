@@ -226,6 +226,178 @@ impl Watchlist {
         Ok(true)
     }
 
+    /// 修改单个直播源开关：`key` ∈ {enabled, notify, quality}。
+    /// - enabled：`是/否` → 注释/取消注释整行（暂停/恢复监控）
+    /// - notify：通知通道 → 写监控偏好.json
+    /// - quality：画质 → 重写行（保留 URL 与备注）
+    /// 返回是否真的改动了列表。
+    pub fn set_live(&self, url: &str, key: &str, value: &str) -> Result<bool> {
+        match key {
+            "notify" => {
+                let item = self
+                    .list_live()
+                    .into_iter()
+                    .find(|i| same_url(&i.url, url))
+                    .ok_or_else(|| anyhow::anyhow!("直播监控不存在: {url}"))?;
+                self.set_notify(&item.url, value, &item.remark)?;
+                Ok(true)
+            }
+            "enabled" => {
+                let on = parse_switch(value)?;
+                let mut changed = false;
+                let before = read_lines(&self.url_config());
+                let after: Vec<String> = before
+                    .into_iter()
+                    .map(|old| {
+                        let stripped = old.trim();
+                        let parsed = parse_live_line(stripped);
+                        if !parsed.url.is_empty() && same_url(&parsed.url, url) {
+                            let mut next = stripped.to_string();
+                            if on {
+                                next = next.trim_start_matches('#').trim().to_string();
+                            } else if !next.starts_with('#') {
+                                next = format!("#{next}");
+                            }
+                            if next != old {
+                                changed = true;
+                            }
+                            next
+                        } else {
+                            old
+                        }
+                    })
+                    .collect();
+                write_lines(&self.url_config(), &after)?;
+                Ok(changed)
+            }
+            "quality" => {
+                let item = self
+                    .list_live()
+                    .into_iter()
+                    .find(|i| same_url(&i.url, url))
+                    .ok_or_else(|| anyhow::anyhow!("直播监控不存在: {url}"))?;
+                let line = format_live_line(&item.url, &item.remark, value);
+                let mut changed = false;
+                let before = read_lines(&self.url_config());
+                let after: Vec<String> = before
+                    .into_iter()
+                    .map(|old| {
+                        let parsed = parse_live_line(&old);
+                        if !parsed.url.is_empty() && same_url(&parsed.url, url) {
+                            changed = true;
+                            line.clone()
+                        } else {
+                            old
+                        }
+                    })
+                    .collect();
+                write_lines(&self.url_config(), &after)?;
+                Ok(changed)
+            }
+            other => bail!("不支持的直播源开关: {other}（可用 enabled/notify/quality）"),
+        }
+    }
+
+    /// 修改单个视频源开关：`key` ∈ {enabled, notify, download, name}。
+    /// - enabled：`是/否` → 注释/取消注释整行（暂停/恢复监控）
+    /// - notify：通知通道 → 写监控偏好.json
+    /// - download：`是/否` → 重写行内的 `下载=` 段（保留名称）
+    /// - name：改名 → 重写行（保留 download 设置）
+    pub fn set_video(&self, url: &str, key: &str, value: &str) -> Result<bool> {
+        match key {
+            "notify" => {
+                let item = self
+                    .list_video()
+                    .into_iter()
+                    .find(|i| same_video_url(&i.url, url))
+                    .ok_or_else(|| anyhow::anyhow!("视频监控不存在: {url}"))?;
+                self.set_notify(&item.url, value, &item.name)?;
+                Ok(true)
+            }
+            "enabled" => {
+                let on = parse_switch(value)?;
+                let mut changed = false;
+                let before = read_lines(&self.video_config());
+                let after: Vec<String> = before
+                    .into_iter()
+                    .map(|old| {
+                        let stripped = old.trim();
+                        let parsed = parse_video_line(stripped);
+                        if !parsed.url.is_empty() && same_video_url(&parsed.url, url) {
+                            let mut next = stripped.to_string();
+                            if on {
+                                next = next.trim_start_matches('#').trim().to_string();
+                            } else if !next.starts_with('#') {
+                                next = format!("#{next}");
+                            }
+                            if next != old {
+                                changed = true;
+                            }
+                            next
+                        } else {
+                            old
+                        }
+                    })
+                    .collect();
+                write_lines(&self.video_config(), &after)?;
+                Ok(changed)
+            }
+            "download" => {
+                let on = parse_switch(value)?;
+                let item = self
+                    .list_video()
+                    .into_iter()
+                    .find(|i| same_video_url(&i.url, url))
+                    .ok_or_else(|| anyhow::anyhow!("视频监控不存在: {url}"))?;
+                let line = format_video_line(&item.url, &item.name, Some(on));
+                let mut changed = false;
+                let before = read_lines(&self.video_config());
+                let after: Vec<String> = before
+                    .into_iter()
+                    .map(|old| {
+                        let parsed = parse_video_line(&old);
+                        if !parsed.url.is_empty() && same_video_url(&parsed.url, url) {
+                            changed = true;
+                            line.clone()
+                        } else {
+                            old
+                        }
+                    })
+                    .collect();
+                write_lines(&self.video_config(), &after)?;
+                Ok(changed)
+            }
+            "name" => {
+                if value.trim().is_empty() {
+                    bail!("主播名不能为空");
+                }
+                let item = self
+                    .list_video()
+                    .into_iter()
+                    .find(|i| same_video_url(&i.url, url))
+                    .ok_or_else(|| anyhow::anyhow!("视频监控不存在: {url}"))?;
+                let line = format_video_line(&item.url, value.trim(), item.download);
+                let mut changed = false;
+                let before = read_lines(&self.video_config());
+                let after: Vec<String> = before
+                    .into_iter()
+                    .map(|old| {
+                        let parsed = parse_video_line(&old);
+                        if !parsed.url.is_empty() && same_video_url(&parsed.url, url) {
+                            changed = true;
+                            line.clone()
+                        } else {
+                            old
+                        }
+                    })
+                    .collect();
+                write_lines(&self.video_config(), &after)?;
+                Ok(changed)
+            }
+            other => bail!("不支持的视频源开关: {other}（可用 enabled/notify/download/name）"),
+        }
+    }
+
     pub fn notify_for(&self, url: &str, name: &str) -> String {
         let prefs = self.load_prefs();
         if let Some(v) = prefs.get(url.trim())
@@ -318,6 +490,14 @@ fn normalize_url(url: &str) -> String {
         u.to_string()
     } else {
         format!("https://{u}")
+    }
+}
+
+fn parse_switch(value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "是" | "yes" | "true" | "1" | "on" => Ok(true),
+        "否" | "no" | "false" | "0" | "off" => Ok(false),
+        other => bail!("开关值必须是 是/否: {other}"),
     }
 }
 

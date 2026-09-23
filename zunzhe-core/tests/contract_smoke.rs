@@ -224,12 +224,14 @@ fn config_load_from_any_cwd() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 目标模式文档与项目根北极星必须存在（上下文恢复锚点）。
+/// 权威文档集必须存在（文档整顿后的唯一导航：产品手册 + CONTRACT + AGENTS + README）。
+/// 旧 PROJECT_GOAL.md 已按产品手册第 9 章移入 .trash-作废文档/，不再是锚点。
 #[test]
 fn goal_docs_exist() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-    assert!(root.join("PROJECT_GOAL.md").exists());
-    assert!(root.join("zunzhe-core").join("目标模式.md").exists());
+    for doc in ["README.md", "CONTRACT.md", "AGENTS.md", "产品手册.md"] {
+        assert!(root.join(doc).exists(), "权威文档缺失: {doc}");
+    }
 }
 
 /// 单一权威 DB 路径契约：默认数据库由 `[路径设置]` 解析到产物根下；
@@ -311,42 +313,24 @@ fn mcp_tools_cover_core_cli_commands() {
         .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
         .collect();
     for expected in [
-        "live_status",
-        "live_list",
-        "live_add",
-        "live_remove",
-        "live_delete",
-        "live_check",
-        "live_set_notify",
-        "record_live",
-        "service_status",
-        "tail_logs",
-        "video_add",
-        "video_remove",
-        "video_list",
-        "video_check_now",
-        "blogger_videos",
+        "anchor_search",
+        "monitor_add",
+        "monitor_remove",
+        "monitor_list",
+        "monitor_set",
+        "check_now",
         "download_video",
-        "video_download",
-        "video_library",
-        "export_training_data",
-        "email_status",
-        "email_setup",
-        "app_prefs_get",
-        "app_prefs_set",
+        "process_media",
+        "notes_list",
+        "status",
+        "paths",
+        "doctor",
         "config_get",
         "config_set",
-        "config_set_bulk",
-        "config_schema_tool",
-        "notes_list",
-        "process_media",
         "service_start",
         "service_stop",
-        "ensure_services",
-        "doctor",
-        "wizard_done",
+        "tail_logs",
         "test_email",
-        "test_notify",
     ] {
         assert!(names.contains(expected), "MCP 缺少工具: {expected}");
     }

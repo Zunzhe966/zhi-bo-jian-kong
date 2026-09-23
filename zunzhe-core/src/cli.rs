@@ -26,6 +26,28 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// 添加监控（直播/短视频按 URL 自动识别；主播主页同时挂两种）
+    MonitorAdd {
+        url: String,
+        #[arg(default_value = "")]
+        name: String,
+        #[arg(default_value = "")]
+        quality: String,
+    },
+    /// 移除监控（直播暂停+短视频删除）
+    MonitorRemove { url: String },
+    /// 列出全部监控源（直播+短视频一张表）
+    MonitorList,
+    /// 改单个源的开关（enabled/notify/quality/download/name）
+    MonitorSet {
+        url: String,
+        key: String,
+        value: String,
+    },
+    /// 立刻全量检查一轮（直播+短视频）
+    CheckNow,
+    /// 按名字搜索主播，返回候选 URL（P4）
+    AnchorSearch { name: String },
     /// 添加关注的主播/直播间（旧名 add-anchor 继续保留）
     AddLive {
         url: String,
@@ -309,6 +331,114 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let api = config_api::ConfigApi::new(project_dir.clone());
 
     match cli.command {
+        Command::MonitorAdd { url, name, quality } => {
+            let lower = url.to_lowercase();
+            let live_domain = lower.contains("live.bilibili")
+                || lower.contains("live.kuaishou")
+                || lower.contains("live.douyin")
+                || lower.contains("live_");
+            let video_domain = lower.contains("space.bilibili")
+                || lower.contains("douyin.com/user")
+                || lower.contains("v.douyin")
+                || lower.contains("/user/");
+            let mut added_live = false;
+            let mut added_video = false;
+            if live_domain && !video_domain {
+                let _ = watch.add_live(&url, &format!("主播: {name}"), &quality);
+                added_live = true;
+            } else if video_domain && !live_domain {
+                watch.add_video(
+                    &url,
+                    if name.is_empty() { &url } else { &name },
+                    None,
+                    None,
+                )?;
+                added_video = true;
+            } else {
+                let _ = watch.add_live(&url, &format!("主播: {name}"), &quality);
+                added_live = true;
+                watch.add_video(
+                    &url,
+                    if name.is_empty() { &url } else { &name },
+                    None,
+                    None,
+                )?;
+                added_video = true;
+            }
+            println!(
+                "{}",
+                json!({"ok": true, "url": url, "name": name, "added_live": added_live, "added_video": added_video})
+            );
+        }
+        Command::MonitorRemove { url } => {
+            let removed_live = watch.remove_live(&url)?;
+            let removed_video = watch.remove_video(&url)?;
+            println!(
+                "{}",
+                json!({"ok": removed_live || removed_video, "url": url, "removed_live": removed_live, "removed_video": removed_video})
+            );
+        }
+        Command::MonitorList => {
+            println!(
+                "{}",
+                json!({"ok": true, "live": watch.list_live(), "video": watch.list_video()})
+            );
+        }
+        Command::MonitorSet { url, key, value } => {
+            let is_live = watch
+                .list_live()
+                .iter()
+                .any(|i| i.url.trim_end_matches('/') == url.trim_end_matches('/'));
+            let is_video = watch
+                .list_video()
+                .iter()
+                .any(|i| i.url.trim() == url.trim());
+            if is_live {
+                let changed = watch.set_live(&url, &key, &value)?;
+                println!(
+                    "{}",
+                    json!({"ok": true, "kind": "live", "url": url, "key": key, "value": value, "changed": changed})
+                );
+            } else if is_video {
+                let changed = watch.set_video(&url, &key, &value)?;
+                println!(
+                    "{}",
+                    json!({"ok": true, "kind": "video", "url": url, "key": key, "value": value, "changed": changed})
+                );
+            } else {
+                anyhow::bail!("监控源不存在: {url}");
+            }
+        }
+        Command::CheckNow => {
+            let cookie = cfg.get_main("Cookie", "b站cookie");
+            let mut rooms = Vec::new();
+            for room in watch.list_live() {
+                let adapter = live_monitor::resolve_live_for_project(
+                    &room.url,
+                    &cfg.project_dir,
+                    &cookie,
+                );
+                match adapter.check(&room.url).await {
+                    Ok(s) => rooms.push(json!({
+                        "url": room.url,
+                        "remark": room.remark,
+                        "ok": true,
+                        "status": serde_json::to_value(&s).ok(),
+                    })),
+                    Err(e) => rooms.push(json!({"url": room.url, "remark": room.remark, "ok": false, "error": e.to_string()})),
+                }
+            }
+            let stats = scheduler::check_video_sources(&pool, &project_dir, &cfg).await?;
+            println!(
+                "{}",
+                json!({"ok": true, "live": rooms, "new_videos": stats.videos_notified + stats.downloads,
+                       "notified": stats.videos_notified, "downloads": stats.downloads})
+            );
+        }
+        Command::AnchorSearch { name } => {
+            let result = platform::search_anchor(&name, &project_dir, &cfg).await?;
+            println!("{}", serde_json::to_string(&result)?);
+        }
         Command::AddLive { url, name, quality } | Command::AddAnchor { url, name, quality } => {
             let _ = watch.add_live(&url, &name, &quality);
             println!(
@@ -431,7 +561,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             )?;
             println!(
                 "{}",
-                json!({"ok": true, "url": url, "name": if name.is_empty() { url.clone() } else { name.clone() },
+                json!({"ok": true, "url": url, "name": if name.is_empty() { &url } else { &name },
                        "download": match download_opt { Some(true) => "是", Some(false) => "否", None => "跟随全局" },
                        "notify": if notify.is_empty() { watch.notify_for(&url, &name) } else { notify }})
             );
