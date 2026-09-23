@@ -236,7 +236,6 @@ export default function App() {
       ])
       const push = cfg['config.ini']?.['推送配置'] || {}
       const tx = fupanCfg['fupan_config.ini']?.['转写'] || {}
-      const llm = fupanCfg['fupan_config.ini']?.['知识提炼'] || {}
       const stash = pathCfg['config.ini']?.['路径设置'] || {}
       const prefs = prefRes.prefs || {}
       const mail = await window.desktop.cli('email-status')
@@ -257,10 +256,6 @@ export default function App() {
         transcribeEnabled: pickCfg(tx, '是否启用转写(是/否)', '是') !== '否',
         whisperModel: pickCfg(tx, 'whisper模型', 'base'),
         pipelineTimeout: pickCfg(fupanCfg['fupan_config.ini']?.['复盘'] || {}, '任务超时秒数', '21600'),
-        llmEnabled: pickCfg(llm, '是否启用知识提炼(是/否)', '是') !== '否',
-        llmApiUrl: pickCfg(llm, 'api地址', 'https://api.deepseek.com'),
-        llmApiKey: '',
-        llmModel: pickCfg(llm, '模型', 'deepseek-chat'),
         watchdog: prefs.watchdog !== false,
         autoStartServices: prefs.autoStartServices !== false,
         openAtLogin: !!prefs.openAtLogin,
@@ -315,16 +310,6 @@ export default function App() {
       }
       if (v.pipelineTimeout) {
         await window.desktop.cli('set-config', 'fupan_config', '复盘', '任务超时秒数', String(v.pipelineTimeout).trim())
-      }
-      await window.desktop.cli('set-config', 'fupan_config', '知识提炼', '是否启用知识提炼(是/否)', v.llmEnabled ? '是' : '否')
-      if (v.llmApiUrl?.trim()) {
-        await window.desktop.cli('set-config', 'fupan_config', '知识提炼', 'api地址', v.llmApiUrl.trim())
-      }
-      if (v.llmApiKey?.trim()) {
-        await window.desktop.cli('set-config', 'fupan_config', '知识提炼', 'api密钥', v.llmApiKey.trim())
-      }
-      if (v.llmModel?.trim()) {
-        await window.desktop.cli('set-config', 'fupan_config', '知识提炼', '模型', v.llmModel.trim())
       }
       // 存放位置。留空 = 用默认落点，所以无条件写（写空串即恢复默认）。
       // 产物刻意不落在程序目录里：程序换代时不该连带动用户的录像和转写文本。
@@ -1616,11 +1601,15 @@ export default function App() {
           <Form.Item label="SMTP 服务器" name="smtpHost"><Input placeholder="smtp.qq.com" /></Form.Item>
           <Form.Item label="SMTP 端口" name="smtpPort"><Input placeholder="465" /></Form.Item>
           <Form.Item label="发件邮箱" name="loginEmail"><Input placeholder="xxx@qq.com" /></Form.Item>
-          <Form.Item label="SMTP 授权码" name="authCode" extra="已配置过可留空"><Input.Password /></Form.Item>
+          <Form.Item label="SMTP 授权码" name="authCode" extra={
+            <span>QQ 邮箱获取：登录 <a onClick={() => window.desktop.openExternal('https://mail.qq.com/')}>mail.qq.com</a> → 设置 → 账户 → 开启「SMTP 服务」→ 按提示生成授权码（不是 QQ 密码）。已配置过可留空。</span>
+          }>
+            <Input.Password placeholder="16 位授权码，如 abcdefghijklmnop" />
+          </Form.Item>
           <Form.Item label="发件人显示名" name="senderName"><Input /></Form.Item>
           <Form.Item label="收件邮箱" name="toEmail"><Input /></Form.Item>
 
-          <div style={{ fontWeight: 600, margin: '16px 0 8px' }}>转写 & 复盘（LLM）</div>
+          <div style={{ fontWeight: 600, margin: '16px 0 8px' }}>转写（本地 whisper，不接任何大模型 API）</div>
           <Form.Item label="录制/下载完成后自动转写" name="transcribeEnabled" valuePropName="checked">
             <Switch />
           </Form.Item>
@@ -1635,18 +1624,6 @@ export default function App() {
           <Form.Item label="长视频转写超时（秒）" name="pipelineTimeout"
             extra="默认 21600（6 小时）。纯 CPU 转写长视频会接近 1 小时，建议保留充足余量。">
             <Input placeholder="21600" />
-          </Form.Item>
-          <Form.Item label="启用 AI 知识提炼" name="llmEnabled" valuePropName="checked">
-            <Switch />
-          </Form.Item>
-          <Form.Item label="API 地址（OpenAI 兼容）" name="llmApiUrl">
-            <Input placeholder="https://api.deepseek.com" />
-          </Form.Item>
-          <Form.Item label="API 密钥" name="llmApiKey" extra="已配置过可留空不修改">
-            <Input.Password placeholder="sk-..." />
-          </Form.Item>
-          <Form.Item label="模型名称" name="llmModel">
-            <Input placeholder="deepseek-chat / gpt-4o-mini 等" />
           </Form.Item>
         </Form>
 
