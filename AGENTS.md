@@ -113,6 +113,8 @@ Electron 桌面端  →  Rust daemon（zunzhe-core，主控）  →  Python 工�
 | Rust 二进制 | `<项目>/zunzhe-core/target/release/zunzhe-core` |
 | MCP 工具数 | **43 个**（运行时 `tools/list` 实测；`.神经总账/控制面.json` 是**快照，会过期**） |
 | MCP 控制面快照 | `.神经总账/控制面.json`（**不是** `.神经/控制面.json`，后者是旧残留） |
+| **守护职责** | **桌面端 watchdog**（GUI 会话进程）。launchd 域（gui/501）进程**无法访问外置盘** `/Volumes/A区`（2026-09-23 实测 `launchctl submit` 跑 `ls /Volumes/A区/...` = `Operation not permitted`）→ **launchd 无法托管本 daemon**；`scripts/launchd/*` 与磁盘 plist 仅备用 |
+| **日志目录** | `~/Library/Logs/zunzhe`（config.ini `[路径设置] 日志目录` 显式配置，2026-09-23 起） |
 
 > ⚠️ **`.神经总账/控制面.json` 是静态快照，会与真实工具集不一致**（曾出现快照 41 / 实测 43）。
 > **要准确数字，永远实测 `tools/list`，不要读这个 json。**
@@ -167,6 +169,7 @@ npm test --prefix desktop                        # 桌面端测试
 | `osascript ... Finder delete` | 在外置卷 A区上失败（TCC -10004） |
 | `trash-put` / `gio` / `/usr/bin/trash` | **都不存在** |
 | `launchctl bootstrap` | 在受限环境恒失败（`Input/output error`），但 `bootout` 会成功 ⇒ **不要 bootout** |
+| **launchd 访问外置盘** | launchd 域进程对 `/Volumes/A区` 全部被系统策略 deny（实测 `Operation not permitted`；log show 见 `xpcproxy deny file-read-data`）——外置盘项目**不能靠 launchd 守护**，只能靠桌面端 watchdog |
 | `~/.Trash` | 读不了（Operation not permitted），但 `lsof -p <pid>` 能穿透读出 |
 | 打包态 `PROJECT_DIR` | 硬编码 `~/Projects/尊者监控直播短视频`（经符号链接落到外置盘） |
 | Shell `$VAR` 后接中文 | 必须写 `${VAR}`，否则 bash 把全角字符当变量名 |

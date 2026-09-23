@@ -62,9 +62,14 @@ PLIST_ERR="$(plutil -extract StandardErrorPath raw "$PLIST" 2>/dev/null || true)
 PLIST_LOG_DIR="$(dirname "$PLIST_OUT")"
 
 UID_VALUE="$(id -u)"
-LOADED_OUT="$(launchctl print "gui/$UID_VALUE/$LABEL" 2>/dev/null | awk -F' = ' '/stdout path =/ {sub(/^[^=]*= /, ""); print; exit}')"
-LOADED_ERR="$(launchctl print "gui/$UID_VALUE/$LABEL" 2>/dev/null | awk -F' = ' '/stderr path =/ {sub(/^[^=]*= /, ""); print; exit}')"
-LOADED_LOG_DIR="$(dirname "$LOADED_OUT")"
+LOADED_OUT="$(launchctl print "gui/$UID_VALUE/$LABEL" 2>/dev/null | awk -F' = ' '/stdout path =/ {sub(/^[^=]*= /, ""); print; exit}' || true)"
+LOADED_ERR="$(launchctl print "gui/$UID_VALUE/$LABEL" 2>/dev/null | awk -F' = ' '/stderr path =/ {sub(/^[^=]*= /, ""); print; exit}' || true)"
+if [ -z "$LOADED_OUT" ]; then
+  LOADED_NOT_REGISTERED=1
+  LOADED_LOG_DIR=""
+else
+  LOADED_LOG_DIR="$(dirname "$LOADED_OUT")"
+fi
 
 printf 'configured_log_dir=%s\n' "$CONFIG_LOG_DIR"
 printf 'plist_log_dir=%s\n' "$PLIST_LOG_DIR"
@@ -79,6 +84,10 @@ printf 'loaded_stderr=%s\n' "$LOADED_ERR"
 if [ "$PLIST_LOG_DIR" != "$CONFIG_LOG_DIR" ]; then
   printf 'FAIL: 磁盘 plist 日志目录与配置不一致，重新运行 scripts/setup-macos.sh 渲染并重载。\n' >&2
   exit 1
+fi
+if [ -n "${LOADED_NOT_REGISTERED:-}" ]; then
+  printf 'INFO: %s 当前未注册（守护职责归桌面端 watchdog；launchd 因系统策略无法访问外置盘，2026-09-23 实测）。磁盘 plist 与配置一致，备用。\n' "$LABEL"
+  exit 0
 fi
 if [ "$LOADED_LOG_DIR" != "$CONFIG_LOG_DIR" ]; then
   printf 'FAIL: 当前已加载 launchd 仍指向旧日志目录；需要重载 com.zunzhe.monitor。\n' >&2

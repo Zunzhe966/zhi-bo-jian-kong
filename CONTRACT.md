@@ -83,7 +83,12 @@ daemon 启动失败不回滚已落库的任务：任务仍可显示在队列中�
 
 ### 7.4 日志目录一致性
 
-日志只有一份权威配置源：`[路径设置] 日志目录`；留空时为 `<产物根目录>/logs`。仓库里的 launchd 模板、渲染脚本、Rust `paths` 和 Python 设置必须都指向同一目录。
+日志只有一份权威配置源：`[路径设置] 日志目录`。**当前实值（2026-09-23）：`~/Library/Logs/zunzhe`**（显式配置），留空时为 `<产物根目录>/logs`。仓库里的 launchd 模板、渲染脚本、Rust `paths` 和 Python 设置必须都指向同一目录。
+
+**实测约束（2026-09-23，铁证）**：launchd 域（gui/501）的进程**无法访问外置盘** `/Volumes/A区`——`launchctl submit` 运行 `/bin/ls /Volumes/A区/尊者产物/` 实测返回 `Operation not permitted`（系统策略 Sandbox deny，log show 可见 `xpcproxy deny file-read-data`）。因此：
+- 本项目真身与产物都在外置盘 → **launchd 无法托管 daemon**（曾表现为 spawn 78 EX_CONFIG + daemon 启动早期冻结）。
+- **守护职责归桌面端 watchdog**（GUI 会话进程 spawn，能访问外置盘）；`scripts/launchd/*` 与磁盘 plist 保留备用（若项目迁到 TCC 允许的目录可启用）。
+- `audit-launchd-log-paths.sh`：服务未注册时输出 INFO 并 exit 0（磁盘 plist 仍须与配置一致）。
 
 `doctor` 与桌面端 `status` 必须返回机器可读的 `log_paths`，至少包含 `configured_dir`、`primary`、`error`、`consistent`、`hint`。`primary/error` 要报告配置路径、旧 `~/Library/Logs/zunzhe` 路径、实际读取路径和来源（`configured` / `legacy_fallback` / `missing`）。
 
@@ -166,7 +171,7 @@ daemon 启动失败不回滚已落库的任务：任务仍可显示在队列中�
 
 - **daemon 循环**用 `tokio::select!`，任何单个任务 panic 不拖垮主循环；顶层安装 panic hook + 崩溃日志；直播检查与视频检查各自独立任务，`JoinError` 只记日志，主循环继续下一轮。
 - **SQLite** 每次写操作事务化；崩溃后重启读取 DB 恢复主播/视频/任务/通知状态。
-- **服务守护**：发现进程不在则拉起（launchd KeepAlive / 看门狗）；日志轮转（保留 5 份）；心跳文件 **30 分钟内**必须刷新，否则 `status` 判为不健康；磁盘满/ffmpeg 缺失等通过 `doctor` 可诊断。
+- **服务守护**：发现进程不在则拉起（**桌面端 watchdog**——GUI 会话进程；launchd 因系统策略无法访问外置盘，2026-09-23 实测，见 7.4）；日志轮转（保留 5 份）；心跳文件 **30 分钟内**必须刷新，否则 `status` 判为不健康；磁盘满/ffmpeg 缺失等通过 `doctor` 可诊断。
 - **冒烟测试**：`run-daemon --once` 与 `run-daemon --duration 30s` 不崩；`SIGTERM/SIGINT` 优雅退出并清理 pid 文件；长期稳定性由真实机器持续运行验收。
 
 ---
