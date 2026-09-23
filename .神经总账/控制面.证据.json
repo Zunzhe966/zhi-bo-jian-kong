@@ -1,7 +1,0 @@
-{
-  "schema": "zunzhe.control-list.evidence.v1",
-  "generated_at": "2026-09-18T21:28:36.589736+00:00",
-  "catalog_sha256": "4cd9a8815c4ed3bae174385df7d101ad3d248f59dcbf7bfaa0d90bf050814ade",
-  "source": "real MCP initialize + tools/list over stdio",
-  "tool_count": 41
-}

@@ -213,3 +213,7 @@ desktop/_probe_*.cjs
 
 # 误提交的 cargo 构建目录
 zunzhe-core/off/
+# 内部状态与外部仓库（不进 git）
+.神经/
+.神经总账/
+rsshub/
