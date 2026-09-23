@@ -5,19 +5,19 @@
 本项目是基于开源项目 [DouyinLiveRecorder](https://github.com/ihmily/DouyinLiveRecorder)（MIT 协议）
 二次开发的个人工具。基于**录制能力**（40+ 平台）扩展出监控调度、转写与智能体控制面。
 
-> 📌 **权威文档：[`项目宪法.md`](./项目宪法.md)。** 本 README 只是入口，产品定义以宪法为准。
+> 📌 **权威文档：[`产品手册.md`](./产品手册.md)。** 本 README 只是入口，产品定义、功能清单、修复计划全部以手册为准。
 
 ---
 
-## 一、这个软件做什么
+## 一、这个软件做什么（就五条）
 
-| # | 职责 | 说明 |
+| # | 职责 | 一句话 |
 |---|---|---|
-| 1 | **直播监控** | 检测关注的主播开播 → 自动录制 → 存到产物目录 |
-| 2 | **短视频监控** | 检测博主发新视频 → 通知 → 按需下载 |
-| 3 | **把文字转出来** | 用本地 whisper 转写，落盘成 `.转写.txt` + `.转写.json` |
-| 4 | **MCP 控制面** | 智能体通过 MCP（43 个工具）控制本软件 |
-| 5 | **交还控制权** | 智能体通过 `notes_list` 拿到转写文件绝对路径，用它自己的模型处理 |
+| 1 | **监控短视频** | 主播发新视频 → 发现它 → 下载下来 |
+| 2 | **监控直播** | 主播开播 → 发现它 → 录制下来 |
+| 3 | **转文字** | 本地 whisper 转写，**文字和视频放同一个文件夹** |
+| 4 | **通知** | 开播/发新视频时发一封邮件。顶天了，没有别的 |
+| 5 | **MCP 控制** | 智能体通过 MCP 控制本软件全部功能、查得到每个文件的位置 |
 
 ### 明确不做
 
@@ -56,30 +56,31 @@
 尊者监控直播短视频/            ← 程序与配置（真身在外置盘 /Volumes/A区/）
 ├── config/                    配置文件
 │   ├── config.ini             主配置（[路径设置] 决定产物落哪）
-│   ├── fupan_config.ini       复盘配置
+│   ├── fupan_config.ini       转写/切片配置
 │   ├── URL_config.ini         直播监控源
 │   └── 视频监控列表.ini        短视频监控源
 ├── desktop/                   Electron 界面 + 打包脚本
-├── fupan/                     Python 工具层
-│   ├── pipeline.py            流水线入口（转写/提炼/切片/邮件）
-│   ├── transcribe.py          本地 whisper 转写
-│   ├── clip.py                切片
-│   ├── notify.py              邮件通知
-│   └── ...
-├── zunzhe-core/               Rust 核心
-│   ├── src/                   源码（extension.rs = MCP 控制面）
-│   └── target/release/        二进制
+├── fupan/                     Python 工具层（转写/切片/邮件，被 daemon 调度）
+├── zunzhe-core/               Rust 核心（src/ + target/release/ 二进制）
 ├── scripts/                   构建、发布、安装、看门狗脚本
-├── 项目宪法.md                ★ 唯一权威文档
-├── 历史/                      历史存档（只读，不得作为依据）
-└── docs/                      专题文档
+├── 产品手册.md                ★ 唯一权威文档
+├── AGENTS.md                  AI 红线（进入本项目的强制入口）
+├── CONTRACT.md                技术层工程契约
+├── README.md                  本文件（门面）
+└── .trash-作废文档/            已作废的旧文档存档（不物理删除，不作依据）
 
 /Volumes/A区/尊者产物/          ← 所有产物（程序与数据物理分离）
-├── fupan_output/              复盘产物（转写文本等）
-├── downloads/                 录像与下载
+├── {主播名}/                  一级永远是主播名
+│   ├── 直播/{日期 场次}/      场次.mp4 + 场次.转写.txt/.json（文字视频同目录）
+│   └── 短视频/{标题}/         标题.mp4 + 标题.转写.txt/.json
 ├── database/zunzhe-core.db    数据库
 └── logs/                      日志
 ```
+
+产物目录三条铁律（详见产品手册第 3 章）：
+- **R1** 直播和短视频在同一个主播目录下分两个子目录
+- **R2** 一级目录只能是主播名
+- **R3** 文字和视频在同一个文件夹里
 
 ---
 
@@ -93,18 +94,17 @@
 <项目绝对路径>/zunzhe-core/target/release/zunzhe-core mcp
 ```
 
-可用工具 **43 个**，按职责分组：
+> **工具数量**：当前 43 个（含历史别名），**规划收敛为一套与 CLI 对齐的 `monitor_*` 主命令**（`anchor_search` / `monitor_add` / `monitor_remove` / `monitor_list` / `monitor_set` / `check_now` / `download_video` / `process_media` / `notes_list` / `status` / `paths` / `doctor` / `config_get` / `config_set` / `service_start` / `service_stop` / `tail_logs` / `test_email`）。完整定义与删除清单见 `产品手册.md` 第 6 章。
 
-| 组 | 工具 |
-|---|---|
-| 直播监控 | `live_status` `live_list` `live_add` `live_remove` `live_delete` `live_check` `live_set_notify` `record_live` |
-| 短视频监控 | `video_add` `video_remove` `video_list` `video_check_now` `blogger_videos` |
-| 下载 | `download_video` `video_download` `download_videos` `video_library` |
-| **复盘产物** | **`notes_list`**（列产物+绝对路径）、**`process_media`**（跑流水线）、`export_training_data` |
-| 服务控制 | `service_status` `service_start` `service_stop` `ensure_services` `tail_logs` `doctor` |
-| 配置 | `config_get` `config_set` `config_set_bulk` `config_schema_tool` `app_prefs_get` `app_prefs_set` `wizard_done` |
-| 邮箱通知 | `email_status` `email_setup` `test_email` `test_notify` `notify_list` `notify_retry` `notify_prune` |
-| 状态 | `status` |
+智能体典型用法：
+
+```
+用户：「帮我监控XXX」
+智能体：anchor_search("XXX") → 确认候选 → monitor_add(url, name) → 完事
+
+用户：「XXX 的转写呢」
+智能体：notes_list → 按主播过滤 → 拿到绝对路径 → 自己读文件、用自己的模型处理
+```
 
 ### 4.2 CLI
 
@@ -114,12 +114,12 @@ BIN=zunzhe-core/target/release/zunzhe-core
 
 $BIN doctor        # 环境诊断
 $BIN status        # 状态快照
-$BIN notes         # 列出复盘产物（含绝对路径）
+$BIN notes         # 列出转写产物（含绝对路径）
 $BIN paths         # 路径解析（只读，不建目录）
 $BIN start         # 启动 daemon
 ```
 
-所有 CLI 命令输出一行 JSON。
+所有 CLI 命令输出一行 JSON。完整命令集见 `产品手册.md` 第 5 章。
 
 ### 4.3 桌面端
 
@@ -130,7 +130,7 @@ npm run build
 npm start
 ```
 
-打包发布见 `docs/打包发布操作手册.md`。
+打包发布见 `scripts/publish-release.sh --build` 与 `scripts/install-app-safe.sh`。
 
 ---
 
@@ -140,21 +140,12 @@ npm start
 
 ```json
 {"notes":[{
-  "anchor": "从“封存”聊到公知的变化",
-  "session": "[B站] 从“封存”聊到公知的变化",
-  "transcript_file": "/Volumes/A区/尊者产物/fupan_output/.../[B站] ....转写.txt"
+  "anchor": "侯翠翠",
+  "kind": "短视频",
+  "session": "一个人自驾阿勒泰_风都是自由的",
+  "media_file": "/Volumes/A区/尊者产物/侯翠翠/短视频/一个人自驾阿勒泰_风都是自由的/一个人自驾阿勒泰_风都是自由的.mp4",
+  "transcript_file": "/Volumes/A区/尊者产物/侯翠翠/短视频/一个人自驾阿勒泰_风都是自由的/一个人自驾阿勒泰_风都是自由的.转写.txt"
 }]}
-```
-
-实测（2026-09-21）：**216 个场次，201 个转写文件真实存在。**
-
-目录规则：
-
-```
-<产物根>/fupan_output/{视频标题}/{[平台] 场次名}/
-    {[平台] 场次名}.转写.txt      ← 转写正文（带时间戳）
-    {[平台] 场次名}.转写.json     ← 结构化分段
-    流水线结果.json               ← 本次摘要
 ```
 
 智能体拿到 `transcript_file` 后，用它**自己的模型**处理即可。
@@ -163,41 +154,26 @@ npm start
 
 ## 六、平台支持
 
-录制能力继承自上游 DouyinLiveRecorder，支持 **40+ 平台**（抖音、B站、快手、虎牙、
-斗鱼、小红书、YouTube、TikTok、Twitch 等，完整列表见上游仓库）。
-
-本项目的平台适配现状（`zunzhe-core`）：
-
 | 平台 | 直播 | 短视频/投稿 | 备注 |
 |---|---|---|---|
 | B站 | ✅ Rust 原生（免登录） | ✅ 官方 WBI 接口 + RSSHub + yt-dlp 三级兜底 | 投稿接口有风控，建议配 cookie |
-| 抖音 | ✅ Python 链路（免登录） | ⚠️ 需登录态 cookie | 详见 `docs/抖音历史视频回捞操作手册.md` |
+| 抖音 | ✅ Python 链路（免登录） | ⚠️ 需登录态 cookie | 短视频源需先扫码授权 |
 | 快手 | ✅ Python 链路（免登录） | — | |
-| 其它 | 按上游支持 | — | |
 
-> **实测分界线（2026-09-17）**：**直播全平台免授权可用；投稿/作品列表全平台反爬。**
-> 这是平台策略差异，不是实现问题 —— 直播是平台引流资产，投稿是核心内容资产。
+> **实测分界线**：直播全平台免授权可用；投稿/作品列表反爬是平台策略，不是实现问题。
+> 前端只列后端真实有适配器的平台（短视频：B站/抖音；直播：B站/抖音/快手），见产品手册冲突 #6 裁决。
 
 ---
 
 ## 七、文档导航
 
-| 文档 | 内容 | 状态 |
+| 文档 | 角色 | 状态 |
 |---|---|---|
-| **`项目宪法.md`** | ★ 产品定义 + 实测事实 + 禁止事项 | **权威** |
-| `CONTRACT.md` | 技术层工程契约（路径/验证门槛/历史证据） | 有效 |
-| `使用说明.md` | 面向使用者的详细说明 | 有效 |
-| `PROJECT_GOAL.md` | 当前阶段与已交付能力清单 | 有效 |
-| `安全审查报告.md` | 上游项目安全审查 | 有效 |
-| `docs/打包发布操作手册.md` | 打包与发布流程 | 有效 |
-| `docs/安全审计与加固报告.md` | 本项目安全审计 | 有效 |
-| `docs/抖音历史视频回捞操作手册.md` | 抖音回捞操作 | 有效 |
-| `docs/备份软件抖音监控破解分析.md` | 二手软件解剖记录 | 有效 |
-| `docs/调研结论-2026-09-21.md` | 本轮实测调研 | 有效 |
-| `docs/全项目调研报告-2026-09-21.md` | 全项目体检（代码/入口/逻辑/文档） | 有效 |
-| `docs/项目调研方法论.md` | 可复用的调研清单 | 有效 |
-| `docs/历史/Rust重构记录.md` | Rust 重构施工日志（97 节） | **只读，不得作为依据** |
-| `历史/` | 历史存档（08~09 月旧报告） | **只读，不得作为依据** |
+| **`产品手册.md`** | ★ 产品定义 + 实测事实 + 操作 + 修复计划（含进度） | **唯一权威** |
+| **`AGENTS.md`** | AI 红线与禁止事项（进入项目的强制入口） | 有效 |
+| **`CONTRACT.md`** | 技术层工程契约（验证门槛/防回归/架构契约） | 有效 |
+| **`README.md`** | 本文件，项目门面 | 有效 |
+| `.trash-作废文档/` | 旧文档存档（项目宪法/使用说明/docs/历史等） | **只读，不得作为依据** |
 
 ---
 
