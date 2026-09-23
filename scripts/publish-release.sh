@@ -138,7 +138,7 @@ rm -f "$ZIP"
 ditto -c -k --sequesterRsrc --keepParent "$APP_SRC" "$ZIP"
 
 # 压缩包自检：必须真的含 Contents/Info.plist，否则更新器认不出这个包
-if ! unzip -Z1 "$ZIP" 2>/dev/null | grep -q '\.app/Contents/Info\.plist$'; then
+if ! unzip -Z1 "$ZIP" 2>/dev/null | LC_ALL=C grep -aq '\.app/Contents/Info\.plist$'; then
   echo "[发布] 错误：压出来的包不完整（里面找不到 .app/Contents/Info.plist）" >&2
   exit 1
 fi
