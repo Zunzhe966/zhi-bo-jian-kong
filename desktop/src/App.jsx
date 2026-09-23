@@ -16,7 +16,7 @@ import { LiveCard, VideoCard, statusFingerprint } from './PersonCards'
 import {
   itemStashDir, itemStashFallback, humanSize, stamp,
   isTranscribableMedia, processEnqueueFeedback, processTaskAction,
-  processTaskForFile, processTaskLabel, pendingTranscriptionItems, stashFieldDefault,
+  
   downloadQueueFeedback,
 } from './stash'
 import LogsPanel from './LogsPanel'
@@ -160,9 +160,6 @@ export default function App() {
   // 复盘笔记页：哪些「人/内容」的分组被展开了。
   // 复盘目录的结构是 fupan_output/<主播或内容名>/<场次>/<文件>，
   // anchor 就是顶层文件夹——直播录的是主播名，B站投稿复盘的是视频标题，如实展示。
-  const [openNoteGroups, setOpenNoteGroups] = useState({})
-  const [notesOpen, setNotesOpen] = useState(false)
-  const [noteContent, setNoteContent] = useState('')
   const [addForm] = Form.useForm()
   const [videoForm] = Form.useForm()
   const [emailForm] = Form.useForm()
@@ -498,37 +495,8 @@ export default function App() {
     () => (status?.video_watchlist || []).map((v, i) => ({ ...v, key: v.url, index: i + 1, platform: v.platform || detectPlatform(v.url) })),
     [status?.video_watchlist],
   )
-  const fileBaseName = (p) => (p || '').split('/').filter(Boolean).pop() || p || ''
 
-  // 把后端 notes（一条=一个场次）按 anchor 聚成「人/内容」分组，
-  // 每组里再按场场次列出所有文件——这才是用户要的「不同的主播，点进去看所有文章」。
-  const noteGroups = useMemo(() => {
-    const by = new Map()
-    for (const n of status?.notes || []) {
-      const anchor = n.anchor || '（未归类）'
-      if (!by.has(anchor)) by.set(anchor, { anchor, sessions: [], fileCount: 0 })
-      const g = by.get(anchor)
-      const files = []
-      // 笔记（LLM 复盘结论）排最前，转写其次，知识点最后——用户最关心的先露脸。
-      if (n.notes_file) files.push({ path: n.notes_file, name: fileBaseName(n.notes_file), kind: 'notes', kindLabel: '转写文本' })
-      if (n.transcript_file) files.push({ path: n.transcript_file, name: fileBaseName(n.transcript_file), kind: 'txt', kindLabel: '转写' })
-      if (n.points_file) files.push({ path: n.points_file, name: fileBaseName(n.points_file), kind: 'json', kindLabel: '知识点' })
-      g.sessions.push({ session: n.session || '', files, clips: n.clips || [] })
-      g.fileCount += files.length
-    }
-    // 没转出任何文件、也没有切片的场次不显示（实测有 15 个排队失败的空场次，
-    // 摆出来全是「点不了」的占位，用户最恨这个）。过滤后组也空了就连组一起丢。
-    return [...by.values()]
-      .map((g) => ({ ...g, sessions: g.sessions.filter((s) => s.files.length || s.clips.length) }))
-      .filter((g) => g.sessions.length)
-      .sort((a, b) => a.anchor.localeCompare(b.anchor, 'zh-Hans-CN'))
-  }, [status?.notes])
 
-  // 侧边栏徽标：跟页面实际展示的口径一致（只数有文件的场次），不要挂一个虚的数字。
-  const noteSessionCount = useMemo(
-    () => noteGroups.reduce((sum, g) => sum + g.sessions.length, 0),
-    [noteGroups],
-  )
 
   const ensureStarted = async () => {
     if (!status?.rust_daemon && !status?.services?.live_monitor?.running) {
@@ -988,55 +956,17 @@ export default function App() {
     (status?.services?.live_monitor?.running && status?.services?.video_monitor?.running)
   )
 
-  const openNote = async (file) => {
-    const text = await window.desktop.readText(file)
-    setNoteContent(text)
-    setNotesOpen(true)
-  }
-
-  const toggleNoteGroup = (anchor) =>
-    setOpenNoteGroups((prev) => ({ ...prev, [anchor]: !prev[anchor] }))
-
-  /** 点文件名＝直接用系统默认程序打开（跟在访达里双击一样），不再绕一层。 */
-  const openFileDirect = async (p) => {
-    const err = await window.desktop.openPath(p)
-    if (err) message.error(`打不开 ${fileBaseName(p)}：${err}`)
-  }
-
-  /** 点「打开文件夹」＝马上进到那个人/那个内容自己的文件夹，没有中间页。 */
-  const openNoteAnchorDir = async (anchor) => {
-    const root = (paths.media_root || paths.fupan_output || '').replace(/\/+$/, '')
-    if (!root) return message.warning('还没解析出产物根目录，请先在「全局设置」里确认')
-    const dir = `${root}/${anchor}`
-    const err = await window.desktop.openPath(dir)
-    if (err) message.error(`打不开文件夹：${err}（该主播还没有产物目录时，可先确认是否录过/下载过）`)
-  }
-
-  /** 「换个目录」：复盘输出目录是可自由选择的，改完立刻按新目录重新拉数据。 */
-  const changeFupanDir = async () => {
-    const r = await window.desktop.chooseDir({
-      title: '选择复盘输出目录',
-      defaultPath: paths.fupan_output || status?.paths?.media_root || '',
-    })
-    if (r && r.ok && r.path) {
-      await window.desktop.cli('set-config', 'config', '路径设置', '复盘输出目录', r.path)
-      message.success(`复盘目录已换成：${r.path}`)
-      await fetchStatus()
-    }
-  }
 
   const svc = {
     live_monitor: { running: serviceRunning },
     video_monitor: { running: serviceRunning },
   }
-  const tabTitles = { live: '直播监控', video: '发布视频监控', notes: '转写文本', logs: '运行日志' }
+
   const tabHints = {
     live: '每个主播一张卡片，点「主播设置」改画质、通知、删除',
     video: '每个博主一张卡片，点「博主设置」改下载、通知、历史视频、删除',
-    notes: '已转写和复盘的内容',
     logs: '直播/视频监控后台日志，排查报错用',
   }
-  const transcriptionItems = pendingTranscriptionItems(status)
 
   return (
     <div className="app-shell">
@@ -1054,9 +984,6 @@ export default function App() {
         <button type="button" className={`nav-item ${mainTab === 'video' ? 'active' : ''}`} onClick={() => setMainTab('video')}>
           <CloudDownloadOutlined /> 视频监控 <span className="nav-badge">{videoRows.length}</span>
         </button>
-        <button type="button" className={`nav-item ${mainTab === 'notes' ? 'active' : ''}`} onClick={() => setMainTab('notes')}>
-          <FileTextOutlined /> 转写文本 <span className="nav-badge">{noteSessionCount}</span>
-        </button>
         <button type="button" className={`nav-item ${mainTab === 'logs' ? 'active' : ''}`} onClick={() => setMainTab('logs')}>
           <UnorderedListOutlined /> 运行日志
         </button>
@@ -1065,7 +992,6 @@ export default function App() {
           {/* 两个按钮必须一眼分得清：产物是用户自己的文件，程序是安装目录。
               以前叫「打开保存目录 / 打开数据目录」，用户点了后者跳到程序目录，
               看不出是故意的还是出错——名字直接说清就好了。 */}
-          <Button block icon={<FolderOpenFilled />} onClick={() => window.desktop.openPath(status?.paths?.media_root || status?.paths?.recordings || '')}>打开产物目录</Button>
           <Button block icon={<CloudSyncOutlined />} loading={updateBusy} onClick={checkUpdate}>检查更新</Button>
           <div className="app-version">界面 v2 · v{APP_VERSION} · 构建于 {BUILD_LABEL}</div>
         </div>
@@ -1147,122 +1073,6 @@ export default function App() {
                 <Empty description="还没有博主，点「添加博主」监控新视频" />
               </div>
             )
-          )}
-          {mainTab === 'notes' && (
-            <div className="notes-wrap">
-              {/* 目录本身就摆在最上面：能点、能直接打开、也能随时换。
-                  用户要的「地址可以自由选择」就是这个「换个目录」。 */}
-              <div className="notes-dir-bar">
-                <span className="notes-dir-label">复盘输出目录（全局数据）</span>
-                <a className="detail-link" title="点击打开这个文件夹"
-                  onClick={() => window.desktop.openPath(paths.fupan_output || '')}>
-                  {paths.fupan_output || '（未解析）'}
-                </a>
-                <Space size={8}>
-                  <Button size="small" icon={<FolderOpenFilled />}
-                    onClick={() => window.desktop.openPath(paths.fupan_output || '')}>打开</Button>
-                  <Button size="small" onClick={changeFupanDir}>换个目录</Button>
-                </Space>
-              </div>
-
-              <div className="notes-transcribe-panel">
-                <div className="notes-transcribe-head">
-                  <div>
-                    <div className="notes-transcribe-title">视频转文字</div>
-                    <div className="notes-transcribe-hint">
-                      这里列出最近下载/录制的音视频，点按钮直接进转写队列；不再需要进博主详情里翻文件。
-                    </div>
-                  </div>
-                  <Tag>{transcriptionItems.length} 个媒体文件</Tag>
-                </div>
-                {transcriptionItems.length ? (
-                  <div className="file-list">
-                    {transcriptionItems.map((item) => (
-                      <div className="file-row" key={item.path}>
-                        <span className="file-icon"><VideoCameraFilled style={{ color: '#818cf8' }} /></span>
-                        <span className="file-name" title={item.path}
-                          onClick={() => openFileDirect(item.path)}>{item.name}</span>
-                        <span className="file-size">{item.sizeMb ? `${item.sizeMb} MB` : ''}</span>
-                        <span className="file-time">{item.minutesAgo ? `${item.minutesAgo} 分钟前` : ''}</span>
-                        {item.label && <Tag color={item.task?.status === 'failed' ? 'error' : item.task?.status === 'done' ? 'success' : 'processing'}>{item.label}</Tag>}
-                        <Button size="small" type="primary" ghost
-                          loading={detailQueueing === item.path}
-                          disabled={item.action.disabled}
-                          onClick={() => queueTranscription({ path: item.path, name: item.name })}>
-                          {item.action.label}
-                        </Button>
-                        <Button size="small" type="link"
-                          onClick={() => window.desktop.showItem(item.path)}>在访达中显示</Button>
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <div className="detail-empty">最近没有可直接转写的音视频。下载新视频或录完直播后，会自动出现在这里。</div>
-                )}
-              </div>
-
-              {noteGroups.length ? (
-                <div className="notes-groups">
-                  {noteGroups.map((g) => (
-                    <div className="notes-group" key={g.anchor}>
-                      <div className="notes-group-head" onClick={() => toggleNoteGroup(g.anchor)}>
-                        <span className="notes-group-arrow">{openNoteGroups[g.anchor] ? '▾' : '▸'}</span>
-                        <span className="notes-group-name">{g.anchor}</span>
-                        <Tag>{g.sessions.length} 场 / {g.fileCount} 个文件</Tag>
-                        <span style={{ flex: 1 }} />
-                        <Button size="small" icon={<FolderOpenFilled />}
-                          onClick={(e) => { e.stopPropagation(); openNoteAnchorDir(g.anchor) }}>
-                          打开文件夹
-                        </Button>
-                      </div>
-                      {openNoteGroups[g.anchor] && (
-                        <div className="notes-group-body">
-                          {g.sessions.map((s) => (
-                            <div className="notes-session" key={`${g.anchor}/${s.session}`}>
-                              {s.session && <div className="notes-session-name">{s.session}</div>}
-                              {s.files.length ? (
-                                <div className="file-list">
-                                  {s.files.map((f) => (
-                                    <div className="file-row" key={f.path}>
-                                      <span className="file-icon"><FileTextOutlined style={{ color: f.kind === 'notes' ? '#34d399' : '#93c5fd' }} /></span>
-                                      <span className="file-name" title="点击直接用默认程序打开"
-                                        onClick={() => openFileDirect(f.path)}>{f.name}</span>
-                                      <span className="file-kind">{f.kindLabel}</span>
-                                      <Button size="small" type="link" onClick={() => openNote(f.path)}>预览</Button>
-                                      <Button size="small" type="link"
-                                        onClick={() => window.desktop.showItem(f.path)}>在访达中显示</Button>
-                                    </div>
-                                  ))}
-                                </div>
-                              ) : (
-                                <div className="detail-empty">这一场还没转出文件。</div>
-                              )}
-                              {s.clips.length > 0 && (
-                                <div className="notes-clips">
-                                  精华切片：
-                                  {s.clips.map((c, i) => (
-                                    <a className="detail-link" key={c} onClick={() => openFileDirect(c)}>切片 {i + 1}</a>
-                                  ))}
-                                </div>
-                              )}
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <div className="empty-wrap">
-                  <Empty description="还没有复盘内容。录过一段直播、或下载过视频并转写之后，转写和笔记会出现在该主播自己的文件夹里。" />
-                  <Space size={8}>
-                    <Button icon={<FolderOpenFilled />}
-                      onClick={() => window.desktop.openPath(paths.media_root || paths.fupan_output || '')}>打开产物目录看看</Button>
-                    <Button onClick={changeFupanDir}>换个目录</Button>
-                  </Space>
-                </div>
-              )}
-            </div>
           )}
           {mainTab === 'logs' && (
             <LogsPanel logDir={status?.paths?.logs} logPaths={status?.log_paths} />
@@ -1453,8 +1263,6 @@ export default function App() {
           <Space size={8} style={{ marginTop: 6 }} wrap>
             <Button size="small" icon={<FolderOpenFilled />}
               onClick={() => detailRow && openItemStash(detailRow, detailType)}>打开文字稿文件夹</Button>
-            <Button size="small"
-              onClick={() => { setDetailOpen(false); setMainTab('notes') }}>看全部转写文本</Button>
           </Space>
         </div>
 
@@ -1630,10 +1438,6 @@ export default function App() {
         <div style={{ fontWeight: 600, margin: '16px 0 8px' }}>抖音授权</div>
         <Button onClick={douyinLogin}>打开抖音 扫码登录（短视频监控用）</Button>
         <div style={{ fontSize: 12, color: '#999', marginTop: 4 }}>登录后自动保存，用于监控/下载抖音短视频；约一个月后需重新扫码</div>
-      </Modal>
-
-      <Modal title="复盘内容" open={notesOpen} onCancel={() => setNotesOpen(false)} footer={null} width={800}>
-        <pre style={{ whiteSpace: 'pre-wrap', maxHeight: 500, overflow: 'auto' }}>{noteContent}</pre>
       </Modal>
 
       <Modal title="批量下载视频" open={batchOpen} onOk={onBatchBrowse} onCancel={() => setBatchOpen(false)} okText="列出历史视频" width={640} destroyOnClose>

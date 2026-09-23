@@ -423,7 +423,20 @@ fn launchd_monitor_installed() -> bool {
 /// 无效的 `launchctl kickstart`，更不能把直接启动的进程标成“launchd 管理”。
 #[cfg(target_os = "macos")]
 fn launchd_can_manage(project_dir: &Path) -> bool {
-    launchd_monitor_installed() && !is_tcc_protected_path(project_dir)
+    // 外置盘（/Volumes/*）是 launchd 禁区：实测 launchctl submit 跑
+    // `ls /Volumes/A区/...` = Operation not permitted（xpcproxy deny file-read-data），
+    // kickstart 只会得到 "Could not find service" 死循环。这类项目只能由
+    // 桌面端 watchdog 直拉，不能走 launchd 分支。
+    launchd_monitor_installed() && !is_tcc_protected_path(project_dir) && !is_external_volume(project_dir)
+}
+
+#[cfg(target_os = "macos")]
+fn is_external_volume(p: &Path) -> bool {
+    p.starts_with("/Volumes/")
+}
+#[cfg(not(target_os = "macos"))]
+fn is_external_volume(_p: &Path) -> bool {
+    false
 }
 
 /// macOS：com.zunzhe.healthcheck 看门狗是否已安装到用户 LaunchAgents。

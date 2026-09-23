@@ -12,7 +12,10 @@ const { healthcheckInvocation } = require('./healthcheck.cjs')
 // 因此这里只用惰性 getter，避免顶层求值导致主进程启动即崩溃。
 const PROJECT_DIR = path.resolve(__dirname, '..', '..')
 function isPackaged() { return app.isPackaged }
-function runtimeDir() { return isPackaged() ? app.getPath('userData') : PROJECT_DIR }
+// 数据根永远跟随项目根（外置盘/~/Projects），不要用 userData：
+// userData 里曾残留一套旧 config/DB/目录，导致打包态 CLI 与 daemon 数据根分裂、
+// 「启动服务」找不到二进制、打开位置指到旧目录、配置改完不生效。
+function runtimeDir() { return PROJECT_DIR }
 function resDir() { return isPackaged() ? process.resourcesPath : PROJECT_DIR }
 const CORE_NAME = process.platform === 'win32' ? 'zunzhe-core.exe' : 'zunzhe-core'
 function rustExe() {
