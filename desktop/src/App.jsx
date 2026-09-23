@@ -1142,7 +1142,7 @@ export default function App() {
             videoRows.length ? (
               <div className="card-grid">{videoRows.map((r) => (
                 <VideoCard key={r.key} row={r} platformIcon={platformIcon} platformLabel={platformLabel}
-                  onSettings={openItemSettings} onHistory={openHistory} onToggleDownload={toggleVideoDownload}
+                  onSettings={openItemSettings}
                   onOpenStash={openItemStash} onDetail={openItemDetail} />
               ))}</div>
             ) : (

@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Tray, Menu, globalShortcut, ipcMain, shell, nativeImage, Notification } = require('electron')
+const { app, BrowserWindow, Tray, Menu, ipcMain, shell, nativeImage, Notification } = require('electron')
 const path = require('path')
 const { spawn } = require('child_process')
 const fs = require('fs')
@@ -27,7 +27,6 @@ const ICON_ICO = path.join(ASSETS, 'icon.ico')
 const ICON_PNG = path.join(ASSETS, 'icon.png')
 const ICON_TRAY = path.join(ASSETS, 'icon-32.png')
 const APP_NAME = '尊者直播监控'
-const HOTKEY = 'Control+Shift+L'
 function notifyQueuePath() { return path.join(runtimeDir(), 'fupan_output', 'run', 'pending_notify.json') }
 function notifySeenFilePath() { return path.join(runtimeDir(), 'fupan_output', 'run', 'desktop_seen_notify_ids.json') }
 // 打包态下默认配置模板从 resourcesPath/config 复制；开发态直接用项目 config。
@@ -291,18 +290,11 @@ function createTray() {
   const menu = Menu.buildFromTemplate([
     { label: '显示主窗口', click: createWindow },
     { label: '重新加载界面', click: () => reloadUiWindow() },
-    { label: `快捷键 ${HOTKEY}`, enabled: false },
     { type: 'separator' },
     { label: '退出', click: () => { app.isQuitting = true; app.quit() } },
   ])
   tray.setContextMenu(menu)
   tray.on('double-click', createWindow)
-}
-
-function registerShortcut() {
-  globalShortcut.unregisterAll()
-  const ok = globalShortcut.register(HOTKEY, createWindow)
-  if (!ok) console.warn('快捷键注册失败:', HOTKEY)
 }
 
 app.setName(APP_NAME)
@@ -362,7 +354,6 @@ app.whenReady().then(async () => {
   if (!gotLock) return
   ensureRuntime()
   createTray()
-  registerShortcut()
   createWindow()
   await applyStartupPrefs()
   startBackgroundTasks()
@@ -403,7 +394,6 @@ app.whenReady().then(async () => {
 })
 
 app.on('will-quit', () => {
-  globalShortcut.unregisterAll()
   if (watchdogTimer) clearInterval(watchdogTimer)
   if (notifyTimer) clearInterval(notifyTimer)
 })
