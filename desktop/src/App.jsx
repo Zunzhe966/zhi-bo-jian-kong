@@ -424,7 +424,7 @@ export default function App() {
     if (!url.startsWith('http')) return message.error('请输入有效的直播间地址或ID')
     setLoading(true)
     try {
-      await window.desktop.cli('add-live', url, v.remarks ? `主播: ${v.remarks}` : '', v.quality || '', v.notify || '跟随全局')
+      await window.desktop.cli('add-live', url, v.remarks ? `主播: ${v.remarks}` : '', v.quality || '')
       await ensureStarted()
       message.success('已添加直播监控')
       setAddOpen(false)
