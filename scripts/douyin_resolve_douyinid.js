@@ -7,10 +7,32 @@
  *       提取所有候选的 (sec_uid, nickname, unique_id, signature), 去重后输出。
  *       用户可据此判断哪个才是目标账号。
  *
- * 用法: node douyin_resolve_douyinid.js <抖音号> [采样次数]
+ * 用法: node douyin_resolve_douyinid.js <抖音号> [采样次数] [cookie文件]
+ *       cookie 文件为 Netscape 格式（软件授权后落盘 douyin_browser_cookies.txt），
+ *       注入后访问 /user/{抖音号} 不再被登录风控拦住，可稳定解析 sec_uid。
  */
 const { chromium } = require('../rsshub/node_modules/patchright');
 const fs = require('fs');
+
+/** 解析 Netscape cookie 文件（tab 分隔 7 列）为 patchright addCookies 格式 */
+function loadNetscapeCookies(path) {
+  const out = [];
+  const lines = fs.readFileSync(path, 'utf-8').split('\n');
+  for (const l of lines) {
+    const t = l.trim();
+    if (!t || t.startsWith('#')) continue;
+    const p = t.split('\t');
+    if (p.length < 7) continue;
+    out.push({
+      name: p[5], value: p[6],
+      domain: p[0].startsWith('.') ? p[0] : '.' + p[0],
+      path: p[2] || '/',
+      secure: p[3] === 'TRUE',
+      expires: parseInt(p[4]) || Math.floor(Date.now() / 1000) + 86400 * 180,
+    });
+  }
+  return out;
+}
 
 const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36';
@@ -18,6 +40,7 @@ const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (
 async function main() {
   const douyinId = process.argv[2];
   const samples = parseInt(process.argv[3]) || 4;
+  const cookieFile = process.argv[4] || '';
   if (!douyinId) { console.error('用法: node douyin_resolve_douyinid.js <抖音号> [采样次数]'); process.exit(1); }
   console.log(`目标抖音号: ${douyinId}  (采样${samples}次交叉验证)\n`);
 
@@ -30,6 +53,10 @@ async function main() {
 
   for (let i = 0; i < samples; i++) {
     const ctx = await browser.newContext({ userAgent: UA, locale: 'zh-CN', viewport: { width: 1280, height: 1600 } });
+    if (cookieFile && fs.existsSync(cookieFile)) {
+      try { await ctx.addCookies(loadNetscapeCookies(cookieFile)); }
+      catch (e) { console.log('cookie 注入失败: ' + (e.message || '').slice(0, 60)); }
+    }
     const page = await ctx.newPage();
 
     // 建立会话

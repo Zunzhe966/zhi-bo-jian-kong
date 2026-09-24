@@ -405,9 +405,22 @@ export default function App() {
     }
   }
 
+  // 抖音号/平台ID → URL：非 URL 输入时优先按抖音号解析（解析成功返回主播主页，
+  // monitor_add 会把直播+短视频一起挂上）；失败走原 normalizeUrl 兜底（不打断 B站等平台）
+  const resolveAnchorIfNeeded = async (input, platform) => {
+    const v = String(input || '').trim()
+    if (!v || /^https?:\/\//i.test(v)) return v
+    if (/^\d+$/.test(v)) return normalizeUrl(v, platform)
+    const r = await window.desktop.resolveDouyinAnchor(v).catch(() => null)
+    if (r && r.ok) return r.url
+    return normalizeUrl(v, platform)
+  }
+
   const onAddLive = async () => {
     const v = await addForm.validateFields()
-    const url = normalizeUrl(v.channelId, v.providerId)
+    let url
+    try { url = await resolveAnchorIfNeeded(v.channelId, v.providerId) }
+    catch (e) { return message.error(String(e.message || e)) }
     if (!url.startsWith('http')) return message.error('请输入有效的直播间地址或ID')
     setLoading(true)
     try {
@@ -428,7 +441,13 @@ export default function App() {
     const v = await videoForm.validateFields()
     setLoading(true)
     try {
-      await window.desktop.cli('add-video', v.url.trim(), v.name.trim(), v.autoDownload ? '是' : '否', v.notify || '跟随全局')
+      // 非 URL 输入（抖音号）先自动解析成主播主页
+      let url = v.url.trim()
+      if (!/^https?:\/\//i.test(url) && !/^\d+$/.test(url)) {
+        const r = await window.desktop.resolveDouyinAnchor(url).catch(() => null)
+        if (r && r.ok) url = r.url
+      }
+      await window.desktop.cli('add-video', url, v.name.trim(), v.autoDownload ? '是' : '否', v.notify || '跟随全局')
       await ensureStarted()
       message.success('已添加发布视频监控')
       setVideoOpen(false)

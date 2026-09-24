@@ -1043,6 +1043,28 @@ app.whenReady().then(async () => {
     const { harvestDouyinCookies } = require('./douyin-cookie.cjs')
     return harvestDouyinCookies(app, authCookiePath('douyin_browser_cookies.txt'), '')
   })
+  // 抖音号 → 主播主页 URL 解析：跑 douyin_resolve_douyinid.js（优先注入已保存 Cookie），
+  // 前端「添加主播」填抖音号+名字即可，不需要手工复制直播间链接。
+  ipcMain.handle('resolve-douyin-anchor', async (_ev, douyinId) => {
+    const { execFile } = require('child_process')
+    const path = require('path')
+    const id = String(douyinId || '').trim()
+    if (!id) return { ok: false, error: '抖音号不能为空' }
+    const script = path.join(PROJECT_DIR, 'scripts', 'douyin_resolve_douyinid.js')
+    const cookiePath = authCookiePath('douyin_browser_cookies.txt')
+    const out = await new Promise((resolve) => {
+      execFile('node', [script, id, '2', cookiePath], { timeout: 150000, maxBuffer: 8 * 1024 * 1024 },
+        (err, stdout, stderr) => resolve({ err, stdout: String(stdout || ''), stderr: String(stderr || '') }))
+    })
+    // 脚本成功输出「=== 推荐使用的 sec_uid ===」+ 下一行 sec_uid
+    const m = out.stdout.match(/=== 推荐使用的 sec_uid ===\n\s*([A-Za-z0-9_-]+)/)
+    const nick = out.stdout.match(/对应账号: ([^（(]+)/)
+    if (m) {
+      const url = `https://www.douyin.com/user/${m[1]}`
+      return { ok: true, url, sec_uid: m[1], nickname: nick ? nick[1].trim() : id, source: 'resolve' }
+    }
+    return { ok: false, error: '解析失败：未能确认该抖音号。可能原因：① 抖音号拼写有误；② 尚未完成抖音授权（全局设置→抖音授权→扫码登录）后重试；③ 直接粘贴主播主页链接更稳妥', detail: out.stdout.slice(0, 300) }
+  })
 
   // 窗口必须最后创建。渲染进程一加载就会发第一个 `cli('status')`，而
   // 所有 ipcMain.handle 都在上面：以前 createWindow() 排在前面、handler 排在

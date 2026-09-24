@@ -20,7 +20,7 @@ export default function AddModals({
           </Form.Item>
           <Form.Item label="链接/频道ID" name="channelId" rules={[{ required: true, message: '请输入' }]}
             extra="底层支持 40+ 平台，直接粘贴直播间链接；智能体请通过 MCP/CLI 连接，不必在此配置大模型">
-            <Input placeholder="例如 https://live.bilibili.com/21686237" />
+            <Input placeholder="直播间链接，或抖音号（如 xiguahaochi96，自动解析）" />
           </Form.Item>
           <Form.Item label="主播名/备注" name="remarks" rules={[{ required: true, message: '请输入' }]}>
             <Input placeholder="方便识别的名字" />
@@ -42,7 +42,7 @@ export default function AddModals({
           </Form.Item>
           <Form.Item label="监控地址" name="url" rules={[{ required: true }]}
             extra="B站填 space.bilibili.com/数字；抖音/快手可用 RSSHub 订阅地址">
-            <Input placeholder="https://space.bilibili.com/946974" />
+            <Input placeholder="主页链接，或抖音号（如 xiguahaochi96，自动解析）" />
           </Form.Item>
           <Form.Item label="自动下载新视频" name="autoDownload" valuePropName="checked"
             extra="开：发现新视频立即下载；关：只通知不下载">

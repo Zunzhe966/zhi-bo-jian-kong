@@ -31,4 +31,5 @@ contextBridge.exposeInMainWorld('desktop', {
   checkUpdate: (opts) => ipcRenderer.invoke('check-update', opts || {}),
   biliLogin: () => ipcRenderer.invoke('bili-login'),
   douyinLogin: () => ipcRenderer.invoke('douyin-login'),
+  resolveDouyinAnchor: (id) => ipcRenderer.invoke('resolve-douyin-anchor', id),
 })
