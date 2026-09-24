@@ -95,16 +95,28 @@ async function clickLogin(win, debug) {
   for (let i = 0; i < CLICK_RETRIES; i++) {
     try {
       const r = await win.webContents.executeJavaScript(`(function(){
-        var btns = Array.from(document.querySelectorAll('button, [class*="login" i], [class*="Login"]'));
+        // 抖音 SPA 的登录入口不是稳定 button：先按属性选，再按文本全遍历兜底
+        var hit = null;
+        var attrs = Array.from(document.querySelectorAll('button, [class*="login" i], [aria-label*="登录"], [data-e2e*="login" i]'));
         var candidates = ['登录', '登陆', 'Log in', 'Sign in'];
-        for (var i = 0; i < btns.length; i++) {
-          var el = btns[i];
+        var visible = function (el) {
+          return el.offsetParent !== null || (el.getClientRects && el.getClientRects().length > 0);
+        };
+        for (var i = 0; i < attrs.length; i++) {
+          var el = attrs[i];
           var t = (el.textContent || '').trim();
-          if (candidates.indexOf(t) >= 0 && el.offsetParent !== null) {
-            el.click();
-            return 'clicked:' + t;
+          var aria = (el.getAttribute && el.getAttribute('aria-label')) || '';
+          if (visible(el) && (candidates.indexOf(t) >= 0 || (t.indexOf('登录') >= 0 && t.length <= 10) || aria.indexOf('登录') >= 0)) { hit = el; break; }
+        }
+        if (!hit) {
+          // 兜底：全文档找 textContent 恰好为「登录」的最深叶子（如顶部导航入口）
+          var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
+          while ((el = walker.nextNode())) {
+            var t = (el.textContent || '').trim();
+            if (t === '登录' && el.children.length === 0 && visible(el)) { hit = el.parentElement || el; break; }
           }
         }
+        if (hit) { hit.click(); return 'clicked:' + ((hit.textContent || '').trim() || 'login'); }
         return 'no-login-btn';
       })()`, true)
       debug('click login -> ' + r)
@@ -134,8 +146,11 @@ async function harvestDouyinCookies(app, outFile = defaultOut(), statusFile = ''
     height: 780,
     show: true,
     title: '抖音授权登录（请用手机抖音扫码）',
+    // 伪装成普通 Chrome：Electron UA 带 Electron 标识，抖音会对自动化浏览器加严风控（"登录太频繁"）
+    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
     webPreferences: { partition: 'persist:douyin', nodeIntegration: false, contextIsolation: true },
   })
+  ses.setUserAgent(win.webContents.getUserAgent())
 
   const debug = (m) => { try { fs.appendFileSync(path.join(path.dirname(outFile), 'douyin_harvest_status.json'), `[${Date.now()}] fn:${m}\n`) } catch { /* ignore */ } }
   debug('window created')
@@ -162,8 +177,8 @@ async function harvestDouyinCookies(app, outFile = defaultOut(), statusFile = ''
     }
 
     if (!loggedIn) {
-      // 用户可能手动关闭了窗口
-      return { ok: false, error: '未检测到登录（超时 300 秒或窗口已关闭），请确认已用手机抖音扫码登录' }
+      // 用户可能手动关闭了窗口；抖音风控（登录太频繁/需验证）也常见，给出可读提示
+      return { ok: false, error: '未检测到登录（超时 300 秒或窗口已关闭）。若页面提示「登录太频繁」等风控信息，请等待 20-30 分钟后再试；确认扫码成功后窗口会自动保存' }
     }
 
     // 4. 登录成功后，尝试从页面拿到当前用户信息（sec_uid / 抖音号 / 昵称）
