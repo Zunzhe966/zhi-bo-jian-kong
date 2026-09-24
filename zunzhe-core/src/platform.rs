@@ -545,35 +545,29 @@ impl Platform for BilibiliAdapter {
         Box::pin(async move {
             let mid =
                 Self::mid_from_url(url).with_context(|| format!("不是 B站空间地址: {url}"))?;
-            // 官方 wbi/arc 接口优先（带 cookie），再 RSSHub，最后 yt-dlp；
-            // Electron 页面提取从调度轮次移除，因为独立 Electron 冷启动
-            // 需要 20-40 秒，会被 50 秒单源护栏截断；手动 blogger-videos
-            // 场景仍可使用（由调用方决定是否补充）。
+            // RSSHub 优先（平台缓存、抗 412），官方 wbi/arc 接口（带 cookie）
+            // 次之，最后 yt-dlp 兜底。RSS 通道不直接打 B站接口，是三种途径
+            // 里最不容易触发风控的；官方接口仅在 RSS 不可用时才调用。
             // 三个兜底都只返回“空列表”，但空的原因可能是 412 风控，也可能是
             // 网络/DNS 故障。把每级的真实原因带上来，顶层报错才不至于把
             // “api.bilibili.com 解析失败”误导成“请配置 cookie”。
-            let (official_videos, official_err) = self.upload_ids_official(&mid, count).await;
-            let mut rsshub_err = String::new();
+            let (mut bvids, rsshub_err) = self.upload_ids_rsshub(&mid, count).await;
+            let mut official_videos = Vec::new();
+            let mut official_err = String::new();
             let mut ytdlp_err = String::new();
-            tracing::warn!(
-                "B站官方投稿接口返回 {} 条 ({official_err})",
-                official_videos.len()
-            );
-            let mut bvids = official_videos
-                .iter()
-                .map(|v| v.id.clone())
-                .collect::<Vec<_>>();
-            if bvids.is_empty() {
-                let (next, err) = self.upload_ids_rsshub(&mid, count).await;
-                bvids = next;
-                rsshub_err = err.clone();
-                // 这一层是前一级失败后的兜底：拿到了内容就说明链路救回来了，
-                // 不该按 WARN 记 —— 否则「返回 30 条」这种好消息会把日志刷成
-                // 一片红，真故障反而被淹没。真的 0 条才值得 WARN。
-                if bvids.is_empty() {
-                    tracing::warn!("B站 RSSHub 兜底也未返回投稿 (0 条) ({err})");
+            if !bvids.is_empty() {
+                tracing::debug!("B站 RSSHub 优先返回 {} 条", bvids.len());
+            } else {
+                tracing::warn!("B站 RSSHub 未返回投稿 (0 条) ({rsshub_err})，回退官方接口");
+                (official_videos, official_err) = self.upload_ids_official(&mid, count).await;
+                if !official_videos.is_empty() {
+                    tracing::debug!("B站官方投稿接口返回 {} 条", official_videos.len());
+                    bvids = official_videos
+                        .iter()
+                        .map(|v| v.id.clone())
+                        .collect::<Vec<_>>();
                 } else {
-                    tracing::debug!("B站 RSSHub 兜底返回 {} 条", bvids.len());
+                    tracing::warn!("B站官方投稿接口返回 0 条 ({official_err})，回退 yt-dlp");
                 }
             }
             if bvids.is_empty() {
@@ -594,7 +588,8 @@ impl Platform for BilibiliAdapter {
                 )));
             }
             // 官方 vlist 已带标题/封面/时长/日期，直接作为结果；
-            // 兜底源只有 BV 号时仍并发调用 view 补全，避免把占位伪装成成功。
+            // RSSHub/yt-dlp 兜底源只有 BV 号时仍并发调用 view 补全，
+            // 避免把占位伪装成成功。
             let out = if official_videos.is_empty() {
                 let results =
                     futures_util::future::join_all(bvids.iter().map(|bvid| self.view(bvid))).await;

@@ -22,7 +22,7 @@ use crate::watchlist::Watchlist;
 /// 心跳间隔：B站弹幕协议要求每 30 秒一次。
 const HEARTBEAT_SECS: u64 = 30;
 /// 断线重连退避上限：封顶 60 秒，避免坏房间无限快速重连刷日志。
-const MAX_BACKOFF_SECS: u64 = 60;
+const MAX_BACKOFF_SECS: u64 = 300;
 /// 单次认证/连接超时。
 const CONNECT_TIMEOUT_SECS: u64 = 20;
 
@@ -111,8 +111,15 @@ fn contains_live_event(text: &[u8]) -> bool {
 
 /// 对单个房间：拿弹幕服务器地址 → 建立 WS → 认证 → 心跳 + 读循环。
 /// 返回 `Ok` 表示连接被服务端关闭（正常），`Err` 表示网络层失败，由调用方重连。
-async fn connect_and_listen(room_id: u64, url: String, tx: &Sender<String>) -> anyhow::Result<()> {
+async fn connect_and_listen(
+    room_id: u64,
+    url: String,
+    cookie: String,
+    tx: &Sender<String>,
+) -> anyhow::Result<()> {
     // 1) 取弹幕服务器地址与 token。
+    // 带上用户已授权/浏览器导出的 B站 Cookie：匿名 getDanmuInfo 经常被
+    // 风控返回 -352（实测 24931109 匿名请求连续 -352，带 cookie 后成功）。
     let info_url = format!(
         "https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo?id={room_id}"
     );
@@ -120,7 +127,13 @@ async fn connect_and_listen(room_id: u64, url: String, tx: &Sender<String>) -> a
         .timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
         .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
         .build()?;
-    let resp = client.get(&info_url).send().await?;
+    let mut req = client.get(&info_url);
+    if !cookie.is_empty()
+        && let Ok(v) = reqwest::header::HeaderValue::from_str(&cookie)
+    {
+        req = req.header(reqwest::header::COOKIE, v);
+    }
+    let resp = req.send().await?;
     let json: serde_json::Value = resp.json().await?;
     if json.get("code").and_then(|c| c.as_i64()) != Some(0) {
         anyhow::bail!("getDanmuInfo 失败: {}", json.get("message").unwrap_or(&serde_json::Value::Null));
@@ -183,10 +196,11 @@ async fn connect_and_listen(room_id: u64, url: String, tx: &Sender<String>) -> a
 }
 
 /// 单房间监听循环：连接 → 断开 → 指数退避重连。
-async fn listen_room(room_id: u64, url: String, tx: Sender<String>) {
-    let mut backoff: u64 = 5;
+async fn listen_room(room_id: u64, url: String, cookie: String, tx: Sender<String>) {
+    // 30 秒起跳、封顶 300 秒：-352 风控状态下打太密会把出口 IP 打进风控。
+    let mut backoff: u64 = 30;
     loop {
-        match connect_and_listen(room_id, url.clone(), &tx).await {
+        match connect_and_listen(room_id, url.clone(), cookie.clone(), &tx).await {
             Ok(()) => debug!("[B站WS] {room_id} 正常断开"),
             Err(e) => warn!("[B站WS] {room_id} 监听失败: {e:#}"),
         }
@@ -200,6 +214,8 @@ async fn listen_room(room_id: u64, url: String, tx: Sender<String>) {
 /// 返回句柄，调度器停机时应 abort 掉。
 pub fn spawn_bili_ws_monitor(project_dir: std::path::PathBuf, tx: Sender<String>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // 先读 cookie 再 move project_dir 给 Watchlist，避免借用已移动的值。
+        let cookie = crate::bilibili_auth::ws_cookie_header(&project_dir);
         let watch = Watchlist::new(project_dir);
         let mut spawned = 0usize;
         for item in watch.list_live() {
@@ -208,8 +224,9 @@ pub fn spawn_bili_ws_monitor(project_dir: std::path::PathBuf, tx: Sender<String>
             }
             if let Some(room_id) = room_id_from_url(&item.url) {
                 let tx2 = tx.clone();
+                let cookie2 = cookie.clone();
                 tokio::spawn(async move {
-                    listen_room(room_id, item.url, tx2).await;
+                    listen_room(room_id, item.url, cookie2, tx2).await;
                 });
                 spawned += 1;
             }
@@ -296,7 +313,7 @@ mod tests {
         let room_id = 24931109u64; // 侯翠翠 B站直播间
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
         let mut task = tokio::spawn(async move {
-            let _ = connect_and_listen(room_id, "https://live.bilibili.com/24931109".to_string(), &tx).await;
+            let _ = connect_and_listen(room_id, "https://live.bilibili.com/24931109".to_string(), String::new(), &tx).await;
         });
         // 等待：连接建立后要么收到开播事件（rx 有值），要么连接被服务端
         // 关闭/报错（task 结束）。任一都说明“链路可通”；45 秒超时算失败。

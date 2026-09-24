@@ -260,6 +260,7 @@ let mainWindow = null
 let tray = null
 let watchdogTimer = null
 let notifyTimer = null
+let updateReqTimer = null
 let statusCache = null
 let statusCacheAt = 0
 const STATUS_CACHE_TTL_MS = 60000
@@ -446,9 +447,12 @@ async function serviceWatchdog() {
 function startBackgroundTasks() {
   if (watchdogTimer) clearInterval(watchdogTimer)
   if (notifyTimer) clearInterval(notifyTimer)
+  if (updateReqTimer) clearInterval(updateReqTimer)
   watchdogTimer = setInterval(serviceWatchdog, 60000)
   notifyTimer = setInterval(pollLocalNotifyQueue, 4000)
+  updateReqTimer = setInterval(pollUpdateRequest, 10000)
   serviceWatchdog()
+  pollUpdateRequest()
 }
 
 async function applyStartupPrefs() {
@@ -719,6 +723,23 @@ async function checkForUpdateInteractive(opts = {}) {
   app.relaunch()
   app.exit(0)
   return { ...r, applied: true }
+}
+
+// MCP 触发更新通道：轮询 <数据根>/releases/.update-request.json。
+// 智能体通过 daemon 的 apply_update 工具写这个信号文件，桌面端认领后
+// 走一次交互式检查更新（发现更高版本 → 确认框 → 替换 .app 并重启，不碰数据）。
+// 用轮询而不是 fs.watch：更新源在外置盘，kqueue 对外置卷不可靠，10s 轮询开销可忽略。
+function pollUpdateRequest() {
+  try {
+    const rd = releasesDir()
+    const reqFile = path.join(rd, '.update-request.json')
+    if (!fs.existsSync(reqFile)) return
+    let req = null
+    try { req = JSON.parse(fs.readFileSync(reqFile, 'utf8')) } catch (e) { req = { parseError: String((e && e.message) || e) } }
+    try { fs.unlinkSync(reqFile) } catch (e) { console.warn('[更新] 信号文件删除失败', e.message) }
+    console.log('[更新] 收到 MCP 更新请求', req)
+    checkForUpdateInteractive().catch((e) => console.warn('[check-update]', e.message))
+  } catch (e) { console.warn('[更新] 更新请求处理失败', e.message) }
 }
 
 /**
@@ -1036,6 +1057,7 @@ app.whenReady().then(async () => {
 app.on('will-quit', () => {
   if (watchdogTimer) clearInterval(watchdogTimer)
   if (notifyTimer) clearInterval(notifyTimer)
+  if (updateReqTimer) clearInterval(updateReqTimer)
 })
 app.on('window-all-closed', () => {
   // 主窗口只是隐藏而不是关闭；这里保持托盘进程常驻，不退出应用

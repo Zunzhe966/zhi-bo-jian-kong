@@ -28,6 +28,40 @@ pub fn cookie_header_from_project(project_dir: &Path) -> String {
     cookie_header_from_netscape(&text)
 }
 
+/// B站直播弹幕 WS 用的 Cookie 头：登录态 + 匿名设备指纹。
+///
+/// getDanmuInfo 匿名请求经常被风控返回 -352（实测 24931109 连浏览器
+/// SESSDATA 也 -352）；补齐 buvid3/buvid4/b_lsid 设备指纹后风控层才能放行。
+/// 设备指纹从 anon_cookie_path 文件读（yt-dlp 导出的可能缺 b_lsid，现生成一个）。
+pub fn ws_cookie_header(project_dir: &Path) -> String {
+    let mut parts = Vec::new();
+    let login = cookie_header_from_project(project_dir);
+    if !login.is_empty() {
+        parts.push(login);
+    }
+    let Ok(text) = std::fs::read_to_string(anon_cookie_path(project_dir)) else {
+        return parts.join("; ");
+    };
+    let mut b3 = String::new();
+    let mut b4 = String::new();
+    for line in text.lines() {
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() >= 7 && cols[5] == "buvid3" {
+            b3 = cols[6].to_string();
+        } else if cols.len() >= 7 && cols[5] == "buvid4" {
+            b4 = cols[6].to_string();
+        }
+    }
+    if !b3.is_empty() {
+        parts.push(format!("buvid3={b3}"));
+    }
+    if !b4.is_empty() {
+        parts.push(format!("buvid4={b4}"));
+    }
+    parts.push(format!("b_lsid={}", generate_b_lsid()));
+    parts.join("; ")
+}
+
 /// 同步读取桌面端导出的 Netscape Cookie 文件。
 ///
 /// `cookie_header_from_project` 为了兼容旧调用直接吞掉 IO 错误，导致“文件存在但
@@ -179,8 +213,17 @@ pub fn ensure_user_cookie_file(project_dir: &Path, cookie: &str) -> Option<PathB
 /// 失败返回 None，调用方应继续使用已有浏览器 Cookie 或直接匿名下载。
 pub async fn ensure_anon_cookie(project_dir: &Path) -> Option<PathBuf> {
     let path = anon_cookie_path(project_dir);
+    // 复用前提：文件已含 b_lsid（完整指纹）。yt-dlp 导出的旧文件只有
+    // buvid3/buvid4、缺 b_lsid，会被 B站风控层识别为指纹不完整（-352/-403）；
+    // 此时删掉重新生成，而不是一直复用残缺指纹。
     if path.exists() {
-        return Some(path);
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if text.contains("\tb_lsid\t") {
+                return Some(path);
+            }
+        }
+        tracing::warn!("B站匿名指纹文件缺 b_lsid，重新生成覆盖: {}", path.display());
+        let _ = std::fs::remove_file(&path);
     }
 
     let client = crate::net::client_builder()

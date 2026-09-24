@@ -83,10 +83,12 @@ async fn stdio_control_plane_exposes_all_tools_and_central_risk_classes() {
         .iter()
         .filter_map(|tool| tool["name"].as_str())
         .collect();
-    assert_eq!(tools.len(), 18, "源码控制面必须暴露 18 个工具（产品手册第 6 章）");
+    assert_eq!(tools.len(), 20, "源码控制面必须暴露 20 个工具（产品手册第 6 章）");
     assert!(names.contains("monitor_add"));
     assert!(names.contains("monitor_list"));
     assert!(names.contains("anchor_search"));
+    assert!(names.contains("check_update"), "新工具 check_update 必须存在");
+    assert!(names.contains("apply_update"), "新工具 apply_update 必须存在");
     assert!(!names.contains("control_list"), "旧工具 control_list 必须移除");
     assert!(!names.contains("audit_list"), "旧工具 audit_list 必须移除");
     assert!(!names.contains("live_add"), "旧工具 live_add 必须移除");

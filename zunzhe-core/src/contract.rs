@@ -46,7 +46,7 @@ macro_rules! t {
     };
 }
 
-/// MCP 全部工具（18 个，与 `control_plane_contract.rs` 锁点一致）。
+/// MCP 全部工具（20 个，与 `control_plane_contract.rs` 锁点一致）。
 pub const TOOLS: &[ToolSpec] = &[
     t!("anchor_search", "network", "按名字搜索主播，返回候选（平台/账号URL/昵称/头像），智能体拿 URL 去 monitor_add", ("name", "string", true)),
     t!("monitor_add", "config_write", "添加监控（直播/短视频按 URL 自动识别；主播主页同时挂两种）", ("url", "string", true), ("name", "string", false)),
@@ -66,6 +66,8 @@ pub const TOOLS: &[ToolSpec] = &[
     t!("service_stop", "service_lifecycle", "停止 Rust 核心 daemon"),
     t!("tail_logs", "read_only", "读取后台日志末尾", ("name", "string", false), ("lines", "number", false)),
     t!("test_email", "network", "发送测试邮件"),
+    t!("check_update", "read_only", "检查更新源（<数据根>/releases/）是否有比当前 App 更高的版本；只读，不安装"),
+    t!("apply_update", "service_lifecycle", "触发桌面端更新：有更高版本时通知 Electron 走现有更新链路（替换 .app 并重启，不碰数据目录）"),
 ];
 
 /// 从契约派生 MCP `tools/list` 的返回体（与旧手写实现逐字段一致）。
@@ -107,8 +109,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn contract_has_18_tools() {
-        assert_eq!(TOOLS.len(), 18, "MCP 工具数必须与契约锁点一致（产品手册第 6 章）");
+    fn contract_has_20_tools() {
+        assert_eq!(TOOLS.len(), 20, "MCP 工具数必须与契约锁点一致（产品手册第 6 章）");
     }
 
     #[test]
@@ -142,7 +144,7 @@ mod tests {
     #[test]
     fn contract_derives_mcp_shape() {
         let list = tools_list();
-        assert_eq!(list.len(), 18);
+        assert_eq!(list.len(), 20);
         let monitor_add = list.iter().find(|v| v["name"] == "monitor_add").unwrap();
         assert_eq!(monitor_add["inputSchema"]["required"][0], "url");
         assert_eq!(monitor_add["inputSchema"]["properties"]["name"]["type"], "string");

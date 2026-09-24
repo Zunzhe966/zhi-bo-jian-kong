@@ -1,7 +1,7 @@
 {
-  "watchdog": true,
   "autoStartServices": true,
+  "localNotify": true,
   "openAtLogin": false,
-  "wizardDone": true,
-  "localNotify": true
+  "watchdog": true,
+  "wizardDone": true
 }

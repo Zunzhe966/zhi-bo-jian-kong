@@ -515,6 +515,12 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
             let result = crate::platform::search_anchor(name, project_dir, cfg).await?;
             Ok(serde_json::to_string(&result)?)
         }
+        "check_update" => Ok(serde_json::to_string(&crate::updater::check_update(
+            project_dir,
+        ))?),
+        "apply_update" => Ok(serde_json::to_string(
+            &crate::updater::request_update(project_dir)?,
+        )?),
         _ => anyhow::bail!("工具未实现: {name}"),
     }
 }
@@ -526,7 +532,7 @@ mod tests {
     #[test]
     fn tools_list_has_unique_names_and_required_args() {
         let tools = tools_list();
-        assert_eq!(tools.len(), 18, "源码控制面必须暴露 18 个工具（产品手册第 6 章）");
+        assert_eq!(tools.len(), 20, "源码控制面必须暴露 20 个工具（产品手册第 6 章）");
         let mut names = std::collections::HashSet::new();
         for tool in &tools {
             let name = tool["name"].as_str().unwrap_or_default();
@@ -569,6 +575,8 @@ mod tests {
             "service_stop",
             "tail_logs",
             "test_email",
+            "check_update",
+            "apply_update",
         ] {
             assert!(names.contains(expected), "MCP 缺工具: {expected}");
         }

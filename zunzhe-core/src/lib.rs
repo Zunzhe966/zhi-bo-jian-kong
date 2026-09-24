@@ -26,5 +26,6 @@ pub mod status_snapshot;
 #[cfg(test)]
 pub mod test_support;
 pub mod training_data;
+pub mod updater;
 pub mod video_library;
 pub mod watchlist;

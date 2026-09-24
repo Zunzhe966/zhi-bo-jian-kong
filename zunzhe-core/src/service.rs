@@ -286,7 +286,9 @@ pub fn ensure_core(project_dir: &Path) -> Result<serde_json::Value> {
             "hints": ensure_core_hints(project_dir)
         }));
     }
-    let rust = start_rust_daemon(project_dir, 900)?;
+    // 与 CLI `run-daemon --interval` 默认一致：300 秒（B站直播另有弹幕 WS
+    // 秒级监听，轮询只做对账兜底；短视频同样 300 秒一轮）。
+    let rust = start_rust_daemon(project_dir, 300)?;
     // Rust daemon 已统一接管直播检测/录制和视频监控；不再并行启动 Python
     // video_monitor，避免同一批视频源被两套逻辑重复检查/通知/下载。
     let rust_status = rust
