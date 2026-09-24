@@ -113,6 +113,7 @@ Electron 桌面端  →  Rust daemon（zunzhe-core，主控）  →  Python 工�
 | Rust 二进制 | `<项目>/zunzhe-core/target/release/zunzhe-core` |
 | MCP 工具数 | **18 个**（2026-09-23 实测新 release 二进制 `tools/list`；`.神经总账/控制面.json` 是**快照，会过期**） |
 | MCP 控制面快照 | `.神经总账/控制面.json`（**不是** `.神经/控制面.json`，后者是旧残留） |
+| **B站直播监听** | **弹幕 WS 实时监听（录播姬同款，2026-09-24 起）**：getDanmuInfo → WSS → 30s 心跳 → `LIVE` 事件 → 提前唤醒 live tick；检测/录制/通知/防重复用 LiveMonitor 状态机，**300 秒轮询降为对账兜底**；掉线自动退避重连 |
 | **守护职责** | **桌面端 watchdog**（GUI 会话进程）。launchd 域（gui/501）进程**无法访问外置盘** `/Volumes/A区`（2026-09-23 实测 `launchctl submit` 跑 `ls /Volumes/A区/...` = `Operation not permitted`）→ **launchd 无法托管本 daemon**；`scripts/launchd/*` 与磁盘 plist 仅备用 |
 | **日志目录** | `~/Library/Logs/zunzhe`（config.ini `[路径设置] 日志目录` 显式配置，2026-09-23 起） |
 | **打包真身（改 main 层必须改这里）** | `desktop/electron/main.cjs`（package.json `main: electron/main.cjs`、build.files `electron/**`；含 runtimeDir/数据目录指针/托盘菜单/ipcMain.handle 全量）。**`desktop/main.cjs` 是死文件，改它不进包**——1.5.3/1.5.4 曾把修复改在死文件上导致未生效，2026-09-24 已全部移植回真身 |
@@ -132,7 +133,7 @@ Electron 桌面端  →  Rust daemon（zunzhe-core，主控）  →  Python 工�
 cd /Volumes/A区/尊者监控直播短视频
 BIN=zunzhe-core/target/release/zunzhe-core
 
-pgrep -fl "run-daemon"   # daemon 状态
+pgrep -fl "run-daemon"   # daemon 状态（run-daemon --interval 默认 300 秒）
 $BIN doctor              # 环境诊断
 $BIN status              # 状态快照
 $BIN notes               # 列出复盘产物（含绝对路径）
