@@ -115,6 +115,9 @@ Electron 桌面端  →  Rust daemon（zunzhe-core，主控）  →  Python 工�
 | MCP 控制面快照 | `.神经总账/控制面.json`（**不是** `.神经/控制面.json`，后者是旧残留） |
 | **守护职责** | **桌面端 watchdog**（GUI 会话进程）。launchd 域（gui/501）进程**无法访问外置盘** `/Volumes/A区`（2026-09-23 实测 `launchctl submit` 跑 `ls /Volumes/A区/...` = `Operation not permitted`）→ **launchd 无法托管本 daemon**；`scripts/launchd/*` 与磁盘 plist 仅备用 |
 | **日志目录** | `~/Library/Logs/zunzhe`（config.ini `[路径设置] 日志目录` 显式配置，2026-09-23 起） |
+| **打包真身（改 main 层必须改这里）** | `desktop/electron/main.cjs`（package.json `main: electron/main.cjs`、build.files `electron/**`；含 runtimeDir/数据目录指针/托盘菜单/ipcMain.handle 全量）。**`desktop/main.cjs` 是死文件，改它不进包**——1.5.3/1.5.4 曾把修复改在死文件上导致未生效，2026-09-24 已全部移植回真身 |
+| **数据目录指针** | `~/Library/Application Support/尊者直播监控/数据目录.txt`（第一行为数据根路径；曾误指向 userData 导致数据根分裂、watchdog 拉不起 daemon，2026-09-24 已修正为 `/Volumes/A区/尊者监控直播短视频`；有 `ZUNZHE_PROJECT_DIR` 环境变量覆盖） |
+| **更新机制** | App 内「检查更新」= 本地更新源 `releases/尊者直播监控-<version>.zip`（electron 层 `update-run.cjs`，31 项单测）；发布走 `publish-release.sh --build`，用户程序内一键更新，无需手动装 |
 
 > ⚠️ **`.神经总账/控制面.json` 是静态快照，会与真实工具集不一致**（曾出现快照 41 / 实测 43）。
 > **要准确数字，永远实测 `tools/list`，不要读这个 json。**
