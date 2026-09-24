@@ -19,82 +19,23 @@ import {
   processTaskForFile, processTaskLabel, stashFieldDefault, downloadQueueFeedback,
 } from './stash'
 import LogsPanel from './LogsPanel'
+import DetailModal from './DetailModal'
+import AddModals from './AddModals'
+import ItemSettingsModal from './ItemSettingsModal'
+import SettingsModal from './SettingsModal'
+import HistoryModals from './HistoryModals'
+import NotifyModal from './NotifyModal'
+import {
+  qualityOptions, notifyOptions, platformOptions, statusText,
+} from './ui-constants'
+import {
+  platformLabels, platformColors, detectPlatform, platformLabel, normalizeUrl, buildRows,
+} from './platform-utils'
 import SetupWizard from './Wizard'
-
-const qualityOptions = [
-  { label: '原画', value: '原画' },
-  { label: '蓝光', value: '蓝光' },
-  { label: '超清', value: '超清' },
-  { label: '高清', value: '高清' },
-  { label: '标清', value: '标清' },
-  { label: '流畅', value: '流畅' },
-]
-
-const notifyOptions = [
-  { label: '跟随全局', value: '跟随全局' },
-  { label: '微信（Server酱，省额度给重要的）', value: '微信' },
-  { label: '邮箱', value: '邮箱' },
-  { label: '不通知', value: '不通知' },
-]
-
-const platformOptions = [
-  { label: '自动识别（推荐）', value: 'Auto' },
-  { label: '抖音', value: 'DouYin' },
-  { label: '快手', value: 'KuaiShou' },
-  { label: 'B站', value: 'Bilibili' },
-  { label: '其他（直接粘贴完整链接）', value: 'Other' },
-]
-
-const platformLabels = {
-  Auto: '自动',
-  DouYin: '抖音',
-  KuaiShou: '快手',
-  Bilibili: 'B站',
-  Huya: '虎牙',
-  Douyu: '斗鱼',
-  Xiaohongshu: '小红书',
-  TikTok: 'TikTok',
-  Youtube: 'YouTube',
-  Twitch: 'Twitch',
-  Other: '其他',
-}
-
-const platformColors = {
-  DouYin: '#111',
-  KuaiShou: '#ff4906',
-  Bilibili: '#fb7299',
-  Huya: '#ffba00',
-  Douyu: '#ff5d23',
-  Xiaohongshu: '#fe2c55',
-  TikTok: '#010101',
-  Youtube: '#ff0000',
-  Twitch: '#9146ff',
-  Other: '#1677ff',
-}
-
-const statusText = {
-  recording: '录制中',
-  monitoring: '监控中，等待开播',
-  noting: '未开始监控',
-}
 
 // 构建时间与版本号由 vite 注入，用来确认界面是否已更新
 const BUILD_LABEL = typeof __APP_BUILD__ !== 'undefined' ? __APP_BUILD__ : '开发版'
 const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : 'dev'
-
-function detectPlatform(url = '') {
-  const u = url.toLowerCase()
-  if (u.includes('douyin')) return 'DouYin'
-  if (u.includes('kuaishou')) return 'KuaiShou'
-  if (u.includes('bilibili') || u.includes('live.bilibili')) return 'Bilibili'
-  if (u.includes('huya.com')) return 'Huya'
-  if (u.includes('douyu.com')) return 'Douyu'
-  if (u.includes('xiaohongshu') || u.includes('xhslink')) return 'Xiaohongshu'
-  if (u.includes('tiktok')) return 'TikTok'
-  if (u.includes('youtube.com') || u.includes('youtu.be')) return 'Youtube'
-  if (u.includes('twitch.tv') || u.includes('twitch')) return 'Twitch'
-  return 'Other'
-}
 
 function platformIcon(id) {
   if (id === 'DouYin') return <img className="platform-icon" src={douyinIcon} alt="抖音" />
@@ -106,47 +47,6 @@ function platformIcon(id) {
       <VideoCameraFilled style={{ fontSize: 22, color }} />
     </Tooltip>
   )
-}
-
-/** 平台的中文名，用于卡片上直接写清「这是哪个网站」。 */
-function platformLabel(id) {
-  return platformLabels[id] || '其他'
-}
-
-function normalizeUrl(input, platform) {
-  let url = String(input || '').trim()
-  if (!url) return ''
-  if (url.startsWith('http')) return url
-  const p = platform === 'Auto' ? detectPlatform(url) : platform
-  if (p === 'DouYin') return `https://live.douyin.com/${url}`
-  if (p === 'KuaiShou') return `https://live.kuaishou.com/u/${url}`
-  if (p === 'Bilibili') return `https://live.bilibili.com/${url}`
-  if (p === 'Huya') return `https://www.huya.com/${url}`
-  if (p === 'Douyu') return `https://www.douyu.com/${url}`
-  return url
-}
-
-function buildRows(status) {
-  const activeFiles = (status.recent_recordings || [])
-    .filter((r) => r.probably_recording)
-    .map((r) => r.file.toLowerCase())
-  const recordingUrls = new Set(
-    (status.recording_sessions || []).map((s) => String(s.url || '').toLowerCase())
-  )
-  return (status.live_watchlist || []).map((room, idx) => {
-    const platform = detectPlatform(room.url)
-    const remark = (room.remark || '').replace(/^主播:\s*/, '')
-    const roomUrl = room.url.toLowerCase()
-    const isRecording = room.enabled && (
-      recordingUrls.has(roomUrl) ||
-      (remark && activeFiles.some((f) => f.includes(remark.toLowerCase())))
-    )
-    let state = 'noting'
-    if (!room.enabled) state = 'noting'
-    else if (isRecording) state = 'recording'
-    else if (status.services?.live_monitor?.running) state = 'monitoring'
-    return { key: room.url, index: idx + 1, platform, remark: room.remark || room.url, url: room.url, enabled: room.enabled, quality: room.quality, notify: room.notify || '跟随全局', state }
-  })
 }
 
 export default function App() {
@@ -1087,488 +987,100 @@ export default function App() {
 
       <SetupWizard open={wizardOpen} onDone={() => setWizardOpen(false)} />
 
-      <Modal title="添加直播监控" open={addOpen} onOk={onAddLive} onCancel={() => setAddOpen(false)} okText="确认并添加" width={700} destroyOnClose>
-        <Form form={addForm} layout="horizontal" labelCol={{ span: 6 }} wrapperCol={{ span: 16 }} initialValues={{ providerId: 'Auto', quality: '原画', notify: '跟随全局' }}>
-          <Form.Item label="平台" name="providerId" rules={[{ required: true }]}>
-            <Select options={platformOptions} />
-          </Form.Item>
-          <Form.Item label="链接/频道ID" name="channelId" rules={[{ required: true, message: '请输入' }]}
-            extra="底层支持 40+ 平台，直接粘贴直播间链接；智能体请通过 MCP/CLI 连接，不必在此配置大模型">
-            <Input placeholder="例如 https://live.bilibili.com/21686237" />
-          </Form.Item>
-          <Form.Item label="主播名/备注" name="remarks" rules={[{ required: true, message: '请输入' }]}>
-            <Input placeholder="方便识别的名字" />
-          </Form.Item>
-          <Form.Item label="录制画质" name="quality">
-            <Select options={qualityOptions} />
-          </Form.Item>
-          <Form.Item label="通知方式" name="notify"
-            extra="重要的选「微信」；不重要的选「邮箱」或「不通知」，省 Server酱 每天 5 条额度">
-            <Select options={notifyOptions} />
-          </Form.Item>
-        </Form>
-      </Modal>
+      <AddModals
+        addOpen={addOpen}
+        addForm={addForm}
+        onAddLive={onAddLive}
+        videoOpen={videoOpen}
+        videoForm={videoForm}
+        onAddVideo={onAddVideo}
+        onCloseAdd={() => setAddOpen(false)}
+        onCloseVideo={() => setVideoOpen(false)}
+      />
 
-      <Modal title="添加发布视频监控" open={videoOpen} onOk={onAddVideo} onCancel={() => setVideoOpen(false)} okText="确认并添加" width={700} destroyOnClose>
-        <Form form={videoForm} layout="horizontal" labelCol={{ span: 6 }} wrapperCol={{ span: 16 }} initialValues={{ autoDownload: true, notify: '跟随全局' }}>
-          <Form.Item label="博主名称" name="name" rules={[{ required: true }]}>
-            <Input placeholder="例如 影视飓风" />
-          </Form.Item>
-          <Form.Item label="监控地址" name="url" rules={[{ required: true }]}
-            extra="B站填 space.bilibili.com/数字；抖音/快手可用 RSSHub 订阅地址">
-            <Input placeholder="https://space.bilibili.com/946974" />
-          </Form.Item>
-          <Form.Item label="自动下载新视频" name="autoDownload" valuePropName="checked"
-            extra="开：发现新视频立即下载；关：只通知不下载">
-            <Switch />
-          </Form.Item>
-          <Form.Item label="通知方式" name="notify"
-            extra="重要的选「微信」；一般博主选「邮箱」或「不通知」">
-            <Select options={notifyOptions} />
-          </Form.Item>
-        </Form>
-      </Modal>
-
-      <Modal
-        title={itemSettingsType === 'live'
-          ? `主播设置 — ${(itemSettingsRow?.remark || '').replace(/^主播:\s*/, '') || ''}`
-          : `博主设置 — ${itemSettingsRow?.name || ''}`}
+      <ItemSettingsModal
+        type={itemSettingsType}
+        row={itemSettingsRow}
         open={itemSettingsOpen}
+        form={itemSettingsForm}
+        paths={paths}
+        stashPath={stashOf(itemSettingsRow, itemSettingsType)}
         onCancel={() => setItemSettingsOpen(false)}
-        onOk={saveItemSettings}
-        okText="保存设置"
-        cancelText="取消"
-        width={560}
-        destroyOnClose
-      >
-        <Form form={itemSettingsForm} layout="vertical">
-          {itemSettingsType === 'live' ? (
-            <>
-              <Form.Item label="主播名称" name="name" rules={[{ required: true, message: '请输入名称' }]}>
-                <Input placeholder="例如 影视飓风" />
-              </Form.Item>
-              <Form.Item label="直播间地址" name="url">
-                <Input readOnly />
-              </Form.Item>
-              <Form.Item label="开启监控" name="enabled" valuePropName="checked"
-                extra="关闭后不再检测开播，但保留在列表中（也可下方直接删除）">
-                <Switch />
-              </Form.Item>
-              <Form.Item label="录制画质" name="quality">
-                <Select options={qualityOptions} />
-              </Form.Item>
-              <Form.Item label="通知方式" name="notify"
-                extra="重要的选「微信」（占 Server酱 每天约 5 条）；一般选「不通知」">
-                <Select options={notifyOptions} />
-              </Form.Item>
-              <Button icon={<ReloadOutlined />} onClick={() => itemSettingsRow && refreshLive(itemSettingsRow)}>
-                立即刷新检测
-              </Button>
-            </>
-          ) : (
-            <>
-              <Form.Item label="博主名称" name="name" rules={[{ required: true, message: '请输入名称' }]}>
-                <Input placeholder="例如 影视飓风" />
-              </Form.Item>
-              <Form.Item label="监控地址" name="url">
-                <Input readOnly />
-              </Form.Item>
-              <Form.Item label="发现新视频自动下载" name="autoDownload" valuePropName="checked"
-                extra={`开：自动下载到 ${paths.video_root || paths.media_root || "<产物根目录>"}/${itemSettingsRow?.name || "博主名"}/短视频/ 并转写；关：只通知`}>
-                <Switch />
-              </Form.Item>
-              <Form.Item label="通知方式" name="notify">
-                <Select options={notifyOptions} />
-              </Form.Item>
-              <Button type="link" onClick={() => { setItemSettingsOpen(false); openHistory(itemSettingsRow) }}>
-                查看历史视频 / 批量下载
-              </Button>
-            </>
-          )}
-        </Form>
-        {/* 「东西存哪儿了」——用户要求直接写在设置里，点了就能去。
-            这里显示的是按 Rust 落盘规则算出来的真实路径，不是占位文案。 */}
-        <div className="stash-box">
-          <div className="stash-box-title">
-            {itemSettingsType === 'live' ? '录像存到这里' : '视频与文字稿存到这里'}
-          </div>
-          <div className="stash-box-path"
-            title="点击打开这个文件夹"
-            onClick={() => itemSettingsRow && openItemStash(itemSettingsRow, itemSettingsType)}>
-            {stashOf(itemSettingsRow, itemSettingsType) || '（还没解析出存放位置，请先在全局设置里确认产物根目录）'}
-          </div>
-          <Space size={8} wrap>
-            <Button size="small" icon={<FolderOpenFilled />}
-              onClick={() => itemSettingsRow && openItemStash(itemSettingsRow, itemSettingsType)}>
-              打开这个文件夹
-            </Button>
-            <Button size="small"
-              onClick={() => { setItemSettingsOpen(false); openItemDetail(itemSettingsRow, itemSettingsType) }}>
-              看里面有什么
-            </Button>
-          </Space>
-          <div className="stash-box-hint">
-            {itemSettingsType === 'live'
-              ? '按主播名分开存放：主播名 / 直播 /'
-              : '按博主名分开存放：博主名 / 短视频 /'}
-          </div>
-        </div>
-        <div style={{ marginTop: 24, paddingTop: 16, borderTop: '1px solid #f0f0f0' }}>
-          <Popconfirm
-            title={itemSettingsType === 'live' ? '确定删除该主播？将从列表移除，不再监控' : '确定删除该博主？不再关注'}
-            onConfirm={deleteFromSettings}
-          >
-            <Button danger icon={<DeleteFilled />}>删除，不再关注</Button>
-          </Popconfirm>
-        </div>
-      </Modal>
+        onSave={saveItemSettings}
+        onRefresh={refreshLive}
+        onOpenHistory={openHistory}
+        onOpenStash={openItemStash}
+        onOpenDetail={openItemDetail}
+        onDelete={deleteFromSettings}
+      />
 
-      {/* 点一个主播/博主 → 进来看他的东西。
-          地址、存放位置、文件清单，每一项都是真能点的：地址开浏览器，
-          文件夹进访达，文件用系统默认程序打开。不留「假的碰都碰不了」的展示位。 */}
-      <Modal
-        title={detailType === 'live'
-          ? `主播内容 — ${rowDisplayName(detailRow, 'live') || (detailRow && detailRow.url) || ''}`
-          : `博主内容 — ${(detailRow && detailRow.name) || ''}`}
+      <DetailModal
         open={detailOpen}
-        onCancel={() => setDetailOpen(false)}
-        footer={null}
-        width={720}
-        destroyOnClose
-      >
-        <div className="detail-block">
-          <div className="detail-label">监控地址</div>
-          <a className="detail-link" onClick={() => detailRow && window.desktop.openExternal(detailRow.url)}>
-            {detailRow && detailRow.url}
-          </a>
-          <div className="detail-hint">点击用浏览器打开</div>
-        </div>
+        row={detailRow}
+        type={detailType}
+        rowName={rowDisplayName(detailRow, detailType)}
+        stashPath={stashOf(detailRow, detailType)}
+        path={detailPath}
+        files={detailFiles}
+        loading={detailLoading}
+        queueing={detailQueueing}
+        error={detailError}
+        tasks={status?.process_tasks}
+        onClose={() => setDetailOpen(false)}
+        onRefresh={loadDetailFiles}
+        onQueue={queueTranscription}
+        onOpenStash={openItemStash}
+        onReveal={(p) => window.desktop.showItem(p)}
+        onOpenExternal={(url) => window.desktop.openExternal(url)}
+      />
 
-        <div className="detail-block">
-          <div className="detail-label">存放位置</div>
-          <a className="detail-link" onClick={() => detailRow && openItemStash(detailRow, detailType)}>
-            {detailPath || stashOf(detailRow, detailType) || '（未解析）'}
-          </a>
-          <Space size={8} style={{ marginTop: 6 }} wrap>
-            <Button size="small" icon={<FolderOpenFilled />}
-              onClick={() => detailRow && openItemStash(detailRow, detailType)}>打开文件夹</Button>
-            <Button size="small"
-              onClick={() => { const p = detailPath || stashOf(detailRow, detailType); if (p) window.desktop.showItem(p) }}>
-              在访达中定位
-            </Button>
-          </Space>
-        </div>
-
-        <div className="detail-block">
-          <div className="detail-label">文字稿与复盘</div>
-          <a className="detail-link" onClick={() => detailRow && openItemStash(detailRow, detailType)}>
-            {stashOf(detailRow, detailType) || '（未解析）'}
-          </a>
-          <div className="detail-hint">转写文字稿落在该主播自己的文件夹里（与视频同目录），不是全局目录</div>
-          <Space size={8} style={{ marginTop: 6 }} wrap>
-            <Button size="small" icon={<FolderOpenFilled />}
-              onClick={() => detailRow && openItemStash(detailRow, detailType)}>打开文字稿文件夹</Button>
-          </Space>
-        </div>
-
-        <div className="detail-block">
-          <div className="detail-label">
-            里面的文件
-            <Tag style={{ marginLeft: 8 }}>{detailFiles.length}</Tag>
-            <Button size="small" type="link" loading={detailLoading}
-              onClick={() => detailRow && loadDetailFiles(detailRow, detailType)}>刷新</Button>
-          </div>
-          {detailLoading && !detailFiles.length ? (
-            <div className="detail-empty">正在读取…</div>
-          ) : detailFiles.length ? (
-            <div className="file-list">
-              {detailFiles.map((f) => {
-                const task = processTaskForFile(status?.process_tasks, f.path)
-                const taskLabel = processTaskLabel(task)
-                const taskAction = processTaskAction(task)
-                return (
-                  <div className="file-row" key={f.path || f.name}>
-                    <span className="file-icon">
-                      {f.dir ? <FolderFilled style={{ color: '#fbbf24' }} /> : <VideoCameraFilled style={{ color: '#818cf8' }} />}
-                    </span>
-                    <span className="file-name" title="点击用默认程序打开"
-                      onClick={() => window.desktop.openPath(f.path)}>{f.name}</span>
-                    <span className="file-size">{f.dir ? '文件夹' : humanSize(f.size)}</span>
-                    <span className="file-time">{stamp(f.mtime)}</span>
-                    {!f.dir && taskLabel && (
-                      <Tooltip title={task?.last_error || ''}>
-                        <Tag color={task?.status === 'failed' ? 'error' : task?.status === 'done' ? 'success' : 'processing'}>
-                          {taskLabel}
-                        </Tag>
-                      </Tooltip>
-                    )}
-                    {!f.dir && isTranscribableMedia(f.name) && (
-                      <Button size="small" type="primary" ghost
-                        loading={detailQueueing === f.path}
-                        disabled={taskAction.disabled}
-                        onClick={() => queueTranscription(f)}>{taskAction.label}</Button>
-                    )}
-                    <Button size="small" type="link"
-                      onClick={() => window.desktop.showItem(f.path)}>在访达中显示</Button>
-                  </div>
-                )
-              })}
-            </div>
-          ) : (
-            <div className="detail-empty">
-              {detailError
-                ? `读不到目录：${detailError}`
-                : (detailType === 'live'
-                  ? '这个主播还没有录像文件。开播并录过一次之后，文件会出现在上面这个文件夹里。'
-                  : '还没有下载过视频。打开「发现新视频自动下载」后，下载的文件会出现在上面这个文件夹里。')}
-            </div>
-          )}
-        </div>
-      </Modal>
-
-      <Modal
-        title="全局设置"
+      <SettingsModal
+        form={emailForm}
         open={settingsOpen}
-        onCancel={() => setSettingsOpen(false)}
-        width={680}
-        styles={{ body: { maxHeight: '70vh', overflow: 'auto' } }}
-        footer={[
-          <Button key="test" icon={<MailOutlined />} onClick={testEmail}>测试通知</Button>,
-          <Button key="save" type="primary" loading={emailSaving} onClick={saveEmailSettings}>保存配置</Button>,
-          <Button key="close" onClick={() => setSettingsOpen(false)}>关闭</Button>,
-        ]}
-      >
-  <Form form={emailForm} layout="vertical" initialValues={{ smtpHost: 'smtp.qq.com', smtpPort: '465', senderName: '尊者监控直播', transcribeEnabled: true, pipelineTimeout: '21600', llmEnabled: true, watchdog: true, autoStartServices: true, localNotify: true, mediaRoot: '', downloadDir: '', fupanDir: '', logsDir: '', databaseFile: '' }}>
-          <div style={{ fontWeight: 600, margin: '4px 0 8px' }}>应用行为</div>
-          <Form.Item label="打开软件时自动启动监控" name="autoStartServices" valuePropName="checked">
-            <Switch />
-          </Form.Item>
-          <Form.Item label="服务崩溃自动重启（守护）" name="watchdog" valuePropName="checked">
-            <Switch />
-          </Form.Item>
-          <Form.Item label="开机自动启动（登录后托盘运行）" name="openAtLogin" valuePropName="checked">
-            <Switch />
-          </Form.Item>
-          <Form.Item label="Windows 桌面通知（远程推送失败时的兜底）" name="localNotify" valuePropName="checked">
-            <Switch />
-          </Form.Item>
+        saving={emailSaving}
+        emailConfigured={emailConfigured}
+        emailStatusText={emailStatusText}
+        paths={status?.paths}
+        onTest={testEmail}
+        onSave={saveEmailSettings}
+        onClose={() => setSettingsOpen(false)}
+        onPickStash={pickStashDir}
+        onPickDatabase={pickDatabaseFile}
+        onSetupQq={setupQqMail}
+        onBiliLogin={biliLogin}
+        onDouyinLogin={douyinLogin}
+      />
 
-          <div style={{ fontWeight: 600, margin: '16px 0 8px' }}>存放位置</div>
-          <div style={{ marginBottom: 10, padding: '8px 12px', borderRadius: 6, background: '#f6ffed', border: '1px solid #b7eb8f', fontSize: 13 }}>
-            产物（直播录像、下载的短视频、转写文本、切片）和程序是分开的，默认不放在程序目录里。
-          </div>
-          <Form.Item label="产物根目录" name="mediaRoot"
-            extra={<span>留空 = 默认位置 <code>~/Documents/尊者产物</code>。录像、下载、转写全部落在它下面。</span>}>
-            <Input placeholder="留空用默认位置"
-              addonAfter={<a onClick={() => pickStashDir('mediaRoot')} style={{ cursor: 'pointer' }}>选择…</a>} />
-          </Form.Item>
-          <Form.Item label="短视频下载目录" name="downloadDir"
-            extra="留空 = <产物根目录>（新下载落在 <该目录>/博主名/短视频/）">
-            <Input placeholder="留空自动跟随产物根目录"
-              addonAfter={<a onClick={() => pickStashDir('downloadDir')} style={{ cursor: 'pointer' }}>选择…</a>} />
-          </Form.Item>
-          <Form.Item label="复盘输出目录" name="fupanDir"
-            extra="留空 = <产物根目录>/fupan_output（转写、知识点、切片、封面都在这下面）">
-            <Input placeholder="留空自动跟随产物根目录"
-              addonAfter={<a onClick={() => pickStashDir('fupanDir')} style={{ cursor: 'pointer' }}>选择…</a>} />
-          </Form.Item>
-          <Form.Item label="日志目录" name="logsDir"
-            extra="留空 = <产物根目录>/logs。运行日志和心跳记录可单独换到别的盘。">
-            <Input placeholder="留空使用 <产物根目录>/logs"
-              addonAfter={<a onClick={() => pickStashDir('logsDir')} style={{ cursor: 'pointer' }}>选择…</a>} />
-          </Form.Item>
-          <Form.Item label="数据库文件" name="databaseFile"
-            extra="留空 = <产物根目录>/database/zunzhe-core.db；已有旧库会继续沿用，不会自动覆盖或搬动数据。修改后需重启后台服务才生效。">
-            <Input placeholder="留空使用 <产物根目录>/database/zunzhe-core.db"
-              addonAfter={<a onClick={pickDatabaseFile} style={{ cursor: 'pointer' }}>选择…</a>} />
-          </Form.Item>
-          <div style={{ marginBottom: 4 }}>
-            <Button size="small" icon={<FolderOpenFilled />}
-              onClick={() => window.desktop.openPath(status?.paths?.media_root || '')}>打开产物目录</Button>
-            <Button size="small" icon={<FolderOpenFilled />} style={{ marginLeft: 8 }}
-              onClick={() => window.desktop.openPath(status?.paths?.logs || '')}>打开日志目录</Button>
-            <Button size="small" icon={<FolderOpenFilled />} style={{ marginLeft: 8 }}
-              onClick={() => window.desktop.openPath(status?.paths?.database || '')}>打开数据库位置</Button>
-            <span style={{ marginLeft: 10, color: '#888', fontSize: 12 }}>
-              当前：{status?.paths?.media_root || '-'} · 数据库：{status?.paths?.database || '-'}
-            </span>
-          </div>
-
-          <div style={{ fontWeight: 600, margin: '16px 0 8px' }}>抗代理推送（推荐）</div>
-          <Form.Item label="Server酱 SendKey" name="serverChanKey"
-            extra={<span>在 <a onClick={() => window.desktop.openExternal('https://sct.ftqq.com/')}>sct.ftqq.com</a> 微信登录后复制 SendKey。已配置可留空。</span>}>
-            <Input.Password placeholder="SCTxxxxxxxx..." />
-          </Form.Item>
-          <Form.Item label="PushPlus Token" name="pushplusToken">
-            <Input.Password placeholder="留空则不启用" />
-          </Form.Item>
-
-          <div style={{ fontWeight: 600, margin: '16px 0 8px' }}>邮箱推送</div>
-          <div style={{ marginBottom: 8, padding: '8px 12px', borderRadius: 6, background: emailConfigured ? '#f6ffed' : '#fff7e6', border: `1px solid ${emailConfigured ? '#b7eb8f' : '#ffd591'}` }}>
-            {emailConfigured ? '✅ 邮箱已配置' : `⚠️ ${emailStatusText || '邮箱未配置'}`}
-            <Button size="small" style={{ marginLeft: 12 }} onClick={setupQqMail}>QQ 邮箱一键填入</Button>
-          </div>
-          <Form.Item label="SMTP 服务器" name="smtpHost"><Input placeholder="smtp.qq.com" /></Form.Item>
-          <Form.Item label="SMTP 端口" name="smtpPort"><Input placeholder="465" /></Form.Item>
-          <Form.Item label="发件邮箱" name="loginEmail"><Input placeholder="xxx@qq.com" /></Form.Item>
-          <Form.Item label="SMTP 授权码" name="authCode" extra={
-            <span>QQ 邮箱获取：登录 <a onClick={() => window.desktop.openExternal('https://mail.qq.com/')}>mail.qq.com</a> → 设置 → 账户 → 开启「SMTP 服务」→ 按提示生成授权码（不是 QQ 密码）。已配置过可留空。</span>
-          }>
-            <Input.Password placeholder="16 位授权码，如 abcdefghijklmnop" />
-          </Form.Item>
-          <Form.Item label="发件人显示名" name="senderName"><Input /></Form.Item>
-          <Form.Item label="收件邮箱" name="toEmail"><Input /></Form.Item>
-
-          <div style={{ fontWeight: 600, margin: '16px 0 8px' }}>转写（本地 whisper，不接任何大模型 API）</div>
-          <Form.Item label="录制/下载完成后自动转写" name="transcribeEnabled" valuePropName="checked">
-            <Switch />
-          </Form.Item>
-          <Form.Item label="Whisper 模型" name="whisperModel">
-            <Select options={[
-              { label: 'tiny（最快）', value: 'tiny' },
-              { label: 'base（推荐）', value: 'base' },
-              { label: 'small', value: 'small' },
-              { label: 'medium', value: 'medium' },
-            ]} />
-          </Form.Item>
-          <Form.Item label="长视频转写超时（秒）" name="pipelineTimeout"
-            extra="默认 21600（6 小时）。纯 CPU 转写长视频会接近 1 小时，建议保留充足余量。">
-            <Input placeholder="21600" />
-          </Form.Item>
-        </Form>
-
-        <div style={{ fontWeight: 600, margin: '8px 0' }}>B站授权</div>
-        <Button onClick={biliLogin}>打开 B站 登录 / 授权</Button>
-
-        <div style={{ fontWeight: 600, margin: '16px 0 8px' }}>抖音授权</div>
-        <Button onClick={douyinLogin}>打开抖音 扫码登录（短视频监控用）</Button>
-        <div style={{ fontSize: 12, color: '#999', marginTop: 4 }}>登录后自动保存，用于监控/下载抖音短视频；约一个月后需重新扫码</div>
-      </Modal>
-
-      <Modal title="批量下载视频" open={batchOpen} onOk={onBatchBrowse} onCancel={() => setBatchOpen(false)} okText="列出历史视频" width={640} destroyOnClose>
-        <p style={{ marginBottom: 12, color: '#666' }}>
-          输入博主主页地址，列出其历史视频后勾选批量下载（无需先加入监控）。
-        </p>
-        <Form form={batchForm} layout="vertical">
-          <Form.Item label="博主名称" name="name">
-            <Input placeholder="用于文件夹命名，如 影视飓风" />
-          </Form.Item>
-          <Form.Item label="博主主页地址" name="url" rules={[{ required: true }]}
-            extra="B站填 space.bilibili.com/数字；其他平台填 RSS 订阅地址">
-            <Input placeholder="https://space.bilibili.com/946974" />
-          </Form.Item>
-        </Form>
-      </Modal>
-
-      <Modal
-        title={`历史视频 - ${historyBlogger?.name || ''}`}
+      <HistoryModals
+        batchOpen={batchOpen}
+        batchForm={batchForm}
+        onBatchBrowse={onBatchBrowse}
+        onCloseBatch={() => setBatchOpen(false)}
+        blogger={historyBlogger}
         open={historyOpen}
-        onCancel={() => setHistoryOpen(false)}
-        width={860}
-        footer={[
-          <span key="tip" style={{ float: 'left', color: '#999', fontSize: 12, lineHeight: '32px' }}>
-            已选 {historySelected.length} / {historyVideos.length}
-          </span>,
-          <Button key="close" onClick={() => setHistoryOpen(false)}>关闭</Button>,
-          <Button key="all" loading={historyDownloading} disabled={!historyVideos.some((v) => !v.downloaded)} onClick={downloadAll}>
-            下载全部（未下载）
-          </Button>,
-          <Button key="dl" type="primary" loading={historyDownloading} disabled={!historySelected.length} onClick={downloadSelected}>
-            下载选中（{historySelected.length}）
-          </Button>,
-        ]}
-      >
-        <p style={{ marginBottom: 12, color: '#666' }}>
-          勾选想要的视频，点「下载选中」批量保存到 <b>{paths.video_root || paths.media_root || "产物根目录"}/{historyBlogger?.name || "博主名"}/短视频/</b> 并自动转写复盘。
-        </p>
-        <Table
-          rowKey="key"
-          loading={historyLoading}
-          dataSource={historyVideos}
-          pagination={false}
-          size="small"
-          scroll={{ y: 460 }}
-          rowSelection={{
-            selectedRowKeys: historySelected,
-            onChange: (keys) => setHistorySelected(keys),
-            getCheckboxProps: (r) => ({ disabled: !!r.downloaded }),
-          }}
-          columns={[
-            { title: '封面', dataIndex: 'cover_cache', width: 100, align: 'center',
-              render: (c, r) => (r.cover_url
-                ? <img src={r.cover_url} alt="" style={{ width: 96, height: 54, objectFit: 'cover', borderRadius: 4 }} />
-                : <a onClick={() => r.cover && window.desktop.openExternal(r.cover)} style={{ color: '#999' }}>无缓存</a>) },
-            { title: '标题', dataIndex: 'title', ellipsis: true,
-              render: (t, r) => (
-                <span>
-                  <a onClick={() => window.desktop.openExternal(r.url)}>{t}</a>
-                  {r.downloaded ? <span style={{ marginLeft: 8, color: '#52c41a', fontSize: 12 }}>✓ 已下载</span> : null}
-                </span>
-              ) },
-            { title: '发布日期', dataIndex: 'date', width: 150, align: 'center' },
-            { title: '时长', dataIndex: 'duration', width: 80, align: 'center',
-              render: (d) => (d ? `${Math.floor(d / 60)}:${String(d % 60).padStart(2, '0')}` : '-') },
-          ]}
-        />
-      </Modal>
+        videos={historyVideos}
+        selected={historySelected}
+        loading={historyLoading}
+        downloading={historyDownloading}
+        paths={paths}
+        onClose={() => setHistoryOpen(false)}
+        onDownloadAll={downloadAll}
+        onDownloadSelected={downloadSelected}
+        onSelect={(keys) => setHistorySelected(keys)}
+      />
 
-      <Modal
-        title="通知治理"
+      <NotifyModal
         open={notifyOpen}
-        onCancel={() => setNotifyOpen(false)}
-        width={880}
-        footer={[
-          <Button key="close" onClick={() => setNotifyOpen(false)}>关闭</Button>,
-          <Popconfirm key="prune-sent" title="清理所有已发送通知记录？只影响历史列表，不影响已送达" onConfirm={pruneSentNotify}>
-            <Button icon={<ClearOutlined />} loading={notifyBusy}>清理已发送</Button>
-          </Popconfirm>,
-          <Popconfirm key="prune-failed" title="清理所有失败通知记录？将不再保留这些失败提醒" onConfirm={pruneFailedNotify}>
-            <Button danger icon={<DeleteFilled />} loading={notifyBusy}>清理失败记录</Button>
-          </Popconfirm>,
-          <Button key="retry" type="primary" icon={<RollbackOutlined />} loading={notifyBusy} onClick={retryFailedNotify}>
-            重试全部失败通知
-          </Button>,
-        ]}
-      >
-        <p style={{ marginBottom: 12, color: '#666' }}>
-          这里显示最近 50 条失败通知。配置邮箱/微信补齐后点「重试全部失败通知」；
-          不需要的历史失败记录可以清理，避免通知健康一直显示异常。
-        </p>
-        {status?.notify_health?.hint ? (
-          <div style={{
-            marginBottom: 12,
-            padding: '10px 12px',
-            borderRadius: 8,
-            background: status?.notify_health?.ok ? '#f6ffed' : '#fff1f0',
-            border: `1px solid ${status?.notify_health?.ok ? '#b7eb8f' : '#ffccc7'}`,
-            color: '#333',
-          }}>
-            <strong>诊断建议：</strong> {status?.notify_health?.hint}
-          </div>
-        ) : null}
-        <Table
-          rowKey="id"
-          loading={notifyLoading}
-          dataSource={notifyEvents}
-          pagination={false}
-          size="small"
-          scroll={{ y: 380 }}
-          columns={[
-            { title: 'ID', dataIndex: 'id', width: 70 },
-            { title: '事件', dataIndex: 'event', width: 110,
-              render: (v) => (v === 'live' ? '开播' : v === 'video' ? '新视频' : v || '-') },
-            { title: '主播/博主', dataIndex: 'anchor', width: 140, ellipsis: true },
-            { title: '标题', dataIndex: 'title', ellipsis: true },
-            { title: '渠道', dataIndex: 'channel', width: 100,
-              render: (v) => <Tag color={v === '微信' ? 'green' : v === '邮箱' ? 'blue' : 'default'}>{v || '未知'}</Tag> },
-            { title: '状态', dataIndex: 'status', width: 90,
-              render: (v) => <Tag color={v === 'failed' ? 'red' : v === 'sent' ? 'green' : 'orange'}>{v}</Tag> },
-            { title: '重试', dataIndex: 'attempts', width: 70, align: 'center' },
-            { title: '时间', dataIndex: 'created_at', width: 160 },
-          ]}
-          locale={{ emptyText: '没有失败通知记录，通知链路健康' }}
-        />
-      </Modal>
+        events={notifyEvents}
+        loading={notifyLoading}
+        busy={notifyBusy}
+        healthHint={status?.notify_health?.hint}
+        healthOk={status?.notify_health?.ok}
+        onClose={() => setNotifyOpen(false)}
+        onPruneSent={pruneSentNotify}
+        onPruneFailed={pruneFailedNotify}
+        onRetry={retryFailedNotify}
+      />
     </div>
   )
 }
