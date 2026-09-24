@@ -962,6 +962,12 @@ export default function App() {
     video_monitor: { running: serviceRunning },
   }
 
+  const tabTitles = {
+    live: '直播监控',
+    video: '短视频监控',
+    logs: '运行日志',
+  }
+
   const tabHints = {
     live: '每个主播一张卡片，点「主播设置」改画质、通知、删除',
     video: '每个博主一张卡片，点「博主设置」改下载、通知、历史视频、删除',
