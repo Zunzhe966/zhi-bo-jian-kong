@@ -604,12 +604,6 @@ function createTray() {
   tray.on('double-click', createWindow)
 }
 
-function registerShortcut() {
-  globalShortcut.unregisterAll()
-  const ok = globalShortcut.register(HOTKEY, createWindow)
-  if (!ok) console.warn('快捷键注册失败:', HOTKEY)
-}
-
 app.setName(APP_NAME)
 if (process.platform === 'win32') {
   app.setAppUserModelId('com.zunzhe.livemonitor')
@@ -773,7 +767,6 @@ app.whenReady().then(async () => {
   // 协议处理器依赖 allowedRoots 做校验，放在刷新之后注册。
   registerLocalFileProtocol()
   createTray()
-  registerShortcut()
 
   // ---------- 安全加固：IPC 入参校验（纵深防御） ----------
   // renderer 仅加载本地打包页面，但一旦被 XSS/恶意内容污染，未校验的
@@ -1041,7 +1034,6 @@ app.whenReady().then(async () => {
 })
 
 app.on('will-quit', () => {
-  globalShortcut.unregisterAll()
   if (watchdogTimer) clearInterval(watchdogTimer)
   if (notifyTimer) clearInterval(notifyTimer)
 })
