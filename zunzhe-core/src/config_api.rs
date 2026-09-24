@@ -216,7 +216,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("config")).unwrap();
         std::fs::write(
             dir.join("config").join("fupan_config.ini"),
-            "[视频监控]\n检查间隔秒 = 900\n",
+            "[视频监控]\n检查间隔秒 = 300\n",
         )
         .unwrap();
         let api = ConfigApi::new(dir.clone());

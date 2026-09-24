@@ -211,7 +211,7 @@ enum Command {
         once: bool,
         #[arg(long)]
         duration: Option<u64>,
-        #[arg(long, default_value_t = 900)]
+        #[arg(long, default_value_t = 300)]
         interval: u64,
     },
     /// 启动 MCP stdio server

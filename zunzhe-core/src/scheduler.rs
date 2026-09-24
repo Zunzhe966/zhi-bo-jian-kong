@@ -7,6 +7,15 @@ use sqlx::sqlite::SqlitePool;
 use tracing::{error, info, warn};
 
 use crate::config::Config;
+
+/// 持有 B站 WS 监听任务句柄：run_daemon 退出（无论正常/异常路径）时自动
+/// abort，避免监听任务在调度器停止后残留。
+struct WsMonitorGuard(tokio::task::JoinHandle<()>);
+impl Drop for WsMonitorGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 use crate::daemon_lock::DaemonLock;
 use crate::db;
 use crate::download;
@@ -148,6 +157,11 @@ pub async fn run_daemon(
         Err(e) => warn!("回收重启前残留录制会话失败，继续调度: {e:#}"),
     }
     let mut stop = tokio::sync::watch::channel(false);
+    // B站弹幕 WS 实时开播监听（录播姬同款）：只负责“开播事件 → 提前唤醒
+    // 下一轮 tick”，检测/录制/通知/防重仍由 LiveMonitor 状态机完成；
+    // 掉线或漏报由 300 秒轮询兜底。任务随 run_daemon 退出自动清理。
+    let (ws_tx, mut ws_rx) = tokio::sync::mpsc::channel::<String>(16);
+    let _ws_guard = WsMonitorGuard(crate::bili_live_ws::spawn_bili_ws_monitor(project_dir.to_path_buf(), ws_tx));
     // SQLite 维护计数器：每 6 小时 checkpoint/optimize 一次，防长期 WAL 膨胀。
     // 必须从持久化哨兵恢复，而不是每次启动都重置为当前时间，否则频繁重启
     // 会让维护永远推迟，run 目录残留/数据库 WAL 长期得不到周期收敛。
@@ -386,6 +400,12 @@ pub async fn run_daemon(
                 _sig = shutdown_signal() => {
                     wait_exit = true;
                     break;
+                }
+                live = ws_rx.recv() => {
+                    if let Some(live) = live {
+                        info!("[B站WS] {live} 开播事件触发提前检测");
+                        break;
+                    }
                 }
             }
             waited = waited.saturating_add(step);

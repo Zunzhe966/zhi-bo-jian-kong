@@ -144,9 +144,9 @@ impl Config {
     /// 因为开播要尽快发现）。
     ///
     /// 边界：下限 60 秒（再密就是自己找风控），上限 24 小时（写成 0 或负数时
-    /// 不至于变成「永远不再查」）。缺失或非法时回退 900 秒。
+    /// 不至于变成「永远不再查」）。缺失或非法时回退 300 秒。
     pub fn video_check_interval_secs(&self) -> u64 {
-        const DEFAULT_SECS: u64 = 900;
+        const DEFAULT_SECS: u64 = 300;
         const MIN_SECS: u64 = 60;
         const MAX_SECS: u64 = 24 * 3600;
         self.get_fupan("视频监控", "检查间隔秒")
@@ -1038,15 +1038,15 @@ SMTP邮件服务器端口 = 465
 
     #[test]
     fn video_check_interval_clamps_and_falls_back() {
-        // 缺失 → 默认 900，不能变成 0（0 会让视频检查永远不再执行）
+        // 缺失 → 默认 300，不能变成 0（0 会让视频检查永远不再执行）
         assert_eq!(
             cfg_with_fupan("[视频监控]\n").video_check_interval_secs(),
-            900
+            300
         );
         // 非数字 → 默认
         assert_eq!(
             cfg_with_fupan("[视频监控]\n检查间隔秒 = 十分钟\n").video_check_interval_secs(),
-            900
+            300
         );
         // 写 0 → 抬到下限 60，而不是永不检查
         assert_eq!(
