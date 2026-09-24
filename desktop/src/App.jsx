@@ -16,8 +16,7 @@ import { LiveCard, VideoCard, statusFingerprint } from './PersonCards'
 import {
   itemStashDir, itemStashFallback, humanSize, stamp,
   isTranscribableMedia, processEnqueueFeedback, processTaskAction,
-  
-  downloadQueueFeedback,
+  processTaskForFile, processTaskLabel, stashFieldDefault, downloadQueueFeedback,
 } from './stash'
 import LogsPanel from './LogsPanel'
 import SetupWizard from './Wizard'
