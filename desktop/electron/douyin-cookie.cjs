@@ -28,10 +28,100 @@ function logLine(statusFile, msg) {
   } catch { /* ignore */ }
 }
 
+const LOAD_URL = 'https://www.douyin.com/'
+// 抖音首页很重（SSR + 大量 JS），单次加载给足 40 秒；失败自动 reload 重试。
+const LOAD_TIMEOUT_MS = 40000
+const MAX_LOAD_ATTEMPTS = 3
+const RETRY_DELAY_MS = 5000
+// 页面加载完成后，SPA 是渐进渲染的，登录按钮可能晚出现：每 3 秒找一次，最多 36 秒。
+const CLICK_RETRIES = 12
+const CLICK_RETRY_DELAY_MS = 3000
+
+/**
+ * 可靠加载抖音首页：事件驱动判定（did-fail-load / loadURL 完成 / 超时），
+ * 失败自动 reload 重试（最多 MAX_LOAD_ATTEMPTS 次），并把进度写进窗口标题，
+ * 用户能实时看到"加载中/重试中/请扫码"而不是面对空白窗口干等。
+ */
+async function loadLoginPage(win, debug) {
+  const loadOnce = () => new Promise((resolve) => {
+    let settled = false
+    const finish = (ok, msg) => {
+      if (!settled) { settled = true; debug(msg); resolve(ok) }
+    }
+    // did-fail-load 会带错误码（如 ERR_NAME_NOT_RESOLVED），命中即快速失败，不用干等超时
+    const onFail = (event, code, desc, url) => finish(false, `did-fail-load ${code} ${desc} ${url || ''}`)
+    win.webContents.once('did-fail-load', onFail)
+    win.loadURL(LOAD_URL)
+      .then(() => finish(true, 'loadURL done'))
+      .catch((e) => finish(false, 'loadURL err ' + e.message))
+    setTimeout(() => finish(false, 'loadURL timeout'), LOAD_TIMEOUT_MS)
+  })
+
+  for (let attempt = 1; attempt <= MAX_LOAD_ATTEMPTS; attempt++) {
+    win.setTitle(attempt === 1
+      ? '抖音授权登录 · 正在加载登录页（请稍候）…'
+      : `抖音授权登录 · 加载失败，正在重试（${attempt}/${MAX_LOAD_ATTEMPTS}）…`)
+    const ok = await loadOnce()
+    if (ok) {
+      // 给 SPA 一点时间渲染首屏
+      await new Promise((r) => setTimeout(r, 3000))
+      try {
+        const hasContent = await win.webContents.executeJavaScript(
+          `document.body && document.body.innerText.length > 0 ? true : false`
+        )
+        if (hasContent) {
+          win.setTitle('抖音授权登录 · 请用手机抖音扫码')
+          debug('page ready')
+          return true
+        }
+        debug('page empty body')
+      } catch (e) {
+        debug('page check err ' + e.message)
+      }
+    }
+    if (attempt < MAX_LOAD_ATTEMPTS) {
+      await new Promise((r) => setTimeout(r, RETRY_DELAY_MS))
+    }
+  }
+  win.setTitle('抖音授权登录 · 页面加载困难，请在弹出的窗口里手动刷新后扫码')
+  return false
+}
+
+/**
+ * 自动点击「登录」按钮弹出扫码框。抖音 SPA 渐进渲染，按钮可能延迟出现，
+ * 所以按 CLICK_RETRY_DELAY_MS 间隔重试 CLICK_RETRIES 次；找到并点击成功即停。
+ */
+async function clickLogin(win, debug) {
+  for (let i = 0; i < CLICK_RETRIES; i++) {
+    try {
+      const r = await win.webContents.executeJavaScript(`(function(){
+        var btns = Array.from(document.querySelectorAll('button, [class*="login" i], [class*="Login"]'));
+        var candidates = ['登录', '登陆', 'Log in', 'Sign in'];
+        for (var i = 0; i < btns.length; i++) {
+          var el = btns[i];
+          var t = (el.textContent || '').trim();
+          if (candidates.indexOf(t) >= 0 && el.offsetParent !== null) {
+            el.click();
+            return 'clicked:' + t;
+          }
+        }
+        return 'no-login-btn';
+      })()`, true)
+      debug('click login -> ' + r)
+      if (String(r).startsWith('clicked:')) return true
+    } catch (e) {
+      debug('click err ' + e.message)
+    }
+    await new Promise((r) => setTimeout(r, CLICK_RETRY_DELAY_MS))
+  }
+  debug('no login button after retries')
+  return false
+}
+
 /**
  * 可见窗口登录流程：
- *  1. 打开抖音首页（无痕分区）
- *  2. 注入一段脚本，自动点击「登录」按钮弹出登录框
+ *  1. 打开抖音首页（无痕分区），失败自动重试，标题实时提示状态
+ *  2. 注入脚本自动点击「登录」按钮（多次重试，适配 SPA 渐进渲染）
  *  3. 轮询 Cookie，出现登录态 Cookie 即判定登录成功
  *  4. 从页面抓取当前登录用户的 sec_uid（尽量）
  *  5. 导出 Netscape Cookie
@@ -51,34 +141,13 @@ async function harvestDouyinCookies(app, outFile = defaultOut(), statusFile = ''
   debug('window created')
 
   try {
-    await Promise.race([
-      win.loadURL('https://www.douyin.com/').then(() => debug('loadURL done')).catch((e) => debug('loadURL err ' + e.message)),
-      new Promise((r) => setTimeout(() => { debug('loadURL timeout'); r() }, 25000)),
-    ])
+    // 1. 可靠加载（失败自动重试 3 次）
+    await loadLoginPage(win, debug)
 
-    // 自动尝试点击登录按钮，弹出扫码框（抖音可能弹「验证」滑块，用户自行处理）
-    try {
-      await win.webContents.executeJavaScript(`(function(){
-        var btns = Array.from(document.querySelectorAll('*'));
-        var loginBtn = btns.find(function(el){
-          var t = (el.textContent || '').trim();
-          return el.tagName === 'BUTTON' || el.className === 'login';
-        });
-        // 常见登录按钮文本
-        var candidates = ['登录', '登陆', 'Log in', 'Sign in'];
-        for (var i = 0; i < btns.length; i++) {
-          var el = btns[i];
-          var t = (el.textContent || '').trim();
-          if (candidates.indexOf(t) >= 0 && el.offsetParent !== null) {
-            el.click();
-            return 'clicked:' + t;
-          }
-        }
-        return 'no-login-btn';
-      })()`, true).then((r) => debug('click login -> ' + r)).catch((e) => debug('click err ' + e.message))
-    } catch { /* ignore */ }
+    // 2. 自动尝试点击登录按钮，弹出扫码框（抖音可能弹「验证」滑块，用户自行处理）
+    await clickLogin(win, debug)
 
-    // 轮询等待登录态 Cookie 出现（最多 300 秒，足够用户扫码）
+    // 3. 轮询等待登录态 Cookie 出现（最多 300 秒，足够用户扫码）
     let loggedIn = false
     for (let i = 0; i < 300; i++) {
       const cookies = await ses.cookies.get({ domain: '.douyin.com' })
@@ -97,7 +166,7 @@ async function harvestDouyinCookies(app, outFile = defaultOut(), statusFile = ''
       return { ok: false, error: '未检测到登录（超时 300 秒或窗口已关闭），请确认已用手机抖音扫码登录' }
     }
 
-    // 登录成功后，尝试从页面拿到当前用户信息（sec_uid / 抖音号 / 昵称）
+    // 4. 登录成功后，尝试从页面拿到当前用户信息（sec_uid / 抖音号 / 昵称）
     let userInfo = {}
     try {
       const info = await win.webContents.executeJavaScript(`(function(){
@@ -121,7 +190,7 @@ async function harvestDouyinCookies(app, outFile = defaultOut(), statusFile = ''
       debug('userInfo: ' + JSON.stringify(userInfo))
     } catch (e) { debug('userInfo err ' + e.message) }
 
-    // 导出 Cookie
+    // 5. 导出 Cookie
     const cookies = await ses.cookies.get({ domain: '.douyin.com' })
     if (!cookies.length) return { ok: false, error: '未取到任何抖音 Cookie' }
     const lines = ['# Netscape HTTP Cookie File']
