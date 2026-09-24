@@ -1432,6 +1432,41 @@ impl Platform for DouyinAdapter {
 /// 返回结构：`{ok, candidates: [{platform, name, url, mid?, room_id?, sign?, hint?}]}`
 /// - B 站：`api.bilibili.com/x/web-interface/search/type?search_type=bili_user`
 ///   风控（-352/412）时返回明确错误而不是静默空结果。
+/// 从抖音主页 URL 解析抖音号（unique_id）——headless 打开主页，拦截 profile/other
+/// 接口（页面自带签名，免登录）。供 monitor_add 把直播监控一并挂上。
+pub async fn douyin_unique_id_from_url(
+    url: &str,
+    project_dir: &std::path::Path,
+) -> anyhow::Result<serde_json::Value> {
+    use tokio::process::Command;
+    let sec_uid = url
+        .split("/user/")
+        .nth(1)
+        .and_then(|s| s.split('?').next())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if sec_uid.is_empty() || !sec_uid.starts_with("MS4wLjAB") {
+        anyhow::bail!("抖音主页链接缺少有效 sec_uid");
+    }
+    let script = project_dir.join("scripts").join("douyin_live_status.js");
+    let out = Command::new("node")
+        .arg(&script)
+        .arg(&sec_uid)
+        .current_dir(project_dir)
+        .output()
+        .await
+        .context("运行 douyin_live_status.js 失败")?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!("抖音号解析失败: {}", stderr.chars().take(200).collect::<String>());
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .with_context(|| format!("解析抖音号脚本输出失败: {}", stdout.chars().take(200).collect::<String>()))?;
+    Ok(v)
+}
+
 /// - 抖音：当前返回提示条目，等 P4 接入 sec_uid 搜索。
 pub async fn search_anchor(
     name: &str,

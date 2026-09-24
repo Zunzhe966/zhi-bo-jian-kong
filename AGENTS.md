@@ -119,7 +119,7 @@ Electron 桌面端  →  Rust daemon（zunzhe-core，主控）  →  Python 工�
 | **打包真身（改 main 层必须改这里）** | `desktop/electron/main.cjs`（package.json `main: electron/main.cjs`、build.files `electron/**`；含 runtimeDir/数据目录指针/托盘菜单/ipcMain.handle 全量）。**`desktop/main.cjs` 是死文件，改它不进包**——1.5.3/1.5.4 曾把修复改在死文件上导致未生效，2026-09-24 已全部移植回真身 |
 | **数据目录指针** | `~/Library/Application Support/尊者直播监控/数据目录.txt`（第一行为数据根路径；曾误指向 userData 导致数据根分裂、watchdog 拉不起 daemon，2026-09-24 已修正为 `/Volumes/A区/尊者监控直播短视频`；有 `ZUNZHE_PROJECT_DIR` 环境变量覆盖） |
 | **更新机制** | App 内「检查更新」= 本地更新源 `releases/尊者直播监控-<version>.zip`（electron 层 `update-run.cjs`，31 项单测）；发布走 `publish-release.sh --build`，用户程序内一键更新，无需手动装 |
-| **当前已装版本** | **1.6.6**（2026-09-24 19:56；修复添加直播传多余 notify 参数报错；1.6.5 含「抖音号+名字」解析；更新源只留最新版 zip，旧版自动清理） |
+| **当前已装版本** | **1.6.7**（2026-09-24 20:15；抖音直播监控打通：monitor_add 主页链接自动解析抖音号并同挂直播 live.douyin.com/{抖音号}，LiveMonitor 免登录检测开播即录；1.6.6 修 add-live notify 参数；更新源只留最新版 zip） |
 | **前端代码结构（2026-09-24 拆分）** | `desktop/src/App.jsx`（1086 行，主逻辑与卡片区）+ 8 个独立文件：`DetailModal.jsx`（详情弹窗）/`AddModals.jsx`（添加直播+视频）/`ItemSettingsModal.jsx`（主播设置）/`SettingsModal.jsx`（全局设置）/`HistoryModals.jsx`（批量下载+历史视频）/`NotifyModal.jsx`（通知治理）/`ui-constants.js`/`platform-utils.js`。**改弹窗去对应文件，不要堆回 App.jsx**；每步 `npm run build` 验证 + AST 缺失引用扫描（黑屏根因 = 用未 import 的变量） |
 
 > ⚠️ **`.神经总账/控制面.json` 是静态快照，会与真实工具集不一致**（曾出现快照 41 / 实测 43）。

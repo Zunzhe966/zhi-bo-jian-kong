@@ -244,6 +244,20 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
                 watch.add_live(url, &format!("主播: {remark}"), "")?;
                 added_live = true;
             } else if video_domain && !live_domain {
+                // 抖音主页链接：顺带解析抖音号，把直播监控也挂上
+                // （DouyinLiveRecorder 同款：live.douyin.com/{抖音号}，免登录检测）
+                if lower.contains("douyin.com/user") {
+                    if let Ok(info) = crate::platform::douyin_unique_id_from_url(url, project_dir).await {
+                        if let Some(uid) = info.get("unique_id").and_then(|v| v.as_str()) {
+                            if !uid.is_empty() && uid != "0" {
+                                let live_url = format!("https://live.douyin.com/{uid}");
+                                let lname = if name.is_empty() { live_url.clone() } else { name.to_string() };
+                                watch.add_live(&live_url, &format!("主播: {lname}"), "")?;
+                                added_live = true;
+                            }
+                        }
+                    }
+                }
                 let vname = if name.is_empty() { url } else { name };
                 watch.add_video(url, vname, None, None)?;
                 added_video = true;
