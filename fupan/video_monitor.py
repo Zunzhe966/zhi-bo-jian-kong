@@ -98,11 +98,12 @@ def _bilibili_view(bvid: str) -> dict:
 
 
 def _bilibili_upload_ids(mid: str, count: int) -> list[str]:
-    """拉 UP主投稿 BV 号列表。优先官方 arc/search 接口，失败回退 yt-dlp。
-    两个途径都带用户 cookie，避免 412 限流。"""
-    bvids = _bilibili_upload_ids_api(mid, count)
+    """拉 UP主投稿 BV 号列表。优先 RSSHub（平台缓存、抗 412），失败回退
+    官方 arc/search 接口（带用户 cookie），再失败 yt-dlp 兜底。
+    RSS 通道不直接打 B站接口，是三种途径里最不容易触发风控的。"""
+    bvids = _bilibili_upload_ids_rsshub(mid, count)
     if not bvids:
-        bvids = _bilibili_upload_ids_rsshub(mid, count)
+        bvids = _bilibili_upload_ids_api(mid, count)
     if bvids:
         return bvids
     ytdlp = _ytdlp_bin()
@@ -195,7 +196,12 @@ def _fetch_bilibili_ytdlp(mid: str) -> list[dict]:
 
 
 def _fetch_bilibili(mid: str, cookie: str) -> list[dict]:
-    """获取UP主最新投稿，返回 [{'id','title','url'}]。优先官方接口（需cookie），失败回退 yt-dlp。"""
+    """获取UP主最新投稿，返回 [{'id','title','url'}]。优先 RSSHub（抗 412），
+    失败回退官方接口（需 cookie），最后 yt-dlp 兜底。"""
+    rss_bvids = _bilibili_upload_ids_rsshub(mid, 10)
+    if rss_bvids:
+        return [{'id': bv, 'title': _bilibili_title(bv),
+                 'url': f'https://www.bilibili.com/video/{bv}'} for bv in rss_bvids]
     if cookie:
         headers = {'User-Agent': UA, 'Referer': f'https://space.bilibili.com/{mid}/video',
                    'Cookie': cookie}
