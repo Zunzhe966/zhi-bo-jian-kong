@@ -64,6 +64,14 @@ pub async fn build(project_dir: &Path, pool: &SqlitePool, cfg: &Config) -> Resul
         })
         .collect::<Vec<_>>();
     let switches = crate::download::PipelineSwitches::load(project_dir);
+    // 平台授权状态：抖音需要浏览器 Cookie（douyin_browser_cookies.txt），
+    // 没有它时后端每轮都会跳过该源。桌面端据此显示「未授权」而非伪装可用。
+    let douyin_authorized = crate::paths::run_dir(project_dir)
+        .join("douyin_browser_cookies.txt")
+        .exists();
+    let bili_authorized = crate::paths::run_dir(project_dir)
+        .join("bilibili_browser_cookies.txt")
+        .exists();
     // 与 CLI/MCP doctor 同口径：源进入冷却后会静默不通知/不下载，
     // 桌面端 status 必须能暴露该健康风险，不能只显示“服务运行中”。
     // 读取失败按“未知”处理，不让状态快照整体失败。
@@ -124,6 +132,7 @@ pub async fn build(project_dir: &Path, pool: &SqlitePool, cfg: &Config) -> Resul
         "anchors": anchors,
         "live_watchlist": live,
         "video_watchlist": video_sources,
+        "platform_credentials": {"douyin": douyin_authorized, "bilibili": bili_authorized},
         "video_count": video_count,
         "process_tasks": process_tasks,
         "email": cfg.email_status(),

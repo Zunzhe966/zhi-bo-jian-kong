@@ -46,7 +46,7 @@ export default function SettingsModal({
         <Form.Item label="开机自动启动（登录后托盘运行）" name="openAtLogin" valuePropName="checked">
           <Switch />
         </Form.Item>
-        <Form.Item label="Windows 桌面通知（远程推送失败时的兜底）" name="localNotify" valuePropName="checked">
+        <Form.Item label="桌面通知（远程推送失败时的兜底）" name="localNotify" valuePropName="checked">
           <Switch />
         </Form.Item>
 

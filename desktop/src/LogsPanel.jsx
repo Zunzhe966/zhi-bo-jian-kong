@@ -16,6 +16,21 @@ function dirname(filePath) {
   return cut > 0 ? text.slice(0, cut) : text
 }
 
+/** 日志清洗：剥离 ANSI 颜色码；把 UTC 时间戳（Z 后缀）转成本地时间。 */
+function cleanLogText(raw) {
+  const text = String(raw || '')
+    // ANSI 转义序列（[...m）剥掉，只留可读文本
+    .replace(/\u001b\[[0-9;]*m/g, '')
+    // UTC 时间戳 → 本地时间（+8）：2026-09-24T05:28:37.647255Z
+    .replace(/(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?)Z/g, (_m, utc) => {
+      const d = new Date(utc + 'Z')
+      if (Number.isNaN(d.getTime())) return utc + 'Z'
+      const p = (n) => String(n).padStart(2, '0')
+      return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+    })
+  return text
+}
+
 export default function LogsPanel({ logDir, logPaths }) {
   const [name, setName] = useState('zunzhe-core')
   const [content, setContent] = useState('')
@@ -32,7 +47,7 @@ export default function LogsPanel({ logDir, logPaths }) {
     setLoading(true)
     try {
       const r = await window.desktop.cli('tail-logs', name, '300')
-      setContent(r.content || '（空）')
+      setContent(cleanLogText(r.content) || '（空）')
       setPath(r.path || '')
     } catch (e) {
       setContent(String(e.message || e))

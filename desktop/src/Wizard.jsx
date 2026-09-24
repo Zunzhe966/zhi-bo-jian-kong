@@ -58,7 +58,7 @@ export default function SetupWizard({ open, onDone }) {
             <Form.Item label="Server酱 SendKey（可选，稍后可在全局设置里填）" name="serverChanKey">
               <Input.Password placeholder="SCTxxxxxxxx..." />
             </Form.Item>
-            <Form.Item label="同时弹出 Windows 桌面通知（兜底）" name="localNotify" valuePropName="checked">
+            <Form.Item label="同时弹出 桌面通知（兜底）" name="localNotify" valuePropName="checked">
               <Switch defaultChecked />
             </Form.Item>
           </Form>

@@ -90,16 +90,23 @@ fn upload_list_failure_message(official: &str, rsshub: &str, ytdlp: &str) -> Str
     format!("B站投稿列表拉取失败: {detail}（{hint}）")
 }
 
-/// 构造 RSSHub 路由 URL：空配置保留公共实例；非空配置允许本地/自建实例，
-/// 并容忍末尾斜杠，避免拼出 `//bilibili/...`。
-fn rsshub_url(configured: &str, mid: &str) -> String {
-    let base = configured.trim().trim_end_matches('/');
-    let base = if base.is_empty() {
-        "https://rsshub.app"
+/// 构造 RSSHub 路由 URL 候选列表：配置的自建实例优先，否则依次尝试
+/// 公共实例（rsshub.app 官方 + RSS.SB 社区镜像），一个挂了自动换下一个，
+/// 避免「RSS 首选」因单点故障直接失效。
+fn rsshub_candidates(configured: &str, mid: &str) -> Vec<String> {
+    let trimmed = configured.trim().trim_end_matches('/');
+    let bases: Vec<String> = if trimmed.is_empty() {
+        vec![
+            "https://rsshub.app".to_string(),
+            "https://rsshub.rss.sb".to_string(),
+        ]
     } else {
-        base
+        vec![trimmed.to_string()]
     };
-    format!("{base}/bilibili/user/video/{mid}")
+    bases
+        .into_iter()
+        .map(|b| format!("{b}/bilibili/user/video/{mid}"))
+        .collect()
 }
 
 /// 用 B 站 WBI 公钥和投稿列表参数生成签名查询串。
@@ -688,32 +695,46 @@ impl BilibiliAdapter {
             .ok()
             .map(|c| c.get_main("网络", "RSSHub 地址"))
             .unwrap_or_default();
-        let rss = rsshub_url(&configured, mid);
-        match self.client.get(&rss).send().await {
-            Ok(resp) => {
-                let status = resp.status();
-                if !status.is_success() {
-                    return (Vec::new(), format!("RSSHub 返回 HTTP {status}"));
-                }
-                match resp.text().await {
-                    Ok(text) if text.starts_with('<') => {
-                        let ids = extract_bvids(&text);
-                        if ids.is_empty() {
-                            return (Vec::new(), "RSSHub 返回 HTML 但未解析出 BV 号".to_string());
-                        }
-                        let limit = if count == 0 {
-                            usize::MAX
-                        } else {
-                            count as usize
-                        };
-                        (ids.into_iter().take(limit).collect(), String::new())
+        let candidates = rsshub_candidates(&configured, mid);
+        let mut failures = Vec::new();
+        for rss in &candidates {
+            match self.client.get(rss).send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if !status.is_success() {
+                        failures.push(format!("{rss} → HTTP {status}"));
+                        continue;
                     }
-                    Ok(_) => (Vec::new(), "RSSHub 返回非 HTML 内容".to_string()),
-                    Err(e) => (Vec::new(), format!("RSSHub 响应读取失败: {e:#}")),
+                    match resp.text().await {
+                        Ok(text) if text.starts_with('<') => {
+                            let ids = extract_bvids(&text);
+                            if ids.is_empty() {
+                                failures.push(format!("{rss} → 返回 HTML 但未解析出 BV 号"));
+                                continue;
+                            }
+                            let limit = if count == 0 {
+                                usize::MAX
+                            } else {
+                                count as usize
+                            };
+                            return (ids.into_iter().take(limit).collect(), String::new());
+                        }
+                        Ok(_) => {
+                            failures.push(format!("{rss} → 返回非 HTML 内容"));
+                            continue;
+                        }
+                        Err(e) => {
+                            failures.push(format!("{rss} → 响应读取失败: {e:#}"));
+                            continue;
+                        }
+                    }
+                }
+                Err(e) => {
+                    failures.push(format!("{rss} → 请求失败: {e:#}"));
                 }
             }
-            Err(e) => (Vec::new(), format!("RSSHub 请求失败: {e:#}")),
         }
+        (Vec::new(), format!("RSSHub 全部实例失败: {}", failures.join("；")))
     }
 
     async fn upload_ids_ytdlp(&self, mid: &str, count: u32) -> (Vec<String>, String) {
@@ -1624,13 +1645,18 @@ mod tests {
 
     #[test]
     fn rsshub_url_can_use_configured_local_instance() {
+        // 空配置 → 公共实例候选（官方 + 社区镜像）
         assert_eq!(
-            rsshub_url("", "946974"),
-            "https://rsshub.app/bilibili/user/video/946974"
+            rsshub_candidates("", "946974"),
+            vec![
+                "https://rsshub.app/bilibili/user/video/946974".to_string(),
+                "https://rsshub.rss.sb/bilibili/user/video/946974".to_string(),
+            ]
         );
+        // 配置自建实例 → 只用一个，容忍末尾斜杠
         assert_eq!(
-            rsshub_url("http://127.0.0.1:1200/", "946974"),
-            "http://127.0.0.1:1200/bilibili/user/video/946974"
+            rsshub_candidates("http://127.0.0.1:1200/", "946974"),
+            vec!["http://127.0.0.1:1200/bilibili/user/video/946974".to_string()]
         );
     }
 

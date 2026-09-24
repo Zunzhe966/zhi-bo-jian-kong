@@ -111,15 +111,15 @@ Electron 桌面端  →  Rust daemon（zunzhe-core，主控）  →  Python 工�
 | **产物根** | `/Volumes/A区/尊者产物` |
 | 数据库 | `/Volumes/A区/尊者产物/database/zunzhe-core.db` |
 | Rust 二进制 | `<项目>/zunzhe-core/target/release/zunzhe-core` |
-| MCP 工具数 | **18 个**（2026-09-23 实测新 release 二进制 `tools/list`；`.神经总账/控制面.json` 是**快照，会过期**） |
+| MCP 工具数 | **20 个**（2026-09-24 实测 `tools/list`：新增 `check_update`/`apply_update` 更新链路；`.神经总账/控制面.json` 是**快照，会过期**） |
 | MCP 控制面快照 | `.神经总账/控制面.json`（**不是** `.神经/控制面.json`，后者是旧残留） |
 | **B站直播监听** | **弹幕 WS 实时监听（录播姬同款，2026-09-24 起）**：getDanmuInfo → WSS → 30s 心跳 → `LIVE` 事件 → 提前唤醒 live tick；检测/录制/通知/防重复用 LiveMonitor 状态机，**300 秒轮询降为对账兜底**；掉线自动退避重连 |
-| **守护职责** | **桌面端 watchdog**（GUI 会话进程）。launchd 域（gui/501）进程**无法访问外置盘** `/Volumes/A区`（2026-09-23 实测 `launchctl submit` 跑 `ls /Volumes/A区/...` = `Operation not permitted`）→ **launchd 无法托管本 daemon**；`scripts/launchd/*` 与磁盘 plist 仅备用 |
+| **守护职责** | **桌面端 watchdog**（GUI 会话进程）。launchd 域（gui/501）进程**无法访问外置盘** `/Volumes/A区` → **launchd 无法托管本 daemon**；`com.zunzhe.healthcheck`（launchd 版健康检查，每 60 秒访问外置盘被 TCC 拒绝持续刷错）**已于 2026-09-24 停用**，plist 保留可恢复；`scripts/launchd/*` 仅备用 |
 | **日志目录** | `~/Library/Logs/zunzhe`（config.ini `[路径设置] 日志目录` 显式配置，2026-09-23 起） |
 | **打包真身（改 main 层必须改这里）** | `desktop/electron/main.cjs`（package.json `main: electron/main.cjs`、build.files `electron/**`；含 runtimeDir/数据目录指针/托盘菜单/ipcMain.handle 全量）。**`desktop/main.cjs` 是死文件，改它不进包**——1.5.3/1.5.4 曾把修复改在死文件上导致未生效，2026-09-24 已全部移植回真身 |
 | **数据目录指针** | `~/Library/Application Support/尊者直播监控/数据目录.txt`（第一行为数据根路径；曾误指向 userData 导致数据根分裂、watchdog 拉不起 daemon，2026-09-24 已修正为 `/Volumes/A区/尊者监控直播短视频`；有 `ZUNZHE_PROJECT_DIR` 环境变量覆盖） |
 | **更新机制** | App 内「检查更新」= 本地更新源 `releases/尊者直播监控-<version>.zip`（electron 层 `update-run.cjs`，31 项单测）；发布走 `publish-release.sh --build`，用户程序内一键更新，无需手动装 |
-| **当前已装版本** | **1.5.7**（2026-09-24，前端拆分发版；更新源只留最新版 zip，旧版自动清理） |
+| **当前已装版本** | **1.5.9**（2026-09-24；前端拆分发版 + 后端版本对齐 + 更新链路端到端验证；更新源只留最新版 zip，旧版自动清理） |
 | **前端代码结构（2026-09-24 拆分）** | `desktop/src/App.jsx`（1086 行，主逻辑与卡片区）+ 8 个独立文件：`DetailModal.jsx`（详情弹窗）/`AddModals.jsx`（添加直播+视频）/`ItemSettingsModal.jsx`（主播设置）/`SettingsModal.jsx`（全局设置）/`HistoryModals.jsx`（批量下载+历史视频）/`NotifyModal.jsx`（通知治理）/`ui-constants.js`/`platform-utils.js`。**改弹窗去对应文件，不要堆回 App.jsx**；每步 `npm run build` 验证 + AST 缺失引用扫描（黑屏根因 = 用未 import 的变量） |
 
 > ⚠️ **`.神经总账/控制面.json` 是静态快照，会与真实工具集不一致**（曾出现快照 41 / 实测 43）。

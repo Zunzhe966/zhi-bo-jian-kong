@@ -499,17 +499,12 @@ export default function App() {
         setDetailFiles(res.items || [])
         setDetailError('')
       } else {
-        const up = fallbackStashOf(row, kind)
-        const res2 = up ? await window.desktop.listDir(up) : null
-        if (res2 && res2.ok) {
-          setDetailPath(res2.path || up)
-          setDetailFiles(res2.items || [])
-          setDetailError('')
-        } else {
-          setDetailPath(dir)
-          setDetailFiles([])
-          setDetailError((res && res.error) || '读不到目录')
-        }
+        // 不回退到产物根：博主自己的目录不存在就是「还没有内容」，
+        // 避免出现「标题是博主、内容却是全局目录」的误导。
+        // 打开存放位置（openItemStash）仍保留退到上一级的逻辑。
+        setDetailPath(dir)
+        setDetailFiles([])
+        setDetailError((res && res.error) || '该博主还没有内容（目录尚未创建）；完成平台授权后，新内容会自动落到这里')
       }
     } catch (e) {
       setDetailError(String(e.message || e))
@@ -970,6 +965,7 @@ export default function App() {
             videoRows.length ? (
               <div className="card-grid">{videoRows.map((r) => (
                 <VideoCard key={r.key} row={r} platformIcon={platformIcon} platformLabel={platformLabel}
+                  platformCred={status?.platform_credentials}
                   onSettings={openItemSettings}
                   onOpenStash={openItemStash} onDetail={openItemDetail} />
               ))}</div>

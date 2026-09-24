@@ -43,7 +43,12 @@ export const LiveCard = memo(function LiveCard({
           <UrlLine url={row.url} />
         </div>
       </div>
-      <div className="person-meta">
+            {(row.platform === 'douyin' && platformCred && platformCred.douyin === false) && (
+        <div className="meta-tag meta-warn" style={{ color: '#d4380d', background: '#fff2e8', border: '1px solid #ffbb96', borderRadius: 4, padding: '0 8px', marginBottom: 4 }}>
+          抖音未授权：请到「全局设置 → 抖音登录」扫码授权，否则监控到新视频也会跳过下载
+        </div>
+      )}
+<div className="person-meta">
         {platName && <span className="meta-tag meta-platform">{platName}</span>}
         <span className={`meta-tag ${row.state === 'recording' ? 'state-recording' : row.state === 'monitoring' ? 'state-live' : ''}`}>
           {statusText[row.state]}
