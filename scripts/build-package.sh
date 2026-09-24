@@ -77,6 +77,10 @@ echo "[打包] Rust daemon: $ROOT/zunzhe-core/target/release/zunzhe-core"
 echo "[打包] 构建前端 UI (vite) ..."
 ( cd "$DESKTOP" && npx vite build )
 
+# ---- 3.5 前端渲染验收（防黑屏/防按钮失灵；2026-09-24 起打包必跑）----
+echo "[打包] 前端渲染验收（check-ui-render）..."
+node "$ROOT/scripts/check-ui-render.cjs" || { echo "[打包] ❌ UI 验收未过，终止发布（先修界面再发）"; exit 1; }
+
 # ---- 4. 清理旧的 release 产物（保留 dmg）----
 echo "[打包] 清理旧产物 ..."
 ( cd "$DESKTOP" && rm -rf release/mac-arm64 release/win-unpacked release/*.blockmap release/*.yml )

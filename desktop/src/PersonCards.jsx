@@ -30,7 +30,7 @@ function UrlLine({ url }) {
 }
 
 export const LiveCard = memo(function LiveCard({
-  row, platformIcon, platformLabel, onToggle, onSettings, onOpenStash, onDetail,
+  row, platformIcon, platformLabel, platformCred, onToggle, onSettings, onOpenStash, onDetail,
 }) {
   const name = (row.remark || '').replace(/^主播:\s*/, '') || row.url
   const platName = platformLabel ? platformLabel(row.platform) : ''

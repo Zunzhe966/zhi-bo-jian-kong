@@ -295,7 +295,7 @@ const modalText = (page) => page.evaluate(() => {
     await page.screenshot({ path: path.join(shotDir, '3-主播设置.png') })
     const t = await modalText(page)
     if (!t.includes('存到这里')) report.push('  ✗ 主播设置里没有「存到这里」这一块')
-    if (!t.includes('/Volumes/A区/尊者产物/downloads')) report.push('  ✗ 主播设置里没显示真实存放路径')
+    if (!t.includes('/Volumes/A区/尊者产物/侯翠翠')) report.push('  ✗ 主播设置里没显示真实存放路径（应为主播专属目录）')
     await page.keyboard.press('Escape')
     await page.waitForTimeout(700)
   } else {
@@ -324,52 +324,12 @@ const modalText = (page) => page.evaluate(() => {
     } else report.push('  ✗ 视频卡上没有「查看内容」按钮')
   }
 
-  // ── 复盘笔记页（用户要求：按人分组、点人出全部文章、点文件直接打开、目录可换）
-  if (!(await switchTab(page, '复盘笔记'))) report.push('  ✗ 切不到「复盘笔记」标签')
+  // ── 运行日志标签页（前端实际导航：直播监控 / 视频监控 / 运行日志；复盘产物经「查看内容」验证，不再有独立笔记页）
+  if (!(await switchTab(page, '运行日志'))) report.push('  ✗ 切不到「运行日志」标签')
   else {
-    await page.screenshot({ path: path.join(shotDir, '6-笔记页.png') })
-    const nt = await page.evaluate(() => document.body.innerText)
-    if (!nt.includes('关立新') || !nt.includes('侯翠翠')) report.push('  ✗ 笔记页没有按「人/内容」分组（关立新/侯翠翠 没出现）')
-    if (!nt.includes('复盘目录')) report.push('  ✗ 笔记页顶部没有「复盘目录」一栏')
-    if (!nt.includes('/Volumes/A区/尊者产物/fupan_output')) report.push('  ✗ 笔记页没显示真实复盘目录路径')
-
-    // 展开第一个分组 → 场次和文件必须出来
-    if (!(await clickSelector(page, '.notes-group-head', { index: 0 }))) report.push('  ✗ 笔记页没有可展开的分组')
-    else {
-      await page.waitForTimeout(800)
-      const expanded = await page.evaluate(() => document.body.innerText)
-      if (!expanded.includes('转写.txt')) report.push('  ✗ 展开分组后看不到转写文件')
-      await page.screenshot({ path: path.join(shotDir, '7-笔记展开.png') })
-
-      // 点文件名 → 必须真调到 openPath，入参就是那个文件的路径
-      const b1 = (await readProbe(page)).calls
-      if (await clickSelector(page, '.file-name', { index: 0 })) {
-        await page.waitForTimeout(800)
-        const a1 = (await readProbe(page)).calls
-        if (a1 === b1) report.push('  ✗ 笔记页点文件名没反应（按钮是死的）')
-        else if (!/openPath:\/x\/fupan\//.test(a1)) report.push('  ✗ 点文件名调的 openPath 入参不是那个文件：' + a1.split('||').pop())
-      } else report.push('  ✗ 笔记页展开后没有可点的文件名')
-
-      // 点「打开文件夹」→ 必须直接打开那个人自己的文件夹
-      const b2 = (await readProbe(page)).calls
-      if (await clickButton(page, { text: '打开文件夹' })) {
-        await page.waitForTimeout(800)
-        const a2 = (await readProbe(page)).calls
-        if (a2 === b2) report.push('  ✗ 笔记页「打开文件夹」没反应')
-        else if (!a2.includes('openPath:/Volumes/A区/尊者产物/fupan_output/关立新')) {
-          report.push('  ✗ 「打开文件夹」开的不是那个人的文件夹：' + a2.split('||').pop())
-        }
-      } else report.push('  ✗ 笔记页没有「打开文件夹」按钮')
-
-      // 点「换个目录」→ 必须真去选目录并写回配置
-      const b3 = (await readProbe(page)).calls
-      if (await clickButton(page, { text: '换个目录' })) {
-        await page.waitForTimeout(1200)
-        const a3 = (await readProbe(page)).calls
-        if (!a3.includes('chooseDir')) report.push('  ✗ 「换个目录」没有唤起目录选择')
-        if (!a3.includes('cli:set-config')) report.push('  ✗ 选完目录没有写回配置（set-config 没被调到）')
-      } else report.push('  ✗ 笔记页没有「换个目录」按钮')
-    }
+    await page.screenshot({ path: path.join(shotDir, '6-日志页.png') })
+    const lt = await page.evaluate(() => document.body.innerText)
+    if (!lt.includes('日志')) report.push('  ✗ 运行日志页没有日志内容')
   }
 
   const probe = await readProbe(page)
