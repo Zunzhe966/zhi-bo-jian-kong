@@ -94,7 +94,7 @@
 <项目绝对路径>/zunzhe-core/target/release/zunzhe-core mcp
 ```
 
-> **工具数量**：当前 43 个（含历史别名），**规划收敛为一套与 CLI 对齐的 `monitor_*` 主命令**（`anchor_search` / `monitor_add` / `monitor_remove` / `monitor_list` / `monitor_set` / `check_now` / `download_video` / `process_media` / `notes_list` / `status` / `paths` / `doctor` / `config_get` / `config_set` / `service_start` / `service_stop` / `tail_logs` / `test_email`）。完整定义与删除清单见 `产品手册.md` 第 6 章。
+> **工具数量**：当前 **18 个**（P3 已完成收敛，实测 `tools/list` 为准；`.神经总账/控制面.json` 是快照会过期）——`anchor_search` / `monitor_add` / `monitor_remove` / `monitor_list` / `monitor_set` / `check_now` / `download_video` / `process_media` / `notes_list` / `status` / `paths` / `doctor` / `config_get` / `config_set` / `service_start` / `service_stop` / `tail_logs` / `test_email`。完整定义见 `产品手册.md` 第 6 章。
 
 智能体典型用法：
 
