@@ -386,6 +386,28 @@ app.whenReady().then(async () => {
   })
   ipcMain.handle('open-path', (_, p) => shell.openPath(p))
   ipcMain.handle('open-external', (_, url) => shell.openExternal(url))
+  // 外置盘访问权限自检：macOS 对 /Volumes/* 有 TCC 授权要求，App 未被授权时
+  // 读不到产物根（watchdog 拉不起 daemon、打开位置失败）。返回状态供前端显示引导。
+  ipcMain.handle('check-external-volume', () => {
+    const candidates = [
+      PROJECT_DIR,
+      (() => { try { return fs.readFileSync(path.join(runtimeDir(), 'config', 'config.ini'), 'utf8') } catch (e) { return '' } })(),
+    ]
+    let mediaRoot = ''
+    try {
+      const ini = candidates[1]
+      const m = ini && ini.match(/^\s*产物根目录\s*=\s*(.+)$/m)
+      if (m) mediaRoot = m[1].trim()
+    } catch (e) {}
+    if (!mediaRoot) mediaRoot = '/Volumes/A区/尊者产物'
+    try {
+      fs.accessSync(mediaRoot, fs.constants.R_OK)
+      return { ok: true, mediaRoot }
+    } catch (e) {
+      try { fs.accessSync(PROJECT_DIR, fs.constants.R_OK); return { ok: false, mediaRoot, hint: `App 读不到产物根（${mediaRoot}）` } } catch (e2) {}
+      return { ok: false, mediaRoot, hint: `App 读不到项目根（${PROJECT_DIR}）` }
+    }
+  })
   ipcMain.handle('read-text', (_, p) => {
     try { return fs.readFileSync(p, 'utf8') } catch { return '' }
   })
