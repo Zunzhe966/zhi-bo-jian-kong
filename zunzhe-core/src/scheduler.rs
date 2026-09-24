@@ -862,6 +862,10 @@ async fn apply_source_outcome(
                 warn!(
                     "source {source_url} 未完成授权，本轮跳过（不计失败冷却，授权后自动恢复）: {msg}"
                 );
+                // 未授权是确定性状态：把历史失败计数清零，避免桌面端把
+                // 「未登录」误显示成「冷却中」（曾出现抖音源 13 次失败计数
+                // 永久挂在监控源状态里，误导用户以为 B站链路出了问题）。
+                let _ = db::reset_source_failures(pool, &source_url).await;
                 *skipped_missing_credential += 1;
                 return Ok(());
             }

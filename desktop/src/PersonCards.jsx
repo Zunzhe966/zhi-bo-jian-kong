@@ -43,7 +43,7 @@ export const LiveCard = memo(function LiveCard({
           <UrlLine url={row.url} />
         </div>
       </div>
-            {(row.platform === 'douyin' && platformCred && platformCred.douyin === false) && (
+            {(row.platform === 'DouYin' && platformCred && platformCred.douyin === false) && (
         <div className="meta-tag meta-warn" style={{ color: '#d4380d', background: '#fff2e8', border: '1px solid #ffbb96', borderRadius: 4, padding: '0 8px', marginBottom: 4 }}>
           抖音未授权：请到「全局设置 → 抖音登录」扫码授权，否则监控到新视频也会跳过下载
         </div>
@@ -76,7 +76,7 @@ export const LiveCard = memo(function LiveCard({
 })
 
 export const VideoCard = memo(function VideoCard({
-  row, platformIcon, platformLabel, onSettings, onOpenStash, onDetail,
+  row, platformIcon, platformLabel, platformCred, onSettings, onOpenStash, onDetail,
 }) {
   const platName = platformLabel ? platformLabel(row.platform) : ''
   // 平台图标以前是写死的 B站图标：不管监控的是哪个站，卡片长得一模一样，
@@ -93,6 +93,11 @@ export const VideoCard = memo(function VideoCard({
           <UrlLine url={row.url} />
         </div>
       </div>
+      {(row.platform === 'DouYin' && platformCred && platformCred.douyin === false) && (
+        <div className="meta-tag meta-warn" style={{ color: '#d4380d', background: '#fff2e8', border: '1px solid #ffbb96', borderRadius: 4, padding: '0 8px', marginBottom: 4 }}>
+          抖音未授权：请到「全局设置 → 抖音登录」扫码授权，否则监控到新视频也会跳过下载
+        </div>
+      )}
       <div className="person-meta">
         {platName && <span className="meta-tag meta-platform">{platName}</span>}
         <span className="meta-tag">{row.download ? '自动下载' : '只通知'}</span>
