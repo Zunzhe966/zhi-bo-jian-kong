@@ -36,7 +36,7 @@ export default function NotifyModal({
       ]}
     >
       <p style={{ marginBottom: 12, color: '#666' }}>
-        这里显示最近 50 条失败通知。配置邮箱/微信补齐后点「重试全部失败通知」；
+        这里显示最近 50 条失败通知。配置好邮箱后点「重试全部失败通知」；
         不需要的历史失败记录可以清理，避免通知健康一直显示异常。
       </p>
       {healthHint ? (

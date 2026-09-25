@@ -54,7 +54,7 @@ export default function ItemSettingsModal({
               <Select options={qualityOptions} />
             </Form.Item>
             <Form.Item label="通知方式" name="notify"
-              extra="重要的选「微信」（占 Server酱 每天约 5 条）；一般选「不通知」">
+              extra="默认跟随全局（全局渠道为邮箱）；可单独指定「邮箱」或「不通知」">
               <Select options={notifyOptions} />
             </Form.Item>
             <Button icon={<ReloadOutlined />} onClick={() => row && onRefresh(row)}>

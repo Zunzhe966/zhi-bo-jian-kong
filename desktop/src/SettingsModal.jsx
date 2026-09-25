@@ -35,7 +35,7 @@ export default function SettingsModal({
         <Button key="close" onClick={onClose}>关闭</Button>,
       ]}
     >
-      <Form form={form} layout="vertical" initialValues={{ smtpHost: 'smtp.qq.com', smtpPort: '465', senderName: '尊者监控直播', transcribeEnabled: true, pipelineTimeout: '21600', llmEnabled: true, watchdog: true, autoStartServices: true, localNotify: true, mediaRoot: '', downloadDir: '', fupanDir: '', logsDir: '', databaseFile: '' }}>
+      <Form form={form} layout="vertical" initialValues={{ smtpHost: 'smtp.qq.com', smtpPort: '465', senderName: '尊者监控直播', transcribeEnabled: true, pipelineTimeout: '21600', watchdog: true, autoStartServices: true, localNotify: true, mediaRoot: '', downloadDir: '', fupanDir: '', logsDir: '', databaseFile: '' }}>
         <div style={{ fontWeight: 600, margin: '4px 0 8px' }}>应用行为</div>
         <Form.Item label="打开软件时自动启动监控" name="autoStartServices" valuePropName="checked">
           <Switch />
@@ -91,16 +91,7 @@ export default function SettingsModal({
           </span>
         </div>
 
-        <div style={{ fontWeight: 600, margin: '16px 0 8px' }}>抗代理推送（推荐）</div>
-        <Form.Item label="Server酱 SendKey" name="serverChanKey"
-          extra={<span>在 <a onClick={() => window.desktop.openExternal('https://sct.ftqq.com/')}>sct.ftqq.com</a> 微信登录后复制 SendKey。已配置可留空。</span>}>
-          <Input.Password placeholder="SCTxxxxxxxx..." />
-        </Form.Item>
-        <Form.Item label="PushPlus Token" name="pushplusToken">
-          <Input.Password placeholder="留空则不启用" />
-        </Form.Item>
-
-        <div style={{ fontWeight: 600, margin: '16px 0 8px' }}>邮箱推送</div>
+        <div style={{ fontWeight: 600, margin: '16px 0 8px' }}>邮箱推送（唯一通知渠道）</div>
         <div style={{ marginBottom: 8, padding: '8px 12px', borderRadius: 6, background: emailConfigured ? '#f6ffed' : '#fff7e6', border: `1px solid ${emailConfigured ? '#b7eb8f' : '#ffd591'}` }}>
           {emailConfigured ? '✅ 邮箱已配置' : `⚠️ ${emailStatusText || '邮箱未配置'}`}
           <Button size="small" style={{ marginLeft: 12 }} onClick={onSetupQq}>QQ 邮箱一键填入</Button>

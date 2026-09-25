@@ -12,7 +12,6 @@ export const qualityOptions = [
 
 export const notifyOptions = [
   { label: '跟随全局', value: '跟随全局' },
-  { label: '微信（Server酱，省额度给重要的）', value: '微信' },
   { label: '邮箱', value: '邮箱' },
   { label: '不通知', value: '不通知' },
 ]

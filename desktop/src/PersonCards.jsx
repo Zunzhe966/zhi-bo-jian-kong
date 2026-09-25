@@ -3,12 +3,7 @@ import { Button, Switch, Tooltip } from 'antd'
 import {
   SettingOutlined, VideoCameraFilled, FolderOpenFilled, ProfileOutlined,
 } from '@ant-design/icons'
-
-const statusText = {
-  recording: '录制中',
-  monitoring: '监控中，等待开播',
-  noting: '未开始监控',
-}
+import { statusText } from './ui-constants'
 
 function notifyLabel(n) {
   if (n === '微信') return '微信通知'
@@ -45,7 +40,7 @@ export const LiveCard = memo(function LiveCard({
       </div>
             {(row.platform === 'DouYin' && platformCred && platformCred.douyin === false) && (
         <div className="meta-tag meta-warn" style={{ color: '#d4380d', background: '#fff2e8', border: '1px solid #ffbb96', borderRadius: 4, padding: '0 8px', marginBottom: 4 }}>
-          抖音未授权：请到「全局设置 → 抖音登录」扫码授权，否则监控到新视频也会跳过下载
+          抖音未授权：直播监控免登录不受影响；若还监控该主播的短视频，请到「全局设置 → 抖音登录」扫码授权
         </div>
       )}
 <div className="person-meta">

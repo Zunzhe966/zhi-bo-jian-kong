@@ -36,18 +36,70 @@ def _empty(anchor_name: str = '') -> dict:
     }
 
 
+def _load_douyin_cookies() -> str:
+    """读取「抖音授权」保存的 cookie 文件（Netscape 格式），转成请求头字符串。
+
+    与 Rust 短视频适配器读的是同一个文件：<产物根>/fupan_output/run/
+    douyin_browser_cookies.txt。文件不存在（用户未授权）时返回空串，
+    直播检测继续走匿名通道——授权只是兜底，不是前提。
+    """
+    try:
+        from fupan.settings import RUN_DIR
+        path = Path(RUN_DIR) / 'douyin_browser_cookies.txt'
+    except Exception:
+        return ''
+    if not path.exists():
+        return ''
+    pairs = []
+    try:
+        for line in path.read_text(encoding='utf-8', errors='replace').splitlines():
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split('\t')
+            if len(parts) >= 7 and parts[5]:
+                pairs.append(f'{parts[5]}={parts[6]}')
+    except OSError:
+        return ''
+    return '; '.join(pairs)
+
+
 async def _resolve_douyin(url: str) -> dict:
     from src.spider import get_douyin_web_stream_data, get_douyin_app_stream_data
     from src.stream import get_douyin_stream_url
 
     # 旧 Python 优先走 web，分享链接/用户页再走 app 解析。
-    try:
-        if 'v.douyin.com' in url or '/user/' in url:
-            raw = await get_douyin_app_stream_data(url)
-        else:
-            raw = await get_douyin_web_stream_data(url)
-    except Exception:
+    use_app = 'v.douyin.com' in url or '/user/' in url
+    # 匿名（内置 ttwid）先试；失败时用「抖音授权」的 cookie 兜底一次。
+    attempts = ['']
+    if not use_app:
+        authorized = _load_douyin_cookies()
+        if authorized:
+            attempts.append(authorized)
+
+    raw = {}
+    last_error = ''
+    for cookies in attempts:
+        try:
+            if use_app:
+                raw = await get_douyin_app_stream_data(url)
+            else:
+                raw = await get_douyin_web_stream_data(url, cookies=cookies or None)
+        except Exception as exc:
+            last_error = str(exc)
+            raw = {}
+            continue
+        if raw.get('anchor_name'):
+            break
+        # spider.py 失败时会吞掉异常返回 {'anchor_name': ''}——这就是它的失败签名。
+        last_error = '接口未返回主播信息（可能被风控、a_bogus 签名失效或房间不存在）'
         raw = {}
+    if not raw.get('anchor_name'):
+        # 关键约定：检测失败必须抛出，让上层写进 JSON 的 error 字段（Rust 桥只认
+        # error 字段判失败）。绝不能把失败伪装成 is_live=False——否则风控/签名
+        # 失效时用户看到的永远是「主播没开播」，监控坏了也没有任何告警。
+        raise RuntimeError(f'抖音直播检测失败: {last_error or "接口无有效返回"}')
+
     result = await get_douyin_stream_url(raw, '原画', '')
     return {
         'is_live': bool(result.get('is_live')),

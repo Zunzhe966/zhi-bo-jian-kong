@@ -19,7 +19,7 @@ function dirname(filePath) {
 /** 日志清洗：剥离 ANSI 颜色码；把 UTC 时间戳（Z 后缀）转成本地时间。 */
 function cleanLogText(raw) {
   const text = String(raw || '')
-    // ANSI 转义序列（[...m）剥掉，只留可读文本
+    // ANSI 转义序列（\u001b[...m）剥掉，只留可读文本
     .replace(/\u001b\[[0-9;]*m/g, '')
     // UTC 时间戳 → 本地时间（+8）：2026-09-24T05:28:37.647255Z
     .replace(/(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?)Z/g, (_m, utc) => {

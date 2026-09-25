@@ -20,8 +20,8 @@ from .config_api import config_schema, get_config, set_config, set_config_bulk
 mcp = FastMCP(
     'live-monitor',
     instructions=(
-        '尊者直播监控工具：自动监控直播开播/发视频、录制、转写、复盘、邮件通知。'
-        '支持 40+ 直播平台。大模型由调用方智能体自带，用 set_config 写入 [知识提炼] 的 api地址/api密钥/模型。'
+        '尊者直播监控工具：自动监控直播开播/发视频、录制、本地转写、邮件通知。'
+        '本软件不接任何大模型 API：转写之后的理解/总结由调用方智能体用自己的模型完成。'
         '所有工具返回 JSON 字符串。'
     ),
 )

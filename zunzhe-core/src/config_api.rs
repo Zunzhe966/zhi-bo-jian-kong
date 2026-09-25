@@ -124,16 +124,12 @@ impl ConfigApi {
 
     pub fn schema(&self) -> Value {
         json!({
-            "description": "尊者直播监控工具配置。大模型由外部智能体自带，通过 MCP/CLI 写入 [知识提炼] 即可。",
-            "mcp_hint": "智能体用 set_config 写入 api地址/api密钥/模型，或用 bulk 一次写入。",
+            "description": "尊者直播监控工具配置。本软件不接任何大模型 API：转写之后的理解/总结由调用方智能体用自己的模型完成，不需要也不应该在这里配置 api地址/api密钥。",
             "files": {
                 "config.ini": {
                     "录制设置": {"循环时间(秒)": "监控轮询间隔", "视频保存格式ts|mkv|flv|mp4|mp3音频|m4a音频": "保存格式"},
                     "推送配置": {
                         "直播状态推送渠道": "填「邮箱」启用邮件通知",
-                        "server酱SendKey": "Server酱 SendKey，可推微信（secret）",
-                        "pushplus推送token": "PushPlus token（secret）",
-                        "pushplus_token": "PushPlus token 旧键名（兼容读取，写入建议用 pushplus推送token）",
                         "bark推送接口链接": "iOS Bark 推送地址（secret）",
                         "ntfy推送地址": "ntfy 订阅地址（secret）",
                         "SMTP邮件服务器": "如 smtp.qq.com",
@@ -153,9 +149,7 @@ impl ConfigApi {
                 },
                 "fupan_config.ini": {
                     "转写": {"是否启用转写(是/否)": "是/否", "whisper模型": "tiny/base/small/medium/large-v3", "运行设备": "auto/cpu/cuda"},
-                    "知识提炼": {"是否启用知识提炼(是/否)": "是/否", "api地址": "OpenAI 兼容 API", "api密钥": "API Key（secret）", "模型": "模型名"},
-                    "切片": {"是否启用切片(是/否)": "是/否", "最多片段数": "整数"},
-                    "复盘邮件": {"录制完成后发送复盘笔记(是/否)": "是/否", "发现新视频时发送通知(是/否)": "是/否"},
+                    "复盘邮件": {"发现新视频时发送通知(是/否)": "是/否"},
                     "视频监控": {"检查间隔秒": "轮询间隔", "自动下载新视频(是/否)": "是/否"}
                 }
             }
@@ -192,21 +186,45 @@ mod tests {
     }
 
     #[test]
-    fn schema_includes_legacy_cookie_and_pushplus_compat() {
+    fn schema_includes_legacy_cookie_section() {
         let dir = std::env::temp_dir().join(format!("zunzhe-config-schema-{}", std::process::id()));
         let schema = ConfigApi::new(dir).schema();
         assert_eq!(
             schema["files"]["config.ini"]["Cookie"]["抖音cookie"],
             "录制抖音必填（secret）"
         );
-        assert_eq!(
-            schema["files"]["config.ini"]["推送配置"]["pushplus推送token"],
-            "PushPlus token（secret）"
+    }
+
+    #[test]
+    fn schema_no_longer_advertises_wechat_or_llm() {
+        // 产品决策（2026-09-25）：通知只留邮箱，微信(Server酱)/pushplus 入口裁掉；
+        // 本软件不接大模型 API，schema 不得再引导配置 [知识提炼] 的 api地址/api密钥。
+        let dir =
+            std::env::temp_dir().join(format!("zunzhe-config-schema-nollm-{}", std::process::id()));
+        let schema = ConfigApi::new(dir).schema();
+        let push = &schema["files"]["config.ini"]["推送配置"];
+        assert!(
+            push.get("server酱SendKey").is_none(),
+            "schema 不得再出现 Server酱"
         );
         assert!(
-            schema["files"]["config.ini"]["推送配置"]
-                .get("pushplus_token")
-                .is_some()
+            push.get("pushplus推送token").is_none(),
+            "schema 不得再出现 pushplus"
+        );
+        assert!(
+            push.get("pushplus_token").is_none(),
+            "schema 不得再出现 pushplus 旧键名"
+        );
+        assert!(
+            schema["files"]["fupan_config.ini"]
+                .get("知识提炼")
+                .is_none(),
+            "schema 不得再出现知识提炼（违反不接大模型 API 红线）"
+        );
+        let desc = schema["description"].as_str().unwrap_or("");
+        assert!(
+            desc.contains("不接任何大模型"),
+            "description 必须声明不接大模型 API: {desc}"
         );
     }
 

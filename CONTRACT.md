@@ -112,9 +112,9 @@ daemon 启动失败不回滚已落库的任务：任务仍可显示在队列中�
 
 ## 8. 已验证基线（历史证据摘要，非规则）
 
-- Rust：`cargo test --all-targets` 基线 **289 passed / 0 failed / 1 ignored**；`cargo clippy -D warnings` 零告警；`cargo fmt --check` 通过。
-- 桌面端：`npm test` 基线 **8 passed / 0 failed**。
-- 控制面：真实 stdio `tools/list` = **43 个工具**（源码契约 `tests/control_plane_contract.rs` 断言同数）。
+- Rust：`cargo test --all-targets` 基线 **322 passed / 0 failed / 2 ignored**（2026-09-25 实测；另有 `service::tests::remove_pid_if_never_deletes_new_instance_pid` 在并行+受限沙箱下偶发失败，单跑稳定通过，属测试隔离问题非代码缺陷）；`cargo clippy -D warnings` 零告警；`cargo fmt --check` 通过。
+- 桌面端：`npm test` 基线 **8 passed / 0 failed**（其中 update-run.test.cjs 31 项在 WorkBuddy 代理沙箱下会因 `.asar` 写入被拦而中断，`env -u NODE_OPTIONS node` 直跑 31/31 通过，属运行环境问题）。
+- 控制面：真实 stdio `tools/list` = **20 个工具**（源码契约 `tests/control_plane_contract.rs` 断言同数；2026-09-25 实测）。
 - 转写链路：58 分钟 B站视频在纯 CPU + `small` 模型下约 26 分钟完成转写，产出 `.转写.txt` + `.转写.json`，证明转写链路可产出真实文件。
 - 监控源失败冷却：已实盘证实 `consecutive_fails` 跨轮累加（不是永远停 1）；进入冷却阈值后的跳过行为以现场数据为准。
 

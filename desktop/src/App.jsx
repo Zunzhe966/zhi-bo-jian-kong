@@ -147,8 +147,6 @@ export default function App() {
         senderName: pickCfg(push, '发件人显示昵称', '尊者直播监控'),
         toEmail: pickCfg(push, '收件人邮箱'),
         authCode: '',
-        serverChanKey: '',
-        pushplusToken: '',
         transcribeEnabled: pickCfg(tx, '是否启用转写(是/否)', '是') !== '否',
         whisperModel: pickCfg(tx, 'whisper模型', 'base'),
         pipelineTimeout: pickCfg(fupanCfg['fupan_config.ini']?.['复盘'] || {}, '任务超时秒数', '21600'),
@@ -173,12 +171,9 @@ export default function App() {
       const v = await emailForm.validateFields()
       const login = v.loginEmail?.trim()
       const sender = (v.senderEmail || login)?.trim()
-      // 开播推送渠道：邮箱 + （配了 PushPlus 就加上，让直播开播也走抗代理通道）
-      const channels = []
-      if (login) channels.push('邮箱')
-      if (v.pushplusToken?.trim()) channels.push('PUSHPLUS')
+      // 通知渠道只留邮箱（微信/Server酱/pushplus 已按需求裁掉，入口不再提供）
       const pairs = [
-        ['直播状态推送渠道', channels.join(',') || '邮箱'],
+        ['直播状态推送渠道', '邮箱'],
         ['smtp邮件服务器', v.smtpHost || 'smtp.qq.com'],
         ['是否使用SMTP服务SSL加密(是/否)', '是'],
         ['SMTP邮件服务器端口', String(v.smtpPort || 465)],
@@ -193,12 +188,6 @@ export default function App() {
       }
       if (v.authCode?.trim()) {
         await window.desktop.cli('set-config', 'config', '推送配置', '发件人密码(授权码)', v.authCode.trim())
-      }
-      if (v.serverChanKey?.trim()) {
-        await window.desktop.cli('set-config', 'config', '推送配置', 'server酱SendKey', v.serverChanKey.trim())
-      }
-      if (v.pushplusToken?.trim()) {
-        await window.desktop.cli('set-config', 'config', '推送配置', 'pushplus推送token', v.pushplusToken.trim())
       }
       await window.desktop.cli('set-config', 'fupan_config', '转写', '是否启用转写(是/否)', v.transcribeEnabled ? '是' : '否')
       if (v.whisperModel) {
@@ -425,6 +414,10 @@ export default function App() {
     setLoading(true)
     try {
       await window.desktop.cli('add-live', url, v.remarks ? `主播: ${v.remarks}` : '', v.quality || '')
+      // 表单里的「通知方式」不再静默丢弃：非「跟随全局」时走 set-notify 落配置
+      if (v.notify && v.notify !== '跟随全局') {
+        await setItemNotify(url, v.notify, v.remarks || '')
+      }
       await ensureStarted()
       message.success('已添加直播监控')
       setAddOpen(false)
@@ -599,11 +592,15 @@ export default function App() {
     try {
       if (itemSettingsType === 'live') {
         const remark = v.name ? `主播: ${v.name}` : ''
-        if (v.enabled) {
-          await window.desktop.cli('add-live', v.url, remark, v.quality || '', v.notify || '跟随全局')
-        } else {
-          await window.desktop.cli('add-live', v.url, remark, v.quality || '', v.notify || '跟随全局')
+        // add-live 只收 URL/NAME/QUALITY 三个参数（1.6.6 踩过坑：多传 notify 必报错）；
+        // 通知通道走独立的 set-notify 命令。
+        await window.desktop.cli('add-live', v.url, remark, v.quality || '')
+        if (!v.enabled) {
           await window.desktop.cli('remove-live', v.url)
+        }
+        const nextNotify = v.notify || '跟随全局'
+        if (nextNotify !== (itemSettingsRow?.notify || '跟随全局')) {
+          await setItemNotify(v.url, nextNotify, v.name || '')
         }
       } else {
         await window.desktop.cli('add-video', v.url, v.name, v.autoDownload ? '是' : '否', v.notify || '跟随全局')
@@ -971,6 +968,7 @@ export default function App() {
             rows.length ? (
               <div className="card-grid">{rows.map((r) => (
                 <LiveCard key={r.key} row={r} platformIcon={platformIcon} platformLabel={platformLabel}
+                  platformCred={status?.platform_credentials}
                   onToggle={toggleLive} onSettings={openItemSettings}
                   onOpenStash={openItemStash} onDetail={openItemDetail} />
               ))}</div>

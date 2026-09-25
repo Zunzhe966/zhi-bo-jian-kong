@@ -35,8 +35,6 @@ CONFIG_SCHEMA = {
             '发件人显示昵称': '邮件显示名',
             '收件人邮箱': '通知收件人',
             '开播推送开启(是/否)': '是/否',
-            'server酱SendKey': 'Server酱³ SendKey，推微信，走443不怕代理（secret）',
-            'pushplus_token': 'PushPlus token，走443不怕代理（secret）',
             'bark推送接口链接': 'iOS Bark 推送地址',
             'ntfy推送地址': 'ntfy 订阅地址',
         },
@@ -51,18 +49,7 @@ CONFIG_SCHEMA = {
             'whisper模型': 'tiny/base/small/medium/large-v3',
             '运行设备': 'auto/cpu/cuda',
         },
-        '知识提炼': {
-            '是否启用知识提炼(是/否)': '是/否',
-            'api地址': 'OpenAI 兼容 API（由连接的智能体配置）',
-            'api密钥': 'API Key（secret，由智能体配置）',
-            '模型': '模型名',
-        },
-        '切片': {
-            '是否启用切片(是/否)': '是/否',
-            '最多片段数': '整数',
-        },
         '复盘邮件': {
-            '录制完成后发送复盘笔记(是/否)': '是/否',
             '发现新视频时发送通知(是/否)': '是/否',
         },
         '视频监控': {

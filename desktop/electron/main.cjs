@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Tray, Menu, globalShortcut, ipcMain, shell, nativeImage, Notification, protocol, net } = require('electron')
+const { app, BrowserWindow, Tray, Menu, ipcMain, shell, nativeImage, Notification, protocol, net } = require('electron')
 const path = require('path')
 const { pathToFileURL } = require('url')
 const { spawn } = require('child_process')
@@ -234,7 +234,6 @@ const ICON_ICO = path.join(ASSETS, 'icon.ico')
 const ICON_PNG = path.join(ASSETS, 'icon.png')
 const ICON_TRAY = path.join(ASSETS, 'icon-32.png')
 const APP_NAME = '尊者直播监控'
-const HOTKEY = 'Control+Shift+L'
 
 // 必须在 app ready 之前声明特权 scheme，之后才能用 protocol.handle 接管它。
 protocol.registerSchemesAsPrivileged([
@@ -268,7 +267,8 @@ const STATUS_CACHE_TTL_MS = 60000
 // 否则界面点“添加/下载/复盘”后可能继续显示旧快照。
 const STATUS_INVALIDATING_COMMANDS = new Set([
   'add-live', 'remove-live', 'delete-live', 'record-live',
-  'add-video', 'remove-video', 'download-video', 'video-download',
+  'add-video', 'remove-video', 'download-video',
+  'monitor-add', 'monitor-remove', 'monitor-set', 'check-now',
   'process', 'check-videos', 'ensure-services', 'start', 'stop',
   'wizard-done', 'set-app-prefs', 'set-config', 'set-config-bulk',
 ])
@@ -600,8 +600,6 @@ function createTray() {
     { label: '检查更新…', click: () => { checkForUpdateInteractive().catch((e) => console.warn('[check-update]', e.message)) } },
     { label: '打开 releases 文件夹', click: () => { shell.openPath(releasesDir()) } },
     { type: 'separator' },
-    { label: `快捷键 ${HOTKEY}`, enabled: false },
-    { type: 'separator' },
     { label: '退出', click: () => { app.isQuitting = true; app.quit() } },
   ])
   tray.setContextMenu(menu)
@@ -829,7 +827,10 @@ app.whenReady().then(async () => {
     'add-live', 'remove-live', 'delete-live', 'check-live',
     // 视频源管理
     'add-video', 'remove-video', 'blogger-videos', 'download-video',
-    'download-videos', 'check-videos', 'video-download', 'process',
+    'download-videos', 'check-videos', 'process',
+    // 统一监控主命令（产品手册第 5 章；前端迁移后旧 add-*/remove-* 逐步退役）
+    'monitor-add', 'monitor-remove', 'monitor-list', 'monitor-set',
+    'check-now', 'anchor-search',
     // 状态与配置
     'status', 'get-config', 'set-config', 'get-app-prefs', 'set-app-prefs',
     'set-notify',

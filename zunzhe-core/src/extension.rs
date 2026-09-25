@@ -217,10 +217,7 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
             &json!({"ok":true,"live":watch.list_live(),"video":watch.list_video()}),
         )?),
         "monitor_add" => {
-            let url = args
-                .get("url")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
+            let url = args.get("url").and_then(|v| v.as_str()).unwrap_or_default();
             let name = args
                 .get("name")
                 .and_then(|v| v.as_str())
@@ -239,6 +236,9 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
                 || lower.contains("/user/");
             let mut added_live = false;
             let mut added_video = false;
+            // 抖音主页链接的直播自动挂载结果说明：成功为空串，失败/跳过为可读原因。
+            // 绝不静默——挂不上必须让调用方知道，否则用户以为直播也在监控。
+            let mut douyin_live_note = String::new();
             if live_domain && !video_domain {
                 let remark = if name.is_empty() { url } else { name };
                 watch.add_live(url, &format!("主播: {remark}"), "")?;
@@ -247,14 +247,27 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
                 // 抖音主页链接：顺带解析抖音号，把直播监控也挂上
                 // （DouyinLiveRecorder 同款：live.douyin.com/{抖音号}，免登录检测）
                 if lower.contains("douyin.com/user") {
-                    if let Ok(info) = crate::platform::douyin_unique_id_from_url(url, project_dir).await {
-                        if let Some(uid) = info.get("unique_id").and_then(|v| v.as_str()) {
+                    match crate::platform::douyin_unique_id_from_url(url, project_dir).await {
+                        Ok(info) => {
+                            let uid = info.get("unique_id").and_then(|v| v.as_str()).unwrap_or("");
                             if !uid.is_empty() && uid != "0" {
                                 let live_url = format!("https://live.douyin.com/{uid}");
-                                let lname = if name.is_empty() { live_url.clone() } else { name.to_string() };
+                                let lname = if name.is_empty() {
+                                    live_url.clone()
+                                } else {
+                                    name.to_string()
+                                };
                                 watch.add_live(&live_url, &format!("主播: {lname}"), "")?;
                                 added_live = true;
+                            } else {
+                                douyin_live_note =
+                                    "解析到的抖音号为空，未自动挂直播监控".to_string();
                             }
+                        }
+                        Err(e) => {
+                            douyin_live_note = format!(
+                                "抖音号解析失败，未自动挂直播监控: {e}；可改用 live.douyin.com/抖音号 链接再添加一次"
+                            );
                         }
                     }
                 }
@@ -271,14 +284,11 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
                 added_video = true;
             }
             Ok(serde_json::to_string(
-                &json!({"ok":true,"url":url,"name":name,"added_live":added_live,"added_video":added_video,"hint":"daemon 运行中会自动检测；短视频需 视频监控列表.ini 与平台 cookie"}),
+                &json!({"ok":true,"url":url,"name":name,"added_live":added_live,"added_video":added_video,"douyin_live_note":douyin_live_note,"hint":"daemon 运行中会自动检测；短视频需 视频监控列表.ini 与平台 cookie"}),
             )?)
         }
         "monitor_remove" => {
-            let url = args
-                .get("url")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
+            let url = args.get("url").and_then(|v| v.as_str()).unwrap_or_default();
             let removed_live = watch.remove_live(url)?;
             let removed_video = watch.remove_video(url)?;
             Ok(serde_json::to_string(
@@ -286,10 +296,7 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
             )?)
         }
         "monitor_set" => {
-            let url = args
-                .get("url")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
+            let url = args.get("url").and_then(|v| v.as_str()).unwrap_or_default();
             let key = args.get("key").and_then(|v| v.as_str()).unwrap_or_default();
             let value = args
                 .get("value")
@@ -308,10 +315,14 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
                 .any(|i| i.url.trim() == url.trim());
             if is_live {
                 let changed = watch.set_live(url, key, value)?;
-                Ok(serde_json::to_string(&json!({"ok":true,"kind":"live","url":url,"key":key,"value":value,"changed":changed}))?)
+                Ok(serde_json::to_string(
+                    &json!({"ok":true,"kind":"live","url":url,"key":key,"value":value,"changed":changed}),
+                )?)
             } else if is_video {
                 let changed = watch.set_video(url, key, value)?;
-                Ok(serde_json::to_string(&json!({"ok":true,"kind":"video","url":url,"key":key,"value":value,"changed":changed}))?)
+                Ok(serde_json::to_string(
+                    &json!({"ok":true,"kind":"video","url":url,"key":key,"value":value,"changed":changed}),
+                )?)
             } else {
                 anyhow::bail!("监控源不存在: {url}（先 monitor_list 确认）");
             }
@@ -321,11 +332,8 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
             let cookie = cfg.get_main("Cookie", "b站cookie");
             let mut rooms = Vec::new();
             for room in watch.list_live() {
-                let adapter = crate::live_monitor::resolve_live_for_project(
-                    &room.url,
-                    project_dir,
-                    &cookie,
-                );
+                let adapter =
+                    crate::live_monitor::resolve_live_for_project(&room.url, project_dir, &cookie);
                 match adapter.check(&room.url).await {
                     Ok(s) => rooms.push(json!({
                         "url": room.url,
@@ -532,9 +540,9 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
         "check_update" => Ok(serde_json::to_string(&crate::updater::check_update(
             project_dir,
         ))?),
-        "apply_update" => Ok(serde_json::to_string(
-            &crate::updater::request_update(project_dir)?,
-        )?),
+        "apply_update" => Ok(serde_json::to_string(&crate::updater::request_update(
+            project_dir,
+        )?)?),
         _ => anyhow::bail!("工具未实现: {name}"),
     }
 }
@@ -546,7 +554,11 @@ mod tests {
     #[test]
     fn tools_list_has_unique_names_and_required_args() {
         let tools = tools_list();
-        assert_eq!(tools.len(), 20, "源码控制面必须暴露 20 个工具（产品手册第 6 章）");
+        assert_eq!(
+            tools.len(),
+            20,
+            "源码控制面必须暴露 20 个工具（产品手册第 6 章）"
+        );
         let mut names = std::collections::HashSet::new();
         for tool in &tools {
             let name = tool["name"].as_str().unwrap_or_default();

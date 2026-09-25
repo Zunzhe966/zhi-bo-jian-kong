@@ -1,5 +1,5 @@
 import React, { useState } from 'react'
-import { Button, Form, Input, Modal, Steps, Switch, message } from 'antd'
+import { Button, Form, Modal, Steps, Switch, message } from 'antd'
 
 export default function SetupWizard({ open, onDone }) {
   const [step, setStep] = useState(0)
@@ -10,9 +10,6 @@ export default function SetupWizard({ open, onDone }) {
     setSaving(true)
     try {
       const v = form.getFieldsValue()
-      if (v.serverChanKey?.trim()) {
-        await window.desktop.cli('set-config', 'config', '推送配置', 'server酱SendKey', v.serverChanKey.trim())
-      }
       await window.desktop.cli('set-app-prefs', JSON.stringify({
         autoStartServices: v.autoStartServices !== false,
         watchdog: v.watchdog !== false,
@@ -41,7 +38,7 @@ export default function SetupWizard({ open, onDone }) {
           <p>欢迎使用 <b>尊者直播监控</b>。下面 30 秒完成基础配置即可开始用。</p>
           <ul style={{ paddingLeft: 20, lineHeight: 1.8 }}>
             <li>后台会自动监控直播开播 & 博主新视频</li>
-            <li>重要主播可单独设「微信通知」</li>
+            <li>新视频/开播时发邮件通知（稍后在「全局设置」里配邮箱）</li>
             <li>服务崩溃会自动拉起（可关）</li>
           </ul>
         </div>
@@ -52,13 +49,10 @@ export default function SetupWizard({ open, onDone }) {
       content: (
         <>
           <p style={{ color: '#94a3b8', marginBottom: 12 }}>
-            推荐 Server酱 推微信（免费每天约 5 条）。代理环境下比邮件可靠。
+            通知只走邮箱。完成向导后到「全局设置 → 邮箱推送」填 QQ 邮箱和 SMTP 授权码即可；这里先决定要不要桌面通知兜底。
           </p>
           <Form form={form} layout="vertical" initialValues={{ localNotify: true }}>
-            <Form.Item label="Server酱 SendKey（可选，稍后可在全局设置里填）" name="serverChanKey">
-              <Input.Password placeholder="SCTxxxxxxxx..." />
-            </Form.Item>
-            <Form.Item label="同时弹出 桌面通知（兜底）" name="localNotify" valuePropName="checked">
+            <Form.Item label="同时弹出 桌面通知（远程推送失败时的兜底）" name="localNotify" valuePropName="checked">
               <Switch defaultChecked />
             </Form.Item>
           </Form>

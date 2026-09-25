@@ -76,7 +76,7 @@ enum Command {
     ListAnchors,
     /// 检查单个直播间监控状态
     CheckLive { url: String },
-    /// 设置某监控项通知通道（跟随全局/邮箱/微信/不通知）
+    /// 设置某监控项通知通道（跟随全局/邮箱/不通知）
     SetNotify {
         url: String,
         #[arg(default_value = "跟随全局")]
@@ -347,22 +347,12 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 let _ = watch.add_live(&url, &format!("主播: {name}"), &quality);
                 added_live = true;
             } else if video_domain && !live_domain {
-                watch.add_video(
-                    &url,
-                    if name.is_empty() { &url } else { &name },
-                    None,
-                    None,
-                )?;
+                watch.add_video(&url, if name.is_empty() { &url } else { &name }, None, None)?;
                 added_video = true;
             } else {
                 let _ = watch.add_live(&url, &format!("主播: {name}"), &quality);
                 added_live = true;
-                watch.add_video(
-                    &url,
-                    if name.is_empty() { &url } else { &name },
-                    None,
-                    None,
-                )?;
+                watch.add_video(&url, if name.is_empty() { &url } else { &name }, None, None)?;
                 added_video = true;
             }
             println!(
@@ -413,11 +403,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             let cookie = cfg.get_main("Cookie", "b站cookie");
             let mut rooms = Vec::new();
             for room in watch.list_live() {
-                let adapter = live_monitor::resolve_live_for_project(
-                    &room.url,
-                    &cfg.project_dir,
-                    &cookie,
-                );
+                let adapter =
+                    live_monitor::resolve_live_for_project(&room.url, &cfg.project_dir, &cookie);
                 match adapter.check(&room.url).await {
                     Ok(s) => rooms.push(json!({
                         "url": room.url,

@@ -190,6 +190,61 @@ assert.deepStrictEqual(
   `界面会调用但被白名单拒绝的命令（点了必报错）：${blocked.join(', ')}`,
 )
 
+// 4b. 反向核对：白名单里的每条命令必须真实存在于 Rust CLI。
+//     2026-09-25 的实例：白名单挂着 video-download，CLI 根本没这个子命令，
+//     而上面的单向核对测不出来。真值来源 = 二进制 --help；二进制不存在时
+//     （纯前端环境）降级为跳过并告警，不误伤。
+{
+  const { execFileSync } = require('child_process')
+  const coreDir = path.join(__dirname, '..', '..', 'zunzhe-core', 'target')
+  const exe = ['release', 'debug']
+    .map((profile) => path.join(coreDir, profile, process.platform === 'win32' ? 'zunzhe-core.exe' : 'zunzhe-core'))
+    .find((p) => fs.existsSync(p))
+  if (!exe) {
+    console.warn('[smoke] 未找到 zunzhe-core 二进制，跳过「白名单⊆CLI」核对')
+  } else {
+    const help = execFileSync(exe, ['--help'], { encoding: 'utf8' })
+    const cmdSection = help.split(/\n\s*Options:/)[0]
+    const realCmds = new Set(
+      [...cmdSection.matchAll(/^\s{2}([a-z][a-z0-9-]*)\s{2,}/gm)].map((m) => m[1]),
+    )
+    assert.ok(realCmds.size >= 15, `从 --help 解析出的子命令偏少（${realCmds.size}），疑似解析规则失效`)
+    const ghosts = [...allowed].filter((c) => !realCmds.has(c))
+    assert.deepStrictEqual(
+      ghosts, [],
+      `白名单里挂着 CLI 不存在的死命令（调用必报 unrecognized subcommand）：${ghosts.join(', ')}`,
+    )
+  }
+}
+
+// 4c. add-live 只收 URL/NAME/QUALITY 三个参数。
+//     1.6.6 修过一次、1.6.8 又在另两处复发（多传 notify 必报错
+//     "unexpected argument"）。通知通道必须走独立的 set-notify。
+{
+  const appText = fs.readFileSync(path.join(srcDir, 'App.jsx'), 'utf8')
+  const calls = [...appText.matchAll(/cli\(\s*'add-live'[^)]*\)/g)].map((m) => m[0])
+  assert.ok(calls.length >= 2, `应至少有两处 add-live 调用（添加/保存设置），实际 ${calls.length}`)
+  for (const call of calls) {
+    const stripped = call.replace(/'[^']*'|"[^"]*"|`[^`]*`/g, "''")
+    const commas = (stripped.match(/,/g) || []).length
+    assert.ok(
+      commas <= 3,
+      `add-live 调用参数超过 3 个（命令名后至多 3 个位置参数）：${call}`,
+    )
+  }
+}
+
+// 4d. mojibake 防护网：「鏍」「锛」是 UTF-8 被 GBK 双重编码的标志性残片，
+//     正常中文文案永远不会用到。LogsPanel.jsx 曾整文件中招且测试全绿。
+for (const name of fs.readdirSync(srcDir)) {
+  if (!name.endsWith('.jsx') && !name.endsWith('.js')) continue
+  const text = fs.readFileSync(path.join(srcDir, name), 'utf8')
+  assert.ok(
+    !/[鏍锛]/.test(text),
+    `${name} 含 GBK 双重编码乱码残片（鏍/锛），界面文案会显示为乱码`,
+  )
+}
+
 // 5. 「运行日志」必须默认打开真正在写入的 Rust 核心日志。
 //    launchd/开发态都把 zunzhe-core.log 作为主日志；旧 Python 服务日志
 //    只保留为可切换历史。默认值若退回 live_monitor，用户会看到空日志，

@@ -19,7 +19,7 @@ export default function AddModals({
             <Select options={platformOptions} />
           </Form.Item>
           <Form.Item label="链接/频道ID" name="channelId" rules={[{ required: true, message: '请输入' }]}
-            extra="底层支持 40+ 平台，直接粘贴直播间链接；智能体请通过 MCP/CLI 连接，不必在此配置大模型">
+            extra="支持 B站/抖音/快手直播，直接粘贴直播间链接；智能体请通过 MCP/CLI 连接，不必在此配置大模型">
             <Input placeholder="直播间链接，或抖音号（如 xiguahaochi96，自动解析）" />
           </Form.Item>
           <Form.Item label="主播名/备注" name="remarks" rules={[{ required: true, message: '请输入' }]}>
@@ -29,7 +29,7 @@ export default function AddModals({
             <Select options={qualityOptions} />
           </Form.Item>
           <Form.Item label="通知方式" name="notify"
-            extra="重要的选「微信」；不重要的选「邮箱」或「不通知」，省 Server酱 每天 5 条额度">
+            extra="默认跟随全局（全局渠道为邮箱）；可单独指定「邮箱」或「不通知」">
             <Select options={notifyOptions} />
           </Form.Item>
         </Form>
@@ -49,7 +49,7 @@ export default function AddModals({
             <Switch />
           </Form.Item>
           <Form.Item label="通知方式" name="notify"
-            extra="重要的选「微信」；一般博主选「邮箱」或「不通知」">
+            extra="默认跟随全局（全局渠道为邮箱）；可单独指定「邮箱」或「不通知」">
             <Select options={notifyOptions} />
           </Form.Item>
         </Form>

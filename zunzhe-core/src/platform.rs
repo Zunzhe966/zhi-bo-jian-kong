@@ -734,7 +734,10 @@ impl BilibiliAdapter {
                 }
             }
         }
-        (Vec::new(), format!("RSSHub 全部实例失败: {}", failures.join("；")))
+        (
+            Vec::new(),
+            format!("RSSHub 全部实例失败: {}", failures.join("；")),
+        )
     }
 
     async fn upload_ids_ytdlp(&self, mid: &str, count: u32) -> (Vec<String>, String) {
@@ -1425,20 +1428,18 @@ impl Platform for DouyinAdapter {
     }
 }
 
-/// 带项目根的平台注册表：yt-dlp 兜底按项目 .venv 查找，跨目录运行也可用。
+// 带项目根的平台注册表：yt-dlp 兜底按项目 .venv 查找，跨目录运行也可用。
 
-/// 按名字搜索主播（P4 起点：B 站搜索接口基础版；抖音 sec_uid 搜索后续完善）。
+/// 从抖音主页 URL 解析抖音号（unique_id）——供 monitor_add 把直播监控一并挂上。
 ///
-/// 返回结构：`{ok, candidates: [{platform, name, url, mid?, room_id?, sign?, hint?}]}`
-/// - B 站：`api.bilibili.com/x/web-interface/search/type?search_type=bili_user`
-///   风控（-352/412）时返回明确错误而不是静默空结果。
-/// 从抖音主页 URL 解析抖音号（unique_id）——headless 打开主页，拦截 profile/other
-/// 接口（页面自带签名，免登录）。供 monitor_add 把直播监控一并挂上。
+/// 走 iesdouyin 公开 user/info 接口：免登录、免签名、免浏览器
+/// （2026-09-25 实测两个在监 sec_uid 均正确返回 unique_id）。
+/// 旧方案（patchright headless Chrome 拦截 profile/other 接口）已被抖音
+/// JSVM 验证页干掉——页面不再自发请求该接口，脚本恒超时，已弃用。
 pub async fn douyin_unique_id_from_url(
     url: &str,
-    project_dir: &std::path::Path,
+    _project_dir: &std::path::Path,
 ) -> anyhow::Result<serde_json::Value> {
-    use tokio::process::Command;
     let sec_uid = url
         .split("/user/")
         .nth(1)
@@ -1449,24 +1450,64 @@ pub async fn douyin_unique_id_from_url(
     if sec_uid.is_empty() || !sec_uid.starts_with("MS4wLjAB") {
         anyhow::bail!("抖音主页链接缺少有效 sec_uid");
     }
-    let script = project_dir.join("scripts").join("douyin_live_status.js");
-    let out = Command::new("node")
-        .arg(&script)
-        .arg(&sec_uid)
-        .current_dir(project_dir)
-        .output()
+    let client = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15")
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .context("构建 HTTP 客户端失败")?;
+    let api = format!("https://www.iesdouyin.com/web/api/v2/user/info/?sec_uid={sec_uid}");
+    let resp = client
+        .get(&api)
+        .send()
         .await
-        .context("运行 douyin_live_status.js 失败")?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        anyhow::bail!("抖音号解析失败: {}", stderr.chars().take(200).collect::<String>());
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let v: serde_json::Value = serde_json::from_str(stdout.trim())
-        .with_context(|| format!("解析抖音号脚本输出失败: {}", stdout.chars().take(200).collect::<String>()))?;
-    Ok(v)
+        .context("请求抖音用户信息接口失败")?;
+    let value: serde_json::Value = resp
+        .json()
+        .await
+        .context("抖音用户信息接口返回非 JSON（可能被风控）")?;
+    let (unique_id, nickname) = parse_iesdouyin_user_info(&value)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "unique_id": unique_id,
+        "nickname": nickname,
+    }))
 }
 
+/// 解析 iesdouyin user/info 响应，抽出（unique_id, nickname）。纯函数便于测试。
+fn parse_iesdouyin_user_info(value: &serde_json::Value) -> anyhow::Result<(String, String)> {
+    let status_code = value
+        .get("status_code")
+        .and_then(|c| c.as_i64())
+        .unwrap_or(-1);
+    if status_code != 0 {
+        anyhow::bail!("抖音用户信息接口返回错误 status_code={status_code}");
+    }
+    let info = value
+        .get("user_info")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let unique_id = info
+        .get("unique_id")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let nickname = info
+        .get("nickname")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    if unique_id.is_empty() || unique_id == "0" {
+        anyhow::bail!("抖音用户信息接口未返回有效 unique_id（用户不存在或接口变更）");
+    }
+    Ok((unique_id, nickname))
+}
+
+/// 按名字搜索主播（P4 起点：B 站搜索接口基础版；抖音 sec_uid 搜索后续完善）。
+///
+/// 返回结构：`{ok, candidates: [{platform, name, url, mid?, room_id?, sign?, hint?}]}`
+/// - B 站：`api.bilibili.com/x/web-interface/search/type?search_type=bili_user`
+///   风控（-352/412）时返回明确错误而不是静默空结果。
 /// - 抖音：当前返回提示条目，等 P4 接入 sec_uid 搜索。
 pub async fn search_anchor(
     name: &str,
@@ -1499,7 +1540,9 @@ pub async fn search_anchor(
             .and_then(|v| v.as_str())
             .unwrap_or("未知错误")
             .to_string();
-        anyhow::bail!("B站搜索被风控（code={code}，{msg}）。可稍后再试或直接提供主页 URL 给 monitor_add");
+        anyhow::bail!(
+            "B站搜索被风控（code={code}，{msg}）。可稍后再试或直接提供主页 URL 给 monitor_add"
+        );
     }
     let mut candidates = Vec::new();
     if let Some(users) = resp.pointer("/data/result").and_then(|v| v.as_array()) {
@@ -1534,7 +1577,10 @@ pub async fn search_anchor(
             )
             .header(reqwest::header::REFERER, "https://www.douyin.com/");
         let dy_resp: serde_json::Value = dy_req.send().await?.json().await?;
-        let dy_code = dy_resp.get("status_code").and_then(|v| v.as_i64()).unwrap_or(-1);
+        let dy_code = dy_resp
+            .get("status_code")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(-1);
         if dy_code == 0 {
             let mut dy_count = 0usize;
             collect_douyin_users(&dy_resp, &mut candidates, &mut dy_count);
@@ -1564,7 +1610,6 @@ pub async fn search_anchor(
     }
     Ok(json!({"ok": true, "count": candidates.len(), "candidates": candidates}))
 }
-
 
 /// 从抖音搜索响应中宽松收集用户条目（字段结构因接口版本而异，递归扫描）。
 fn collect_douyin_users(
@@ -1623,6 +1668,34 @@ pub fn resolve_with_project_dir(url: &str, project_dir: &Path) -> Box<dyn Platfo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn iesdouyin_user_info_parses_unique_id() {
+        // 2026-09-25 实测响应结构（关立新 / 侯翠翠两个在监 sec_uid 均为此形态）
+        let v = serde_json::json!({
+            "status_code": 0,
+            "user_info": {"nickname": "侯翠翠", "unique_id": "xiguahaochi96", "short_id": "0"}
+        });
+        let (uid, nick) = parse_iesdouyin_user_info(&v).unwrap();
+        assert_eq!(uid, "xiguahaochi96");
+        assert_eq!(nick, "侯翠翠");
+    }
+
+    #[test]
+    fn iesdouyin_user_info_rejects_error_status() {
+        let v = serde_json::json!({"status_code": 8, "user_info": {}});
+        assert!(parse_iesdouyin_user_info(&v).is_err());
+    }
+
+    #[test]
+    fn iesdouyin_user_info_rejects_empty_unique_id() {
+        // 用户未设抖音号 / 接口变更 / 用户不存在：必须报错而不是挂上 live.douyin.com/ 空地址
+        let v =
+            serde_json::json!({"status_code": 0, "user_info": {"nickname": "x", "unique_id": ""}});
+        assert!(parse_iesdouyin_user_info(&v).is_err());
+        let v2 = serde_json::json!({"status_code": 0, "user_info": {"nickname": "x"}});
+        assert!(parse_iesdouyin_user_info(&v2).is_err());
+    }
 
     #[test]
     fn merge_cookie_headers_keeps_login_state_and_appends_fingerprint() {
