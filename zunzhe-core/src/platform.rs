@@ -1588,6 +1588,76 @@ pub async fn douyin_unique_id_from_url(
 
 /// 解析 iesdouyin user/info 响应，抽出（unique_id, nickname）。纯函数便于测试。
 fn parse_iesdouyin_user_info(value: &serde_json::Value) -> anyhow::Result<(String, String)> {
+    let (_, unique_id, nickname) = parse_iesdouyin_user_info_full(value)?;
+    if unique_id.is_empty() || unique_id == "0" {
+        anyhow::bail!("抖音用户信息接口未返回有效 unique_id（用户不存在或接口变更）");
+    }
+    Ok((unique_id, nickname))
+}
+
+/// 判断输入是否为裸抖音号（如 Glx6768、xiguahaochi96）：
+/// 不是 URL、不含路径/空白、不是纯数字（纯数字按 B站 room/space ID 处理）。
+pub fn looks_like_douyin_id(input: &str) -> bool {
+    let v = input.trim();
+    if v.is_empty() || v.len() > 64 {
+        return false;
+    }
+    if v.contains("://") || v.contains('/') || v.contains(char::is_whitespace) {
+        return false;
+    }
+    if v.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    v.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+/// 抖音号（unique_id）→ (sec_uid, 昵称)。
+/// iesdouyin 公开 user/info 接口直接吃 unique_id：免登录、免签名、免浏览器
+/// （2026-09-26 实测 Glx6768→关立新、xiguahaochi96→侯翠翠 均命中 sec_uid）。
+/// 这取代了已弃用的 patchright Chrome 反查（被风控、150 秒超时把前端拖死）。
+pub async fn douyin_user_info_by_douyin_id(douyin_id: &str) -> anyhow::Result<(String, String)> {
+    let id = douyin_id.trim();
+    let client = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15")
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .context("构建 HTTP 客户端失败")?;
+    let api = format!("https://www.iesdouyin.com/web/api/v2/user/info/?unique_id={id}");
+    let resp = client
+        .get(&api)
+        .send()
+        .await
+        .context("请求抖音用户信息接口失败")?;
+    let value: serde_json::Value = resp
+        .json()
+        .await
+        .context("抖音用户信息接口返回非 JSON（可能被风控）")?;
+    let (sec_uid, _, nickname) = parse_iesdouyin_user_info_full(&value)?;
+    if sec_uid.is_empty() {
+        anyhow::bail!("抖音号不存在或接口未返回 sec_uid: {id}");
+    }
+    Ok((sec_uid, nickname))
+}
+
+/// 裸抖音号 → (直播间 URL, 主页 URL, 昵称)。添加流程的统一解析入口：
+/// 直播走 live.douyin.com/{抖音号}（免登录检测），短视频走主页 sec_uid。
+pub async fn resolve_douyin_id_to_urls(
+    douyin_id: &str,
+) -> anyhow::Result<(String, String, String)> {
+    let id = douyin_id.trim();
+    let (sec_uid, nickname) = douyin_user_info_by_douyin_id(id).await?;
+    Ok((
+        format!("https://live.douyin.com/{id}"),
+        format!("https://www.douyin.com/user/{sec_uid}"),
+        nickname,
+    ))
+}
+
+/// 解析 iesdouyin user/info 响应，抽出（sec_uid, unique_id, nickname）。纯函数便于测试。
+fn parse_iesdouyin_user_info_full(
+    value: &serde_json::Value,
+) -> anyhow::Result<(String, String, String)> {
     let status_code = value
         .get("status_code")
         .and_then(|c| c.as_i64())
@@ -1599,6 +1669,12 @@ fn parse_iesdouyin_user_info(value: &serde_json::Value) -> anyhow::Result<(Strin
         .get("user_info")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
+    let sec_uid = info
+        .get("sec_uid")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
     let unique_id = info
         .get("unique_id")
         .and_then(|x| x.as_str())
@@ -1610,10 +1686,10 @@ fn parse_iesdouyin_user_info(value: &serde_json::Value) -> anyhow::Result<(Strin
         .and_then(|x| x.as_str())
         .unwrap_or("")
         .to_string();
-    if unique_id.is_empty() || unique_id == "0" {
-        anyhow::bail!("抖音用户信息接口未返回有效 unique_id（用户不存在或接口变更）");
+    if sec_uid.is_empty() && (unique_id.is_empty() || unique_id == "0") {
+        anyhow::bail!("抖音用户信息接口未返回有效用户（用户不存在或接口变更）");
     }
-    Ok((unique_id, nickname))
+    Ok((sec_uid, unique_id, nickname))
 }
 
 /// 按名字搜索主播（P4 起点：B 站搜索接口基础版；抖音 sec_uid 搜索后续完善）。
@@ -1822,8 +1898,7 @@ mod tests {
         let v = serde_json::json!({
             "status_code": 0,
             "user_info": {"nickname": "侯翠翠", "unique_id": "xiguahaochi96", "short_id": "0"}
-        });
-        let (uid, nick) = parse_iesdouyin_user_info(&v).unwrap();
+        });        let (uid, nick) = parse_iesdouyin_user_info(&v).unwrap();
         assert_eq!(uid, "xiguahaochi96");
         assert_eq!(nick, "侯翠翠");
     }
@@ -1842,6 +1917,39 @@ mod tests {
         assert!(parse_iesdouyin_user_info(&v).is_err());
         let v2 = serde_json::json!({"status_code": 0, "user_info": {"nickname": "x"}});
         assert!(parse_iesdouyin_user_info(&v2).is_err());
+    }
+
+    #[test]
+    fn iesdouyin_user_info_full_parses_sec_uid() {
+        // 2026-09-26 实测 unique_id 查询响应（Glx6768 → 关立新）
+        let v = serde_json::json!({
+            "status_code": 0,
+            "user_info": {
+                "nickname": "关立新（早上7:00直播）",
+                "unique_id": "Glx6768",
+                "sec_uid": "MS4wLjABAAAAfRq5hAWoSxwYGwDEI-F3glR1hf7mdi87_S2y1bhL7OjOUkc_ETYzRq6QwGZ_qf2m"
+            }
+        });
+        let (sec_uid, unique_id, nickname) = parse_iesdouyin_user_info_full(&v).unwrap();
+        assert!(sec_uid.starts_with("MS4wLjAB"));
+        assert_eq!(unique_id, "Glx6768");
+        assert!(nickname.contains("关立新"));
+        // 用户不存在（user_info 为空）：full 解析必须报错，不许挂空主页
+        let empty = serde_json::json!({"status_code": 0, "user_info": {}});
+        assert!(parse_iesdouyin_user_info_full(&empty).is_err());
+    }
+
+    #[test]
+    fn looks_like_douyin_id_only_matches_bare_ids() {
+        assert!(looks_like_douyin_id("Glx6768"));
+        assert!(looks_like_douyin_id("xiguahaochi96"));
+        assert!(looks_like_douyin_id("a.b_c-d"));
+        // URL / 路径 / 纯数字（B站 ID）/ 空白 / 空串 都不是裸抖音号
+        assert!(!looks_like_douyin_id("https://live.douyin.com/Glx6768"));
+        assert!(!looks_like_douyin_id("live.douyin.com/Glx6768"));
+        assert!(!looks_like_douyin_id("24931109"));
+        assert!(!looks_like_douyin_id("张三 李四"));
+        assert!(!looks_like_douyin_id(""));
     }
 
     #[test]

@@ -332,6 +332,26 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     match cli.command {
         Command::MonitorAdd { url, name, quality } => {
+            // 裸抖音号（如 Glx6768）：iesdouyin 免登录解析成 直播间+主页 一起挂。
+            // 1.7.2 起替代前端浏览器反查（被风控、曾 150 秒超时把界面拖死）。
+            if platform::looks_like_douyin_id(&url) {
+                let (live_url, home_url, nickname) = platform::resolve_douyin_id_to_urls(&url)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "抖音号解析失败: {e:#}。请确认抖音号拼写；或改用主播主页链接"
+                        )
+                    })?;
+                let display = if name.is_empty() { &nickname } else { &name };
+                let _ = watch.add_live(&live_url, &format!("主播: {display}"), &quality);
+                watch.add_video(&home_url, display, None, None)?;
+                println!(
+                    "{}",
+                    json!({"ok": true, "url": url, "name": display, "resolved_live": live_url,
+                           "resolved_video": home_url, "added_live": true, "added_video": true})
+                );
+                return Ok(());
+            }
             let lower = url.to_lowercase();
             let live_domain = lower.contains("live.bilibili")
                 || lower.contains("live.kuaishou")
@@ -427,6 +447,24 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             println!("{}", serde_json::to_string(&result)?);
         }
         Command::AddLive { url, name, quality } | Command::AddAnchor { url, name, quality } => {
+            // 裸抖音号：拼 live.douyin.com/{抖音号} 并验证主播存在（免登录）
+            let (url, name) = if platform::looks_like_douyin_id(&url) {
+                let (live_url, _home, nickname) = platform::resolve_douyin_id_to_urls(&url)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "抖音号解析失败: {e:#}。请确认抖音号拼写；或直接粘贴直播间链接"
+                        )
+                    })?;
+                let remark = if name.is_empty() {
+                    format!("主播: {nickname}")
+                } else {
+                    name
+                };
+                (live_url, remark)
+            } else {
+                (url, name)
+            };
             let _ = watch.add_live(&url, &name, &quality);
             println!(
                 "{}",
@@ -522,6 +560,20 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             download,
             notify,
         } => {
+            // 裸抖音号：iesdouyin 免登录解析出主页（sec_uid）再挂短视频监控
+            let (url, name) = if platform::looks_like_douyin_id(&url) {
+                let (_live, home_url, nickname) = platform::resolve_douyin_id_to_urls(&url)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "抖音号解析失败: {e:#}。请确认抖音号拼写；或改用主播主页链接"
+                        )
+                    })?;
+                let vname = if name.is_empty() { nickname } else { name };
+                (home_url, vname)
+            } else {
+                (url, name)
+            };
             let url_for_opt = url.clone();
             let name_for_opt = name.clone();
             let download_opt = match download.as_str() {

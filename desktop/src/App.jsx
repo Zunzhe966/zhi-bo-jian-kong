@@ -394,20 +394,14 @@ export default function App() {
     }
   }
 
-  // 抖音号/平台ID → URL：非 URL 输入时优先按抖音号解析（解析成功返回主播主页，
-  // monitor_add 会把直播+短视频一起挂上）；失败走原 normalizeUrl 兜底（不打断 B站等平台）
-  const resolveAnchorIfNeeded = async (input, platform) => {
+  // 抖音号/平台ID → URL：纯数字按 B站 ID 拼地址；裸抖音号（如 Glx6768）原样传给
+  // CLI——1.7.2 起 Rust 侧用 iesdouyin 免登录接口解析（秒级），不再走 Chrome 浏览器
+  // 反查（被风控、曾 150 秒超时把「添加」按钮拖到卡死）。
+  const resolveAnchorIfNeeded = (input, platform) => {
     const v = String(input || '').trim()
     if (!v || /^https?:\/\//i.test(v)) return v
     if (/^\d+$/.test(v)) return normalizeUrl(v, platform)
-    const hide = message.loading('正在解析抖音号（最长 30 秒）…', 0)
-    const r = await window.desktop.resolveDouyinAnchor(v).catch(() => null)
-    hide()
-    if (r && r.ok) return r.url
-    // IPC 明确返回失败原因时直接抛出（比 normalizeUrl 兜出一条垃圾 URL 再报错清楚）；
-    // r 为 null（IPC 本身崩了）才走旧兜底，保住 B站等平台的兼容性。
-    if (r && r.error) throw new Error(r.error)
-    return normalizeUrl(v, platform)
+    return v
   }
 
   const onAddLive = async () => {
@@ -415,13 +409,15 @@ export default function App() {
     let url
     try { url = await resolveAnchorIfNeeded(v.channelId, v.providerId) }
     catch (e) { return message.error(String(e.message || e)) }
-    if (!url.startsWith('http')) return message.error('请输入有效的直播间地址或ID')
+    // 允许裸抖音号直达 CLI（Rust 侧免登录解析并验证）；CLI 失败会带可读原因抛回
+    if (!url) return message.error('请输入有效的直播间地址或ID')
     setLoading(true)
     try {
-      await window.desktop.cli('add-live', url, v.remarks ? `主播: ${v.remarks}` : '', v.quality || '')
-      // 表单里的「通知方式」不再静默丢弃：非「跟随全局」时走 set-notify 落配置
+      const r = await window.desktop.cli('add-live', url, v.remarks ? `主播: ${v.remarks}` : '', v.quality || '')
+      // 表单里的「通知方式」不再静默丢弃：非「跟随全局」时走 set-notify 落配置。
+      // 裸抖音号输入时 CLI 返回的 r.url 是解析后的直播间地址，通知要挂到那个地址上。
       if (v.notify && v.notify !== '跟随全局') {
-        await setItemNotify(url, v.notify, v.remarks || '')
+        await setItemNotify((r && r.url) || url, v.notify, v.remarks || '')
       }
       await ensureStarted()
       message.success('已添加直播监控')
@@ -439,20 +435,9 @@ export default function App() {
     const v = await videoForm.validateFields()
     setLoading(true)
     try {
-      // 非 URL 输入（抖音号）先自动解析成主播主页
-      let url = v.url.trim()
-      if (!/^https?:\/\//i.test(url) && !/^\d+$/.test(url)) {
-        const hide = message.loading('正在解析抖音号（最长 30 秒）…', 0)
-        const r = await window.desktop.resolveDouyinAnchor(url).catch(() => null)
-        hide()
-        // 解析失败要当场报真实原因并中止——不能拿原始输入硬闯 add-video，
-        // 否则用户先等 30 秒解析、再等 30 秒 CLI，最后看到一条看不懂的错。
-        if (!r || !r.ok) {
-          message.error((r && r.error) || '抖音号解析失败，请直接粘贴主播主页链接')
-          return
-        }
-        url = r.url
-      }
+      // 裸抖音号（如 Glx6768）原样传给 CLI——1.7.2 起 Rust 侧 iesdouyin 免登录
+      // 秒级解析，不再走 Chrome 浏览器反查（被风控、曾把界面拖到卡死）
+      const url = v.url.trim()
       await window.desktop.cli('add-video', url, v.name.trim(), v.autoDownload ? '是' : '否', v.notify || '跟随全局')
       await ensureStarted()
       message.success('已添加发布视频监控')

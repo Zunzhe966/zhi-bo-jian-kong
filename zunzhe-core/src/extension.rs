@@ -225,6 +225,19 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
             if url.trim().is_empty() {
                 anyhow::bail!("url 不能为空");
             }
+            // 裸抖音号（如 Glx6768）：iesdouyin 免登录解析，直播+短视频一起挂。
+            // 与 CLI monitor-add 同一链路（1.7.2 起）。
+            if crate::platform::looks_like_douyin_id(url) {
+                let (live_url, home_url, nickname) =
+                    crate::platform::resolve_douyin_id_to_urls(url).await?;
+                let display = if name.is_empty() { &nickname } else { name };
+                watch.add_live(&live_url, &format!("主播: {display}"), "")?;
+                watch.add_video(&home_url, display, None, None)?;
+                return Ok(serde_json::to_string(
+                    &json!({"ok":true,"url":url,"name":display,"resolved_live":live_url,
+                            "resolved_video":home_url,"added_live":true,"added_video":true}),
+                )?);
+            }
             let lower = url.to_lowercase();
             let live_domain = lower.contains("live.bilibili")
                 || lower.contains("live.kuaishou")

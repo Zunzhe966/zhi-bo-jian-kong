@@ -107,10 +107,16 @@ impl Watchlist {
         });
         if replaced {
             lines.iter_mut().for_each(|old| {
-                let old_url = parse_live_line(old).url;
-                if !old_url.is_empty() && old_url.trim_end_matches('/') == url.trim_end_matches('/')
+                let parsed = parse_live_line(old);
+                if !parsed.url.is_empty() && parsed.url.trim_end_matches('/') == url.trim_end_matches('/')
                 {
-                    *old = line.clone();
+                    // 覆盖时 quality 为空必须继承旧行画质——否则 MCP/CLI 重复添加
+                    // 会把用户已设的「原画」静默抹掉（与 add_video 同类坑）。
+                    *old = if quality.trim().is_empty() {
+                        format_live_line(&url, remark, &parsed.quality)
+                    } else {
+                        line.clone()
+                    };
                 }
             });
         } else {
@@ -196,9 +202,16 @@ impl Watchlist {
         });
         if replaced {
             lines.iter_mut().for_each(|old| {
-                let old_url = parse_video_line(old).url;
-                if !old_url.is_empty() && old_url == url.trim() {
-                    *old = line.clone();
+                let parsed = parse_video_line(old);
+                if !parsed.url.is_empty() && parsed.url == url.trim() {
+                    // 覆盖时 download=None 必须继承旧行的下载开关——否则 MCP/CLI
+                    // 重复添加同一个源会把用户已设的「下载=是」静默抹掉
+                    // （1.7.2 E2E 实测踩坑：monitor-add 抖音号重加关立新丢 flag）。
+                    *old = if download.is_none() {
+                        format_video_line(url, name, parsed.download)
+                    } else {
+                        line.clone()
+                    };
                 }
             });
         } else {
