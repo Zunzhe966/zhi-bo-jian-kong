@@ -1287,10 +1287,15 @@ fn normalize_rss_date(raw: Option<String>) -> String {
     }
 }
 
-/// 抖音适配器：用 Electron 内核加载抖音用户主页，拦截 `/web/aweme/post`
-/// 接口响应提取视频列表。抖音网页接口有严格 WAF 反爬且要求登录态，
-/// 纯 HTTP 请求会直接被拒，因此复用项目已有的 Electron 隐藏浏览器能力
-/// （与 B站 `bili-video-list.cjs` 同一套临时文件协议）。
+/// 抖音适配器：双通道。
+///
+/// 1. **首选 · Python 桥纯 HTTP（免登录）**：`fupan/douyin_post_list` 用项目自带
+///    a_bogus 签名调 `aweme/v1/web/aweme/post`，匿名 ttwid 即可取列表，
+///    失败自动用「抖音授权」cookie 兜底重试（2026-09-25 实测两在监账号可用）。
+/// 2. **兜底 · Electron 隐藏浏览器**：拦截 `/web/aweme/post` 接口响应，
+///    抗风控能力最强，但要求先做「抖音授权」扫码登录。
+///
+/// 抖音短视频监控自 1.7.0 起不再强制授权；授权只作为兜底通道存在。
 #[derive(Debug)]
 pub struct DouyinAdapter {
     project_dir: PathBuf,
@@ -1319,7 +1324,7 @@ impl DouyinAdapter {
         None
     }
 
-    /// 把 Electron 返回的毫秒时间戳转成 `YYYY-MM-DD HH:MM:SS`。
+    /// 把毫秒时间戳转成 `YYYY-MM-DD HH:MM:SS`。
     fn ts_to_date(ts_ms: i64) -> String {
         if ts_ms <= 0 {
             return String::new();
@@ -1332,6 +1337,108 @@ impl DouyinAdapter {
             })
             .unwrap_or_default()
     }
+
+    /// 首选通道：Python 桥纯 HTTP 列表提取（免登录，a_bogus 签名）。
+    /// 输出契约见 `fupan/douyin_post_list.py`：{ok, videos:[...]} / {ok:false, error}。
+    /// 桥把失败透成 error 字段，这里转成 Err 交给上层分层/记失败——
+    /// 绝不能把失败伪装成空列表（监控坏了用户也看不到）。
+    async fn list_via_python_bridge(&self, sec_uid: &str, count: u32) -> Result<Vec<VideoMeta>> {
+        let python = crate::service::python_bin(&self.project_dir);
+        if !crate::service::python_binary_available(&python) {
+            anyhow::bail!("找不到可用的 Python 环境: {}", python.display());
+        }
+        let mut cmd = Command::new(&python);
+        cmd.kill_on_drop(true)
+            .arg("-m")
+            .arg("fupan.douyin_post_list")
+            .arg("--sec-uid")
+            .arg(sec_uid)
+            .arg("--count")
+            .arg(count.max(1).to_string())
+            .current_dir(&self.project_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = ManagedChild::spawn(&mut cmd).context("启动抖音列表桥接失败")?;
+        let output = match child.wait_with_output(Duration::from_secs(40)).await {
+            Ok(o) => o,
+            Err(crate::process::ChildError::Io(e)) => {
+                return Err(e).context("读取抖音列表桥接输出失败")
+            }
+            Err(crate::process::ChildError::Timeout) => {
+                anyhow::bail!("抖音列表桥接超时（40 秒）")
+            }
+        };
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "抖音列表桥接退出码 {}: {}",
+                output.status,
+                stderr.chars().take(300).collect::<String>()
+            );
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let value: serde_json::Value = serde_json::from_str(stdout.trim()).with_context(|| {
+            format!(
+                "抖音列表桥接输出非 JSON: {}",
+                stdout.chars().take(200).collect::<String>()
+            )
+        })?;
+        parse_douyin_bridge_videos(&value)
+    }
+}
+
+/// 解析 `fupan/douyin_post_list` 的列表契约（纯函数，便于锁契约）。
+/// 失败契约（ok:false 或无 videos）一律 Err——失败不许伪装成空列表。
+fn parse_douyin_bridge_videos(value: &serde_json::Value) -> Result<Vec<VideoMeta>> {
+    if !value.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+        let err = value
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("未知错误");
+        anyhow::bail!("{err}");
+    }
+    let items = value
+        .get("videos")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut videos = Vec::with_capacity(items.len());
+    for item in items {
+        let id = item
+            .get("aweme_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if id.is_empty() {
+            continue;
+        }
+        let create_secs = item.get("create_time").and_then(|v| v.as_i64()).unwrap_or(0);
+        videos.push(VideoMeta {
+            id: id.to_string(),
+            platform: "douyin".to_string(),
+            url: item
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            title: item
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            cover: item
+                .get("cover")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            published_at: DouyinAdapter::ts_to_date(create_secs * 1000),
+            duration: item.get("duration").and_then(|v| v.as_i64()).unwrap_or(0),
+        });
+    }
+    if videos.is_empty() {
+        anyhow::bail!("抖音列表桥接返回空列表");
+    }
+    Ok(videos)
 }
 
 impl Platform for DouyinAdapter {
@@ -1351,11 +1458,17 @@ impl Platform for DouyinAdapter {
                      短链或抖音号无法直接识别，请在抖音 App 打开博主主页 → 分享 → 复制链接"
                 )
             })?;
+            // 首选：Python 桥纯 HTTP（免登录）。失败不静默——带上原因回退授权通道。
+            let bridge_err = match self.list_via_python_bridge(&sec_uid, count).await {
+                Ok(videos) => return Ok(videos),
+                Err(e) => e,
+            };
+            tracing::warn!("抖音免登录列表通道失败，回退 Electron 授权通道: {bridge_err:#}");
+            // 兜底：Electron 隐藏浏览器（需要「抖音授权」cookie）。
             let cookie_path = self.cookie_path();
             if !cookie_path.exists() {
                 return Err(anyhow!(
-                    "尚未登录抖音：缺少 {}，请先在桌面端完成「抖音授权」扫码登录",
-                    cookie_path.display()
+                    "抖音视频列表获取失败: {bridge_err:#}；且尚未「抖音授权」，无浏览器兜底通道"
                 ));
             }
             let target = format!("https://www.douyin.com/user/{sec_uid}");
@@ -1668,6 +1781,40 @@ pub fn resolve_with_project_dir(url: &str, project_dir: &Path) -> Box<dyn Platfo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn douyin_bridge_videos_parse_real_contract() {
+        // 契约形态与 fupan/douyin_post_list.py 输出一致（2026-09-25 实测样本精简）
+        let v = serde_json::json!({
+            "ok": true,
+            "videos": [{
+                "aweme_id": "7676401627256207988",
+                "title": "不是 浙江怎么是这样的啊 #丽水",
+                "create_time": 1787301532,
+                "duration": 256,
+                "url": "https://www.douyin.com/video/7676401627256207988",
+                "download_url": "https://v26-web.douyinvod.com/abc",
+                "cover": ""
+            }]
+        });
+        let videos = parse_douyin_bridge_videos(&v).unwrap();
+        assert_eq!(videos.len(), 1);
+        assert_eq!(videos[0].id, "7676401627256207988");
+        assert_eq!(videos[0].platform, "douyin");
+        assert_eq!(videos[0].duration, 256);
+        assert!(!videos[0].published_at.is_empty());
+    }
+
+    #[test]
+    fn douyin_bridge_failure_contract_is_error_not_empty() {
+        // 失败契约必须转成 Err：风控/签名失效时监控源要记失败，
+        // 绝不能当成「博主没发新视频」
+        let v = serde_json::json!({"ok": false, "error": "抖音视频列表获取失败: 接口返回空视频列表"});
+        let err = parse_douyin_bridge_videos(&v).unwrap_err();
+        assert!(err.to_string().contains("抖音视频列表获取失败"));
+        let v2 = serde_json::json!({"ok": true, "videos": []});
+        assert!(parse_douyin_bridge_videos(&v2).is_err());
+    }
 
     #[test]
     fn iesdouyin_user_info_parses_unique_id() {

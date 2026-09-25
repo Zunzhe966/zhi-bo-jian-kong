@@ -1,6 +1,14 @@
 {
   "https://space.bilibili.com/1458143131": {
+    "notify": "邮箱",
+    "name": "侯翠翠"
+  },
+  "https://www.douyin.com/user/MS4wLjABAAAAeCtzBXGHLhlTQyvOF3-wx9IiM-mrhRTWuGD8pUji024ltAMg5u2q3LbglioIyK-_": {
     "name": "侯翠翠",
-    "notify": "微信"
+    "notify": "邮箱"
+  },
+  "https://www.douyin.com/user/MS4wLjABAAAAfRq5hAWoSxwYGwDEI-F3glR1hf7mdi87_S2y1bhL7OjOUkc_ETYzRq6QwGZ_qf2m": {
+    "name": "关立新",
+    "notify": "邮箱"
   }
 }

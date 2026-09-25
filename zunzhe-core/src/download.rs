@@ -171,8 +171,123 @@ impl Downloader {
             tracing::warn!("B站浏览器下载兜底失败，回退 yt-dlp: {url}");
         }
 
+        // 抖音：直链优先（Python 桥 a_bogus 签名解析 play_addr，免登录，
+        // 2026-09-25 实测）。yt-dlp 的 DouyinIE 匿名必报 Fresh cookies needed，
+        // 只能当「抖音授权」存在时的兜底。
+        if is_douyin(url) {
+            match self.douyin_direct_download(url, &dir).await {
+                Ok(file) => return self.finish_download(url, &safe_name, pool, file).await,
+                Err(e) => tracing::warn!("抖音直链下载失败，回退 yt-dlp: {url}: {e:#}"),
+            }
+        }
+
         let file = self.ytdlp_download(url, &dir).await?;
         self.finish_download(url, &safe_name, pool, file).await
+    }
+
+    /// 抖音直链下载（免登录）：Python 桥解析 play_addr（a_bogus 签名），
+    /// 再纯 HTTP 拉流落盘。契约见 `fupan/douyin_post_list.py --video-url`：
+    /// `{ok, video:{aweme_id,title,download_url,...}}` / `{ok:false, error}`。
+    async fn douyin_direct_download(&self, url: &str, dir: &Path) -> Result<String> {
+        let python = crate::service::python_bin(&self.project_dir);
+        if !crate::service::python_binary_available(&python) {
+            anyhow::bail!("找不到可用的 Python 环境: {}", python.display());
+        }
+        let mut cmd = Command::new(&python);
+        cmd.kill_on_drop(true)
+            .arg("-m")
+            .arg("fupan.douyin_post_list")
+            .arg("--video-url")
+            .arg(url)
+            .current_dir(&self.project_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = ManagedChild::spawn(&mut cmd).context("启动抖音详情桥接失败")?;
+        let output = match child.wait_with_output(Duration::from_secs(40)).await {
+            Ok(o) => o,
+            Err(ChildError::Io(e)) => return Err(e).context("读取抖音详情桥接输出失败"),
+            Err(ChildError::Timeout) => anyhow::bail!("抖音详情桥接超时（40 秒）"),
+        };
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "抖音详情桥接退出码 {}: {}",
+                output.status,
+                stderr.chars().take(300).collect::<String>()
+            );
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let value: serde_json::Value = serde_json::from_str(stdout.trim()).with_context(|| {
+            format!(
+                "抖音详情桥接输出非 JSON: {}",
+                stdout.chars().take(200).collect::<String>()
+            )
+        })?;
+        if !value.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let err = value
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("未知错误");
+            anyhow::bail!("{err}");
+        }
+        let video = value.get("video").cloned().unwrap_or_else(|| serde_json::json!({}));
+        let direct = video
+            .get("download_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if direct.is_empty() {
+            anyhow::bail!("抖音详情未返回 download_url");
+        }
+        let aweme_id = video
+            .get("aweme_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let title = video
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let stem = {
+            let cleaned = safe_file_stem(title);
+            if cleaned.is_empty() {
+                format!("[抖音] {aweme_id}")
+            } else {
+                format!("[抖音] {cleaned}")
+            }
+        };
+        let dest = unique_media_path(dir, &stem, "mp4");
+
+        let client = reqwest::Client::builder()
+            .user_agent(
+                "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) \
+                 Chrome/116.0.5845.97 Safari/537.36 Core/1.116.567.400 QQBrowser/19.7.6764.400",
+            )
+            .timeout(Duration::from_secs(600))
+            .build()
+            .context("构建抖音直链下载客户端失败")?;
+        let resp = client
+            .get(&direct)
+            .header(reqwest::header::REFERER, "https://www.douyin.com/")
+            .send()
+            .await
+            .context("请求抖音直链失败")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("抖音直链返回 HTTP {}", resp.status());
+        }
+        let bytes = resp.bytes().await.context("读取抖音直链内容失败")?;
+        // 抖音风控时会返回 HTML/空壳而不是视频：校验体积与 MP4 魔数（ftyp），
+        // 宁可报错回退 yt-dlp，也不把假文件当下载成功。
+        if bytes.len() < 100 * 1024 {
+            anyhow::bail!("抖音直链内容过小（{} 字节），疑似风控空壳", bytes.len());
+        }
+        if bytes.len() < 12 || &bytes[4..8] != b"ftyp" {
+            anyhow::bail!("抖音直链返回不是有效 MP4（缺 ftyp 头）");
+        }
+        std::fs::write(&dest, &bytes)
+            .with_context(|| format!("写入抖音视频失败: {}", dest.display()))?;
+        Ok(dest.display().to_string())
     }
 
     async fn finish_download(
@@ -525,6 +640,25 @@ fn find_ffmpeg(project_dir: &Path) -> PathBuf {
 
 fn is_bilibili(url: &str) -> bool {
     url.contains("bilibili.com") || url.contains("b23.tv")
+}
+
+fn is_douyin(url: &str) -> bool {
+    url.contains("douyin.com") || url.contains("iesdouyin.com")
+}
+
+/// 文件名主干清洗：只去掉文件系统敌对字符，保留空格与中文标点
+/// （与 yt-dlp 产出的文件名风格一致）；长度截 80 字符防爆 macOS 255 字节上限。
+fn safe_file_stem(input: &str) -> String {
+    let mut out = String::new();
+    for ch in input.trim().chars() {
+        match ch {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => out.push('_'),
+            c if c.is_control() => {}
+            _ => out.push(ch),
+        }
+    }
+    let trimmed = out.trim().trim_matches('.').trim().to_string();
+    trimmed.chars().take(80).collect()
 }
 
 fn clean_name(input: &str) -> String {
@@ -1289,6 +1423,23 @@ mod tests {
         remove_partial_media(&old, true);
         assert!(old.exists(), "启动前已存在的文件不能被清理");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn safe_file_stem_strips_hostile_chars_keeps_readable() {
+        assert_eq!(safe_file_stem("不是 浙江怎么是这样的啊 #丽水"), "不是 浙江怎么是这样的啊 #丽水");
+        assert_eq!(safe_file_stem("a/b\\c:d*e?f\"g<h>i|j"), "a_b_c_d_e_f_g_h_i_j");
+        assert_eq!(safe_file_stem("  ..  "), "");
+        // 80 字符截断
+        let long = "长".repeat(200);
+        assert_eq!(safe_file_stem(&long).chars().count(), 80);
+    }
+
+    #[test]
+    fn is_douyin_matches_douyin_domains() {
+        assert!(is_douyin("https://www.douyin.com/video/123"));
+        assert!(is_douyin("https://www.iesdouyin.com/share/video/123"));
+        assert!(!is_douyin("https://www.bilibili.com/video/BV1xx"));
     }
 
     #[test]

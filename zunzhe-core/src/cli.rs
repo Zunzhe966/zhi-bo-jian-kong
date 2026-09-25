@@ -581,11 +581,15 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::BloggerVideos { url, count } => {
             let cookie = cfg.get_fupan("视频监控", "b站cookie");
+            // 分发必须与 daemon 监控路径（platform::resolve_with_project_dir）一致：
+            // 抖音落进 RssAdapter 会把主页当 XML 解析，报「RSS/Atom XML 解析失败」。
             let adapter: Box<dyn platform::Platform> = if url.contains("bilibili.com") {
                 Box::new(platform::BilibiliAdapter::with_cookie_and_project_dir(
                     cookie,
                     project_dir.clone(),
                 ))
+            } else if url.contains("douyin.com") {
+                Box::new(platform::DouyinAdapter::new(project_dir.clone()))
             } else {
                 Box::new(platform::RssAdapter::new())
             };
