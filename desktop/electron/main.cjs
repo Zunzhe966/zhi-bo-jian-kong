@@ -1054,7 +1054,10 @@ app.whenReady().then(async () => {
     const script = path.join(PROJECT_DIR, 'scripts', 'douyin_resolve_douyinid.js')
     const cookiePath = authCookiePath('douyin_browser_cookies.txt')
     const out = await new Promise((resolve) => {
-      execFile('node', [script, id, '2', cookiePath], { timeout: 150000, maxBuffer: 8 * 1024 * 1024 },
+      // 浏览器采样正常只要几秒；挂住必是 Chrome 启动失败/风控/网络卡死。
+      // 旧值 150 秒会让「添加」按钮转圈 2 分半、用户以为整个软件卡死——
+      // 30 秒失败即报，提示改粘主播主页链接（免浏览器通道）。
+      execFile('node', [script, id, '2', cookiePath], { timeout: 30000, maxBuffer: 8 * 1024 * 1024 },
         (err, stdout, stderr) => resolve({ err, stdout: String(stdout || ''), stderr: String(stderr || '') }))
     })
     // 脚本成功输出「=== 推荐使用的 sec_uid ===」+ 下一行 sec_uid

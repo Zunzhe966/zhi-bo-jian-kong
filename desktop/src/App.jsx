@@ -400,8 +400,13 @@ export default function App() {
     const v = String(input || '').trim()
     if (!v || /^https?:\/\//i.test(v)) return v
     if (/^\d+$/.test(v)) return normalizeUrl(v, platform)
+    const hide = message.loading('正在解析抖音号（最长 30 秒）…', 0)
     const r = await window.desktop.resolveDouyinAnchor(v).catch(() => null)
+    hide()
     if (r && r.ok) return r.url
+    // IPC 明确返回失败原因时直接抛出（比 normalizeUrl 兜出一条垃圾 URL 再报错清楚）；
+    // r 为 null（IPC 本身崩了）才走旧兜底，保住 B站等平台的兼容性。
+    if (r && r.error) throw new Error(r.error)
     return normalizeUrl(v, platform)
   }
 
@@ -437,8 +442,16 @@ export default function App() {
       // 非 URL 输入（抖音号）先自动解析成主播主页
       let url = v.url.trim()
       if (!/^https?:\/\//i.test(url) && !/^\d+$/.test(url)) {
+        const hide = message.loading('正在解析抖音号（最长 30 秒）…', 0)
         const r = await window.desktop.resolveDouyinAnchor(url).catch(() => null)
-        if (r && r.ok) url = r.url
+        hide()
+        // 解析失败要当场报真实原因并中止——不能拿原始输入硬闯 add-video，
+        // 否则用户先等 30 秒解析、再等 30 秒 CLI，最后看到一条看不懂的错。
+        if (!r || !r.ok) {
+          message.error((r && r.error) || '抖音号解析失败，请直接粘贴主播主页链接')
+          return
+        }
+        url = r.url
       }
       await window.desktop.cli('add-video', url, v.name.trim(), v.autoDownload ? '是' : '否', v.notify || '跟随全局')
       await ensureStarted()
