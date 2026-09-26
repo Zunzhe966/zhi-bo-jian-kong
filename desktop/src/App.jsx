@@ -69,6 +69,9 @@ export default function App() {
   const [historyLoading, setHistoryLoading] = useState(false)
   const [historyVideos, setHistoryVideos] = useState([])
   const [historyBlogger, setHistoryBlogger] = useState(null)
+  // 平台自己报告的总条数（B站官方接口）。它和实际列出条数不等时要在弹窗里
+  // 说清「差几条、为什么」——否则用户只看到少一条，永远查不出原因。
+  const [historyExpected, setHistoryExpected] = useState(null)
   const [historySelected, setHistorySelected] = useState([])
   const [historyDownloading, setHistoryDownloading] = useState(false)
   const [batchOpen, setBatchOpen] = useState(false)
@@ -724,6 +727,7 @@ export default function App() {
   const openHistory = async (row) => {
     setHistoryBlogger(row)
     setHistoryVideos([])
+    setHistoryExpected(null)
     setHistorySelected([])
     setHistoryOpen(true)
     setHistoryLoading(true)
@@ -740,6 +744,7 @@ export default function App() {
         }
       }))
       setHistoryVideos(list)
+      setHistoryExpected(Number(r.expected_total) || null)
       if (r.warning) message.warning(r.warning)
       else if (!list.length) message.warning('没拉到视频，可能该地址不是博主主页，或需要在设置里先做 B站授权')
     } catch (e) {
@@ -1088,6 +1093,7 @@ export default function App() {
         blogger={historyBlogger}
         open={historyOpen}
         videos={historyVideos}
+        expectedTotal={historyExpected}
         selected={historySelected}
         loading={historyLoading}
         downloading={historyDownloading}

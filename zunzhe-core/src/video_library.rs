@@ -94,6 +94,53 @@ impl VideoLibrary {
         }
         Ok(videos)
     }
+
+    /// 把「平台返回的列表」落成最终浏览结果：**条数与顺序以平台为准**，库里
+    /// 只补「已下载 / 封面缓存 / anchor」这些状态。
+    ///
+    /// 为什么不用 `list(source_url)`：那会按 `source_url` 反查库，而 `videos.id`
+    /// 是主键、`ON CONFLICT` 不会改写 `source_url`。同一个视频若先被别的
+    /// source_url 写进库里（联合投稿同时挂在两个 UP 主下、主页地址换过、地址
+    /// 带 `?spm_id_from=` 跟踪参数），它就查不出来——用户看到的就是「官方 46 条、
+    /// 界面只列 45 条」，而且少的那条毫无线索。
+    pub async fn browse_videos(&self, source_url: &str, metas: &[VideoMeta]) -> Result<Vec<Video>> {
+        let ids: Vec<String> = metas.iter().map(|m| m.id.clone()).collect();
+        let stored = db::videos_by_ids(&self.pool, &ids).await?;
+        let mut by_id: std::collections::HashMap<String, Video> = std::collections::HashMap::new();
+        for v in stored {
+            by_id.insert(v.id.clone(), v);
+        }
+        Ok(metas
+            .iter()
+            .map(|m| match by_id.remove(&m.id) {
+                Some(mut v) => {
+                    v.cover_cache = resolve_cover_cache(&self.fupan_dir, &v.cover_cache);
+                    // 平台元数据是权威（UP 主可能改过标题/封面/时长），
+                    // 库里只保留「已下载」这类本地事实。
+                    v.title = m.title.clone();
+                    v.cover = m.cover.clone();
+                    v.published_at = m.published_at.clone();
+                    v.duration = m.duration;
+                    v.url = m.url.clone();
+                    v
+                }
+                None => Video {
+                    id: m.id.clone(),
+                    platform: m.platform.clone(),
+                    url: m.url.clone(),
+                    title: m.title.clone(),
+                    cover: m.cover.clone(),
+                    cover_cache: m.cover.clone(),
+                    published_at: m.published_at.clone(),
+                    duration: m.duration,
+                    anchor: String::new(),
+                    source_url: source_url.to_string(),
+                    downloaded: false,
+                    downloaded_at: String::new(),
+                },
+            })
+            .collect())
+    }
 }
 
 /// 浏览博主历史视频的公共入口：成功时入库并返回最新列表；失败但本地已有
@@ -107,7 +154,8 @@ pub async fn browse_with_fallback(
     match fetch {
         Ok(metas) => {
             let _ = library.upsert_browse_many(&metas, source_url).await;
-            let videos = library.list(source_url, "", false).await?;
+            // 结果按平台返回为准（不能按 source_url 反查，见 browse_videos 注释）。
+            let videos = library.browse_videos(source_url, &metas).await?;
             Ok(BrowseOutcome {
                 videos,
                 from_cache: false,
@@ -772,6 +820,65 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows.len(), 8);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn browse_videos_keeps_entries_owned_by_another_source_url() {
+        // 同一个视频可能先被别的 source_url 写进库：联合投稿同时挂在两个 UP 主
+        // 名下、UP 主换过主页地址、或地址带 ?spm_id_from= 跟踪参数。
+        // videos.id 是主键、冲突时不会改写 source_url，所以按 source_url 反查库
+        // 会把它漏掉——这正是「官方 46 条、界面只列 45 条」的静默丢条。
+        // browse_videos 以平台列表为准，必须把它算进来。
+        let root = std::env::temp_dir().join(format!(
+            "zunzhe-browse-anchored-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("fupan_output")).unwrap();
+        let file = root.join("main.db");
+        let pool = crate::db::open_pool(&file).await.unwrap();
+        crate::db::init_db(&pool).await.unwrap();
+        let library = VideoLibrary::new(pool.clone(), root.join("fupan_output"));
+
+        let meta = VideoMeta {
+            id: "BVshare".into(),
+            platform: "bilibili".into(),
+            url: "https://www.bilibili.com/video/BVshare".into(),
+            title: "联合投稿".into(),
+            cover: String::new(),
+            published_at: "2026-09-01".into(),
+            duration: 100,
+        };
+        // 先以「另一个博主的主页」为 key 入库，并标记为已下载。
+        library
+            .upsert_browse(&meta, "https://space.bilibili.com/2")
+            .await
+            .unwrap();
+        crate::db::mark_downloaded(&pool, "BVshare", true)
+            .await
+            .unwrap();
+
+        // 按老实现（source_url 反查）这里是 0 条；以平台列表为准应为 1 条，
+        // 且库里的「已下载」状态要保留。
+        let owned = library
+            .list("https://space.bilibili.com/1", "", false)
+            .await
+            .unwrap();
+        assert!(owned.is_empty(), "旧口径确实查不到（这就是丢条的原因）");
+
+        let videos = library
+            .browse_videos("https://space.bilibili.com/1", std::slice::from_ref(&meta))
+            .await
+            .unwrap();
+        assert_eq!(videos.len(), 1, "以平台列表为准时不能漏掉这条");
+        assert_eq!(videos[0].id, "BVshare");
+        assert!(videos[0].downloaded, "库里的已下载状态必须带出来");
 
         let _ = std::fs::remove_dir_all(&root);
     }

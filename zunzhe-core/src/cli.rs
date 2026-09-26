@@ -677,19 +677,43 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             let library = video_library::VideoLibrary::new(pool.clone(), fupan_dir.clone());
             // 平台拉取失败但有本地缓存时回退显示缓存，避免 412 风控让用户
             // 连“以前下载过没”都看不到；无缓存才把真实错误抛给桌面端。
-            let outcome = video_library::browse_with_fallback(
-                &library,
-                adapter.list_videos(&url, count).await,
-                &url,
-            )
-            .await?;
+            let fetch = adapter.list_videos(&url, count).await;
+            // 平台自己报告的总数（B站官方接口的 data.page.count）。RSSHub/yt-dlp
+            // 兜底路径拿不到总数，会是 None。必须在 list_videos 之后读。
+            let expected_total = adapter.expected_total();
+            let outcome = video_library::browse_with_fallback(&library, fetch, &url).await?;
+            // count==0 = 「全部」：只有这种请求下「官方总数 vs 实取条数」才有可比性
+            // （用户明确只要 30 条时，少于总数是正常的）。且缓存回退时不下这个结论。
+            let shortfall = if count == 0 && !outcome.from_cache {
+                expected_total
+                    .map(|t| t as usize)
+                    .filter(|t| *t > outcome.videos.len())
+            } else {
+                None
+            };
+            let shortfall_note = shortfall.map(|t| {
+                let listed = outcome.videos.len();
+                let missing = t.saturating_sub(listed);
+                format!(
+                    "这个博主官方共有 {t} 条投稿，本次只列出 {listed} 条，差 {missing} 条。\
+少的这些通常是 B站自己不返回的：已下架、设为「仅自己可见」、审核中，\
+或联合投稿（该接口默认不给）——不是你的文件丢了。"
+                )
+            });
+            let warning = match (outcome.warning.clone(), shortfall_note) {
+                (Some(w), Some(note)) => Some(format!("{w}；{note}")),
+                (Some(w), None) => Some(w),
+                (None, Some(note)) => Some(note),
+                (None, None) => None,
+            };
             let result = json!({
                 "ok": true,
                 "platform": adapter.name(),
                 "url": url,
                 "count": outcome.videos.len(),
+                "expected_total": expected_total,
                 "from_cache": outcome.from_cache,
-                "warning": outcome.warning,
+                "warning": warning,
                 "videos": video_library::videos_compat_json(&outcome.videos),
             });
             println!("{}", result);

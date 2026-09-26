@@ -205,6 +205,15 @@ pub trait Platform: Send + Sync {
         url: &'a str,
         count: u32,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<VideoMeta>>> + Send + 'a>>;
+
+    /// 上一次 `list_videos` 期间平台自己报告的总条数；拿不到就返回 `None`。
+    ///
+    /// 上层用它把「平台说共 N 条」与「实际列出 M 条」对照：M < N 时如实告诉
+    /// 用户差了几条，而不是让列表悄悄少一条。默认实现返回 `None`（RSSHub /
+    /// yt-dlp 这类兜底源本身不提供总数）。
+    fn expected_total(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// B站适配器：先解析 space.bilibili.com/<mid>，用 view 接口补全
@@ -214,6 +223,14 @@ pub struct BilibiliAdapter {
     client: reqwest::Client,
     cookie: String,
     project_dir: PathBuf,
+    /// 官方接口报告的投稿总数（`data.page.count`），`list_videos` 期间写入。
+    ///
+    /// 存在的唯一目的：把「平台说一共有多少条」和「实际列出多少条」摆到一起。
+    /// 这两者不等时（例如官方报 46、实取 45），少掉的那条不是被程序吞了，就是
+    /// 被 B站自己过滤了（下架 / 仅自己可见 / 审核中 / 联合投稿不在该接口）。
+    /// 以前这个差值被静默丢弃，用户只看到「少了 1 条」却永远查不出为什么。
+    /// 0 表示未知（RSSHub / yt-dlp 兜底路径拿不到总数）。
+    expected_total: std::sync::atomic::AtomicU32,
 }
 
 impl Default for BilibiliAdapter {
@@ -226,6 +243,7 @@ impl Default for BilibiliAdapter {
                 .unwrap_or_default(),
             cookie: String::new(),
             project_dir: PathBuf::from("."),
+            expected_total: std::sync::atomic::AtomicU32::new(0),
         }
     }
 }
@@ -551,12 +569,25 @@ impl Platform for BilibiliAdapter {
         "bilibili"
     }
 
+    fn expected_total(&self) -> Option<u32> {
+        match self
+            .expected_total
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0 => None,
+            n => Some(n),
+        }
+    }
+
     fn list_videos<'a>(
         &'a self,
         url: &'a str,
         count: u32,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<VideoMeta>>> + Send + 'a>> {
         Box::pin(async move {
+            // 每次列历史都重置总数，避免把上一次的残留值当成这一次的答案。
+            self.expected_total
+                .store(0, std::sync::atomic::Ordering::Relaxed);
             let mid = Self::mid_from_url(url).with_context(|| {
                 format!(
                     "这个地址不是 B站UP主主页，认不出是哪个 UP主：{url}。\
@@ -612,6 +643,16 @@ impl Platform for BilibiliAdapter {
             let out = if official_videos.is_empty() {
                 let results =
                     futures_util::future::join_all(bvids.iter().map(|bvid| self.view(bvid))).await;
+                // view 补全可能个别失败（412/超时），失败的那条会被 flatten 丢掉。
+                // 以前是静默的——用户只看到「少一条」却查不出原因，这里至少留下日志。
+                let filled = results.iter().filter(|r| r.is_some()).count();
+                if filled < bvids.len() {
+                    tracing::warn!(
+                        "B站 view 补全失败 {} 条（共 {} 条），这些条目本次不会出现在列表里",
+                        bvids.len() - filled,
+                        bvids.len()
+                    );
+                }
                 results.into_iter().flatten().collect()
             } else {
                 official_videos
@@ -679,6 +720,12 @@ impl BilibiliAdapter {
                 .await;
             if total.is_none() {
                 total = page_total;
+                // 官方报告的总数一拿到就记下来，供上层对比「实取条数」。
+                // 差值不是被程序吞了，就是被 B站自己过滤了——用户有权知道。
+                if let Some(t) = total {
+                    self.expected_total
+                        .store(t, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             if videos.is_empty() {
                 if reason.is_empty() {
@@ -1133,6 +1180,15 @@ pub async fn normalize_blogger_input(input: &str) -> String {
                 return format!("https://space.bilibili.com/{mid}");
             }
         }
+    }
+    // 空间地址归一成规范形态：只保留 space.bilibili.com/{mid}。
+    //
+    // 用户在 B站复制的主页地址往往带 `?spm_id_from=333.337.0.0` 这类跟踪参数；
+    // 若原样透传，它会成为视频库的 source_url 主键，于是同一个人出现两条 key
+    // （`space.bilibili.com/601214690` 和 `space.bilibili.com/601214690?spm_id_from=…`），
+    // 按 source_url 分组的投稿列表和已下载标记就会各算各的、数量对不上。
+    if let Some(mid) = BilibiliAdapter::mid_from_url(&target) {
+        return format!("https://space.bilibili.com/{mid}");
     }
     target
 }
@@ -2314,6 +2370,26 @@ mod tests {
         assert_eq!(
             normalize_blogger_input("https://space.bilibili.com/946974").await,
             "https://space.bilibili.com/946974"
+        );
+    }
+
+    #[tokio::test]
+    async fn normalize_blogger_input_strips_tracking_query_on_space_url() {
+        // B站主页地址常带 ?spm_id_from= 这类跟踪参数。若不归一，它会成为
+        // 视频库的 source_url 主键，同一个人就出现两条 key，投稿列表和
+        // 已下载标记各算各的——这正是「官方 46 条、界面只列 45 条」的成因之一。
+        assert_eq!(
+            normalize_blogger_input("https://space.bilibili.com/601214690?spm_id_from=333.337.0.0")
+                .await,
+            "https://space.bilibili.com/601214690"
+        );
+        assert_eq!(
+            normalize_blogger_input("https://space.bilibili.com/601214690/video#/all").await,
+            "https://space.bilibili.com/601214690"
+        );
+        assert_eq!(
+            normalize_blogger_input("https://m.bilibili.com/space/601214690").await,
+            "https://space.bilibili.com/601214690"
         );
     }
 

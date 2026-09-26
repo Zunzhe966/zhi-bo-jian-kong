@@ -1735,6 +1735,52 @@ pub async fn get_videos(
     Ok(out)
 }
 
+/// 按一批视频 id 取回库内记录。
+///
+/// 浏览博主历史时，结果必须以平台返回的顺序和条数为准（平台就是权威），库里
+/// 只用来补「已下载 / 封面缓存」这些状态。**不能用 `source_url` 反查**：同一个
+/// 视频可能先被别的 `source_url` 写进库里（联合投稿同时挂在两个 UP 主下、换过
+/// 主页地址、地址带 `?spm_id_from=` 跟踪参数），而 `videos.id` 是主键、冲突时
+/// 不改写 `source_url`，按 source_url 查就会把它漏掉——表现为「官方 46 条、
+/// 界面只列 45 条」，且少的那条还查不出原因。
+pub async fn videos_by_ids(pool: &SqlitePool, ids: &[String]) -> anyhow::Result<Vec<Video>> {
+    let mut out = Vec::new();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    // SQLite 单条语句的绑定变量有上限，分批查避免列表很长时直接报错。
+    for chunk in ids.chunks(400) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!(
+            "SELECT id, platform, url, title, cover, cover_cache, published_at, duration,
+                    anchor, source_url, downloaded, downloaded_at
+             FROM videos WHERE id IN ({placeholders})"
+        );
+        let mut query = sqlx::query(&sql);
+        for id in chunk {
+            query = query.bind(id);
+        }
+        let rows = query.fetch_all(pool).await.context("按 id 查询 videos")?;
+        for row in rows {
+            out.push(Video {
+                id: row.try_get("id")?,
+                platform: row.try_get("platform")?,
+                url: row.try_get("url")?,
+                title: row.try_get("title")?,
+                cover: row.try_get("cover")?,
+                cover_cache: row.try_get("cover_cache")?,
+                published_at: row.try_get("published_at")?,
+                duration: row.try_get("duration")?,
+                anchor: row.try_get("anchor")?,
+                source_url: row.try_get("source_url")?,
+                downloaded: row.try_get::<i64, _>("downloaded")? != 0,
+                downloaded_at: row.try_get("downloaded_at")?,
+            });
+        }
+    }
+    Ok(out)
+}
+
 /// 只统计视频库总数，不加载记录内容。
 ///
 /// `status` 快照只展示 `video_count`，此前却调用 `get_videos` 把全部视频

@@ -5,7 +5,7 @@ import { Button, Form, Input, Modal, Table } from 'antd'
 
 export default function HistoryModals({
   batchOpen, batchForm, onBatchBrowse, onCloseBatch,
-  blogger, open, videos, selected, loading, downloading, paths,
+  blogger, open, videos, selected, loading, downloading, paths, expectedTotal,
   onClose, onDownloadAll, onDownloadSelected, onSelect,
 }) {
   return (
@@ -47,6 +47,12 @@ export default function HistoryModals({
         <p style={{ marginBottom: 12, color: '#666' }}>
           勾选想要的视频，点「下载选中」批量保存到 <b>{paths.video_root || paths.media_root || "产物根目录"}/{blogger?.name || "博主名"}/批量下载/</b> 并自动转写复盘。
         </p>
+        {Number(expectedTotal) > videos.length ? (
+          <p style={{ marginBottom: 12, color: '#d46b08' }}>
+            官方共 {expectedTotal} 条，本次列出 {videos.length} 条，差 {Number(expectedTotal) - videos.length} 条。
+            少的这些一般是 B站自己不返回的（已下架 / 设为仅自己可见 / 审核中 / 联合投稿），不是文件丢了。
+          </p>
+        ) : null}
         <Table
           rowKey="key"
           loading={loading}
