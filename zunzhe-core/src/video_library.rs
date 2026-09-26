@@ -95,51 +95,70 @@ impl VideoLibrary {
         Ok(videos)
     }
 
-    /// 把「平台返回的列表」落成最终浏览结果：**条数与顺序以平台为准**，库里
-    /// 只补「已下载 / 封面缓存 / anchor」这些状态。
+    /// 把「平台返回的列表」与「库里已有的条目」**取并集**，落成最终浏览结果。
     ///
-    /// 为什么不用 `list(source_url)`：那会按 `source_url` 反查库，而 `videos.id`
-    /// 是主键、`ON CONFLICT` 不会改写 `source_url`。同一个视频若先被别的
-    /// source_url 写进库里（联合投稿同时挂在两个 UP 主下、主页地址换过、地址
-    /// 带 `?spm_id_from=` 跟踪参数），它就查不出来——用户看到的就是「官方 46 条、
-    /// 界面只列 45 条」，而且少的那条毫无线索。
+    /// 为什么不是二选一：
+    /// - 只按 `source_url` 反查库（最早的做法）：`videos.id` 是主键、`ON CONFLICT`
+    ///   不改写 `source_url`，同一视频若先被别的 source_url 写进库里（联合投稿挂在
+    ///   两个 UP 主下、主页地址换过、地址带 `?spm_id_from=` 跟踪参数）就查不出来，
+    ///   于是「官方 46 条、界面只列 45 条」，少的那条毫无线索。
+    /// - 只按平台本次返回（改错的那一版）：单次抓取经常不完整——RSSHub 只给最近
+    ///   一批、官方接口可能被风控、yt-dlp 又走同一条接口。结果列表从数据库累积的
+    ///   45 条**倒退**成 34 条，比原来还差。
+    ///
+    /// 所以：平台列表是权威的新鲜数据（标题/封面/时长/日期以它为准），库负责兜住
+    /// 「这次没抓到但以前抓到过」的历史条目。两边并集，去重后按发布时间倒序。
     pub async fn browse_videos(&self, source_url: &str, metas: &[VideoMeta]) -> Result<Vec<Video>> {
+        // 1) 平台本次返回的条目：拿库里的「已下载 / 封面缓存 / anchor」状态补上。
         let ids: Vec<String> = metas.iter().map(|m| m.id.clone()).collect();
         let stored = db::videos_by_ids(&self.pool, &ids).await?;
         let mut by_id: std::collections::HashMap<String, Video> = std::collections::HashMap::new();
         for v in stored {
             by_id.insert(v.id.clone(), v);
         }
-        Ok(metas
-            .iter()
-            .map(|m| match by_id.remove(&m.id) {
-                Some(mut v) => {
-                    v.cover_cache = resolve_cover_cache(&self.fupan_dir, &v.cover_cache);
-                    // 平台元数据是权威（UP 主可能改过标题/封面/时长），
-                    // 库里只保留「已下载」这类本地事实。
-                    v.title = m.title.clone();
-                    v.cover = m.cover.clone();
-                    v.published_at = m.published_at.clone();
-                    v.duration = m.duration;
-                    v.url = m.url.clone();
-                    v
-                }
-                None => Video {
-                    id: m.id.clone(),
-                    platform: m.platform.clone(),
-                    url: m.url.clone(),
-                    title: m.title.clone(),
-                    cover: m.cover.clone(),
-                    cover_cache: m.cover.clone(),
-                    published_at: m.published_at.clone(),
-                    duration: m.duration,
-                    anchor: String::new(),
-                    source_url: source_url.to_string(),
-                    downloaded: false,
-                    downloaded_at: String::new(),
-                },
-            })
-            .collect())
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut out: Vec<Video> = Vec::with_capacity(metas.len());
+        for m in metas {
+            seen.insert(m.id.clone());
+            let mut v = by_id.remove(&m.id).unwrap_or_else(|| Video {
+                id: m.id.clone(),
+                platform: m.platform.clone(),
+                url: m.url.clone(),
+                title: m.title.clone(),
+                cover: m.cover.clone(),
+                cover_cache: m.cover.clone(),
+                published_at: m.published_at.clone(),
+                duration: m.duration,
+                anchor: String::new(),
+                source_url: source_url.to_string(),
+                downloaded: false,
+                downloaded_at: String::new(),
+            });
+            v.cover_cache = resolve_cover_cache(&self.fupan_dir, &v.cover_cache);
+            // 平台元数据是权威（UP 主可能改过标题/封面/时长），
+            // 库里只保留「已下载」这类本地事实。
+            v.title = m.title.clone();
+            v.cover = m.cover.clone();
+            v.published_at = m.published_at.clone();
+            v.duration = m.duration;
+            v.url = m.url.clone();
+            out.push(v);
+        }
+
+        // 2) 补上「库里属于这个博主、但本次平台没返回」的条目，防止单次抓取不完整
+        //    让界面凭空少条（这正是 45 → 34 那次倒退的直接原因）。
+        let existing = db::get_videos(&self.pool, source_url, "", false).await?;
+        for mut v in existing {
+            if !seen.insert(v.id.clone()) {
+                continue;
+            }
+            v.cover_cache = resolve_cover_cache(&self.fupan_dir, &v.cover_cache);
+            out.push(v);
+        }
+
+        // 3) 统一按发布时间倒序（`sort_by` 是稳定排序，同日期时保持上面的先后）。
+        out.sort_by(|a, b| b.published_at.cmp(&a.published_at));
+        Ok(out)
     }
 }
 
@@ -830,7 +849,7 @@ mod tests {
         // 名下、UP 主换过主页地址、或地址带 ?spm_id_from= 跟踪参数。
         // videos.id 是主键、冲突时不会改写 source_url，所以按 source_url 反查库
         // 会把它漏掉——这正是「官方 46 条、界面只列 45 条」的静默丢条。
-        // browse_videos 以平台列表为准，必须把它算进来。
+        // browse_videos 取「平台列表 ∪ 库」的并集，必须把它算进来。
         let root = std::env::temp_dir().join(format!(
             "zunzhe-browse-anchored-{}-{}",
             std::process::id(),
@@ -864,8 +883,7 @@ mod tests {
             .await
             .unwrap();
 
-        // 按老实现（source_url 反查）这里是 0 条；以平台列表为准应为 1 条，
-        // 且库里的「已下载」状态要保留。
+        // 漏掉的这条在 browse_videos 里必须出现，且库里的「已下载」状态要保留。
         let owned = library
             .list("https://space.bilibili.com/1", "", false)
             .await
@@ -876,9 +894,60 @@ mod tests {
             .browse_videos("https://space.bilibili.com/1", std::slice::from_ref(&meta))
             .await
             .unwrap();
-        assert_eq!(videos.len(), 1, "以平台列表为准时不能漏掉这条");
+        assert_eq!(videos.len(), 1, "平台返回的条目一条都不能漏");
         assert_eq!(videos[0].id, "BVshare");
         assert!(videos[0].downloaded, "库里的已下载状态必须带出来");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn browse_videos_unions_platform_list_with_db_history() {
+        // 单次抓取经常不完整：RSSHub 只给最近一批、官方接口可能被风控。
+        // 若只按本次平台返回输出，界面就会从数据库累积的 N 条倒退成 M 条
+        // （真实事故：45 条 → 34 条）。所以必须取并集：平台列表 + 库里的历史条目。
+        let root = std::env::temp_dir().join(format!(
+            "zunzhe-browse-union-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("fupan_output")).unwrap();
+        let file = root.join("main.db");
+        let pool = crate::db::open_pool(&file).await.unwrap();
+        crate::db::init_db(&pool).await.unwrap();
+        let library = VideoLibrary::new(pool.clone(), root.join("fupan_output"));
+        let source = "https://space.bilibili.com/601214690";
+
+        let mk = |id: &str, date: &str| VideoMeta {
+            id: id.into(),
+            platform: "bilibili".into(),
+            url: format!("https://www.bilibili.com/video/{id}"),
+            title: format!("标题 {id}"),
+            cover: String::new(),
+            published_at: date.into(),
+            duration: 60,
+        };
+        // 库里已经有 3 条（历次抓取累积），按发布时间倒序。
+        library.upsert_browse(&mk("BV1", "2026-09-03"), source).await.unwrap();
+        library.upsert_browse(&mk("BV2", "2026-09-02"), source).await.unwrap();
+        library.upsert_browse(&mk("BV3", "2026-09-01"), source).await.unwrap();
+
+        // 本次平台只返回了其中 1 条（模拟 RSSHub 只给最近一批）。
+        let metas = vec![mk("BV1", "2026-09-03")];
+        let videos = library.browse_videos(source, &metas).await.unwrap();
+
+        assert_eq!(videos.len(), 3, "平台缺的条目必须由库兜住，不能倒退");
+        let ids: Vec<&str> = videos.iter().map(|v| v.id.as_str()).collect();
+        assert_eq!(ids, vec!["BV1", "BV2", "BV3"], "按发布时间倒序，且不重复");
+        assert_eq!(
+            videos.iter().filter(|v| v.id == "BV1").count(),
+            1,
+            "平台与库都有的同一 id 只能出现一次（并集去重）"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -178,6 +178,20 @@ fn merge_cookie_headers(base: &str, extra: &str) -> String {
         .join("; ")
 }
 
+/// Cookie 头里是否含非空的登录态字段（`SESSDATA` / `DedeUserID`）。
+///
+/// 匿名设备指纹（buvid3/buvid4/b_lsid）不算登录态，不能作为「已授权」的依据。
+fn cookie_header_has_login(header: &str) -> bool {
+    header.split(';').any(|pair| {
+        let Some((key, value)) = pair.split_once('=') else {
+            return false;
+        };
+        !value.trim().is_empty()
+            && (key.trim().eq_ignore_ascii_case("SESSDATA")
+                || key.trim().eq_ignore_ascii_case("DedeUserID"))
+    })
+}
+
 /// 判断 B站投稿列表是否应继续翻页。
 ///
 /// `count == 0` 表示“全部历史视频”：只要总投稿数已知且还没取满就继续；
@@ -419,6 +433,15 @@ impl BilibiliAdapter {
         ensure_user_cookie_file(&self.project_dir, cookie)
     }
 
+    /// 是否配了登录态 Cookie（手动配置的 `b站cookie`，或设置页「B站授权」导入）。
+    ///
+    /// 只有登录态才可能拿到完整投稿列表；匿名请求基本必被 412 拦。用它决定
+    /// 「RSSHub 已返回结果时，要不要再打一次官方接口」——不给没授权的用户
+    /// 每个监控轮次都白白多一次风控暴露。
+    fn has_login_cookie(&self) -> bool {
+        cookie_header_has_login(&self.upload_list_cookie())
+    }
+
     /// 投稿列表专用 Cookie：旧 Python 明确不使用匿名 buvid，只允许账号 Cookie，
     /// 否则会更容易触发 412。这里遵循同一优先级。
     fn upload_list_cookie(&self) -> String {
@@ -595,70 +618,95 @@ impl Platform for BilibiliAdapter {
 或改用该 UP主的任意视频链接 / b23.tv 分享短链（会自动识别 UP主）"
                 )
             })?;
-            // RSSHub 优先（平台缓存、抗 412），官方 wbi/arc 接口（带 cookie）
-            // 次之，最后 yt-dlp 兜底。RSS 通道不直接打 B站接口，是三种途径
-            // 里最不容易触发风控的；官方接口仅在 RSS 不可用时才调用。
+            // RSSHub 先试：它不直接打 B站接口，是三途里最不容易触发风控的。
             // 三个兜底都只返回“空列表”，但空的原因可能是 412 风控，也可能是
             // 网络/DNS 故障。把每级的真实原因带上来，顶层报错才不至于把
             // “api.bilibili.com 解析失败”误导成“请配置 cookie”。
-            let (mut bvids, rsshub_err) = self.upload_ids_rsshub(&mid, count).await;
-            let mut official_videos = Vec::new();
-            let mut official_err = String::new();
-            let mut ytdlp_err = String::new();
-            if !bvids.is_empty() {
-                tracing::debug!("B站 RSSHub 优先返回 {} 条", bvids.len());
-            } else {
+            let (rsshub_ids, rsshub_err) = self.upload_ids_rsshub(&mid, count).await;
+            if rsshub_ids.is_empty() {
                 tracing::warn!("B站 RSSHub 未返回投稿 (0 条) ({rsshub_err})，回退官方接口");
-                (official_videos, official_err) = self.upload_ids_official(&mid, count).await;
-                if !official_videos.is_empty() {
-                    tracing::debug!("B站官方投稿接口返回 {} 条", official_videos.len());
-                    bvids = official_videos
-                        .iter()
-                        .map(|v| v.id.clone())
-                        .collect::<Vec<_>>();
-                } else {
-                    tracing::warn!("B站官方投稿接口返回 0 条 ({official_err})，回退 yt-dlp");
-                }
+            } else {
+                tracing::debug!("B站 RSSHub 返回 {} 条", rsshub_ids.len());
             }
-            if bvids.is_empty() {
+
+            // 官方 wbi/arc 接口是唯一能给出「总投稿数」（data.page.count）和完整
+            // 投稿列表的源。要不要在 RSSHub 之外再打一次，取决于两件事：
+            //   - RSSHub 没结果 → 必须试（否则只剩 yt-dlp 一条路）；
+            //   - RSSHub 有结果但用户已「B站授权」→ 也要试。早期实现在这里
+            //     「RSSHub 有返回就跳过官方」，导致用户授权了也永远只能看到
+            //     RSSHub 给的半截列表（官方 46 条 → 界面只列 34 条），授权形同虚设；
+            //   - RSSHub 有结果且没登录态 → 跳过。匿名请求几乎必被 412 拦，多打一次
+            //     只会给监控轮次白白增加一次风控暴露。
+            let try_official = rsshub_ids.is_empty() || self.has_login_cookie();
+            let (official_videos, official_err) = if try_official {
+                self.upload_ids_official(&mid, count).await
+            } else {
+                tracing::debug!("B站 RSSHub 已返回结果且无登录态 Cookie，跳过官方接口");
+                (Vec::new(), String::new())
+            };
+            if official_videos.is_empty() {
+                if try_official {
+                    tracing::warn!("B站官方投稿接口返回 0 条 ({official_err})");
+                }
+            } else {
+                tracing::debug!("B站官方投稿接口返回 {} 条", official_videos.len());
+            }
+
+            // 合并两源：官方列表自带完整元数据（标题/封面/时长/日期）且按发布时间
+            // 倒序，作为主体；RSSHub 里官方没给到的 BV（例如联合投稿）再用 view
+            // 补全，尽量一条不漏。
+            let mut seen: std::collections::HashSet<String> =
+                official_videos.iter().map(|v| v.id.clone()).collect();
+            let mut missing_bvids: Vec<String> = rsshub_ids
+                .into_iter()
+                .filter(|id| seen.insert(id.clone()))
+                .collect();
+
+            let mut ytdlp_err = String::new();
+            if official_videos.is_empty() && missing_bvids.is_empty() {
                 let (next, err) = self.upload_ids_ytdlp(&mid, count).await;
-                bvids = next;
+                missing_bvids = next;
                 ytdlp_err = err.clone();
-                if bvids.is_empty() {
+                if missing_bvids.is_empty() {
                     tracing::warn!("B站 yt-dlp 兜底也未返回投稿 (0 条) ({err})");
                 } else {
-                    tracing::debug!("B站 yt-dlp 兜底返回 {} 条", bvids.len());
+                    tracing::debug!("B站 yt-dlp 兜底返回 {} 条", missing_bvids.len());
                 }
             }
-            if bvids.is_empty() {
+            if official_videos.is_empty() && missing_bvids.is_empty() {
                 return Err(anyhow!(upload_list_failure_message(
                     &official_err,
                     &rsshub_err,
                     &ytdlp_err
                 )));
             }
-            // 官方 vlist 已带标题/封面/时长/日期，直接作为结果；
-            // RSSHub/yt-dlp 兜底源只有 BV 号时仍并发调用 view 补全，
+
+            // 官方 vlist 已带标题/封面/时长/日期，直接作为结果主体；
+            // RSSHub/yt-dlp 补出来的 BV 号才需要并发调用 view 补全，
             // 避免把占位伪装成成功。
-            let out = if official_videos.is_empty() {
-                let results =
-                    futures_util::future::join_all(bvids.iter().map(|bvid| self.view(bvid))).await;
+            let mut out = official_videos;
+            if !missing_bvids.is_empty() {
+                let results = futures_util::future::join_all(
+                    missing_bvids.iter().map(|bvid| self.view(bvid)),
+                )
+                .await;
                 // view 补全可能个别失败（412/超时），失败的那条会被 flatten 丢掉。
                 // 以前是静默的——用户只看到「少一条」却查不出原因，这里至少留下日志。
                 let filled = results.iter().filter(|r| r.is_some()).count();
-                if filled < bvids.len() {
+                if filled < missing_bvids.len() {
                     tracing::warn!(
                         "B站 view 补全失败 {} 条（共 {} 条），这些条目本次不会出现在列表里",
-                        bvids.len() - filled,
-                        bvids.len()
+                        missing_bvids.len() - filled,
+                        missing_bvids.len()
                     );
                 }
-                results.into_iter().flatten().collect()
-            } else {
-                official_videos
-            };
+                out.extend(results.into_iter().flatten());
+            }
             if out.is_empty() {
                 return Err(anyhow!("B站视频信息补全失败，请配置 B站 cookie 或稍后重试"));
+            }
+            if count > 0 {
+                out.truncate(count as usize);
             }
             Ok(out)
         })
@@ -2418,6 +2466,18 @@ mod tests {
             "mid=946974&order=pubdate&platform=web&pn=1&ps=10&web_location=1550101&wts=1786550400&w_rid=1b8f0e19353b02df0a82591de339a31f"
         );
         assert!(query.contains("&w_rid="));
+    }
+
+    #[test]
+    fn cookie_header_has_login_only_counts_account_fields() {
+        // 登录态要认；匿名设备指纹不能当登录态，否则会误判成「已授权」，
+        // 让 RSSHub 有结果时还去多打一次官方接口。
+        assert!(cookie_header_has_login("buvid3=x; SESSDATA=abc; b_lsid=y"));
+        assert!(cookie_header_has_login("DedeUserID=123"));
+        assert!(!cookie_header_has_login("buvid3=x; buvid4=y; b_lsid=z"));
+        assert!(!cookie_header_has_login("SESSDATA="));
+        assert!(!cookie_header_has_login("SESSDATA=   "));
+        assert!(!cookie_header_has_login(""));
     }
 
     #[test]

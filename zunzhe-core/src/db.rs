@@ -1682,6 +1682,25 @@ pub async fn ensure_video_row(
     Ok(())
 }
 
+/// 把 `source_url` 归一成「同一个博主」的比较键：去掉 `?query` 与 `#fragment`、
+/// 去掉首尾空白与尾部斜杠、统一小写。
+///
+/// 用户在 B站复制的主页地址常带 `?spm_id_from=333.337.0.0` 这类跟踪参数；若按
+/// 逐字节比较，同一主页会分裂成两个来源，列表和历史下载记录都对不上。
+fn source_url_key(url: &str) -> String {
+    let trimmed = url.trim();
+    let cut = trimmed
+        .find(|c| c == '?' || c == '#')
+        .unwrap_or(trimmed.len());
+    trimmed[..cut].trim_end_matches('/').to_ascii_lowercase()
+}
+
+/// 与 [`source_url_key`] 等价的 SQL 表达式（作用在 `videos.source_url` 列上），
+/// 两边必须保持同一套规则，否则查库会漏。
+const SOURCE_URL_KEY_SQL: &str = "LOWER(RTRIM(TRIM(SUBSTR(source_url, 1, MIN(\
+     CASE WHEN INSTR(source_url,'?')=0 THEN LENGTH(source_url) ELSE INSTR(source_url,'?')-1 END, \
+     CASE WHEN INSTR(source_url,'#')=0 THEN LENGTH(source_url) ELSE INSTR(source_url,'#')-1 END))), '/'))";
+
 pub async fn get_videos(
     pool: &SqlitePool,
     source_url: &str,
@@ -1694,10 +1713,10 @@ pub async fn get_videos(
          FROM videos WHERE 1=1",
     );
     if !source_url.is_empty() {
-        // 用户输入可能带尾部斜杠或大小写差异，和监控列表保存的 source_url
-        // 不一定逐字节相同；统一按“去尾部斜杠 + 大小写不敏感”匹配，保证
-        // 平台失败时本地缓存回退不会因为 URL 写法不同而查不到。
-        sql.push_str(" AND LOWER(TRIM(source_url, '/')) = LOWER(TRIM(?, '/'))");
+        // 用户输入可能带尾部斜杠、大小写差异或 `?spm_id_from=` 跟踪参数，和库里
+        // 保存的 source_url 不一定逐字节相同；统一按「同一个博主」的键比较，
+        // 保证「平台失败回退缓存」和「列历史取并集」不会因为 URL 写法不同而漏条。
+        sql.push_str(&format!(" AND {SOURCE_URL_KEY_SQL} = ?"));
     }
     if !anchor.is_empty() {
         sql.push_str(" AND anchor = ?");
@@ -1709,7 +1728,7 @@ pub async fn get_videos(
 
     let mut query = sqlx::query(&sql);
     if !source_url.is_empty() {
-        query = query.bind(source_url);
+        query = query.bind(source_url_key(source_url));
     }
     if !anchor.is_empty() {
         query = query.bind(anchor);
@@ -1814,11 +1833,12 @@ pub async fn list_videos(
     downloaded_only: bool,
 ) -> anyhow::Result<Vec<Video>> {
     let mut sql = String::from(
-        "SELECT id, platform, url, title, cover, cover_cache, published_at, duration, anchor, source_url, downloaded
+        "SELECT id, platform, url, title, cover, cover_cache, published_at, duration, anchor, source_url, downloaded, downloaded_at
          FROM videos WHERE 1=1",
     );
     if !source_url.is_empty() {
-        sql.push_str(" AND source_url = ?");
+        // 与 get_videos 同一套「同一个博主」比较规则，避免两条读路径口径不一致。
+        sql.push_str(&format!(" AND {SOURCE_URL_KEY_SQL} = ?"));
     }
     if !anchor.is_empty() {
         sql.push_str(" AND anchor = ?");
@@ -1830,7 +1850,7 @@ pub async fn list_videos(
 
     let mut query = sqlx::query(&sql);
     if !source_url.is_empty() {
-        query = query.bind(source_url);
+        query = query.bind(source_url_key(source_url));
     }
     if !anchor.is_empty() {
         query = query.bind(anchor);
@@ -2514,6 +2534,72 @@ mod tests {
         // 测试库文件交由 OS 临时目录回收，避免并发删除正在使用的 SQLite 文件。
         std::mem::forget(file);
         pool
+    }
+
+    #[test]
+    fn source_url_key_normalizes_query_slash_and_case() {
+        assert_eq!(
+            source_url_key(" https://Space.Bilibili.com/601214690/?spm_id_from=1#/all "),
+            "https://space.bilibili.com/601214690"
+        );
+        assert_eq!(source_url_key("https://x.test/a/"), "https://x.test/a");
+        assert_eq!(source_url_key(""), "");
+    }
+
+    #[tokio::test]
+    async fn source_url_matching_ignores_tracking_query() {
+        // 用户在 B站复制的主页地址常带 ?spm_id_from=... 这类跟踪参数。若按逐字节
+        // 比较，同一个博主会被当成两个来源：列历史取并集时捞不到历史条目
+        // （真实事故：界面从 45 条掉到 34 条），平台失败时的缓存回退也会失效。
+        let pool = test_pool().await;
+        let meta = VideoMeta {
+            id: "BVtrack".into(),
+            platform: "bilibili".into(),
+            url: "https://www.bilibili.com/video/BVtrack".into(),
+            title: "带跟踪参数入库".into(),
+            cover: String::new(),
+            published_at: "2026-09-25".into(),
+            duration: 60,
+        };
+        upsert_video(
+            &pool,
+            &meta,
+            "某主播",
+            "https://space.bilibili.com/601214690?spm_id_from=333.337.0.0",
+            "",
+        )
+        .await
+        .unwrap();
+
+        // 库里存的是带参数的地址；用归一化（去掉跟踪参数）后的地址查，必须命中。
+        let by_clean = get_videos(&pool, "https://space.bilibili.com/601214690", "", false)
+            .await
+            .unwrap();
+        assert_eq!(by_clean.len(), 1, "去掉跟踪参数后必须还能查到历史条目");
+        assert_eq!(by_clean[0].id, "BVtrack");
+
+        // 反向同理：库里干净、查询带参数也要命中。
+        let by_dirty = get_videos(
+            &pool,
+            "https://space.bilibili.com/601214690?spm_id_from=333.1007.0.0",
+            "",
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(by_dirty.len(), 1);
+
+        // 两条读路径口径必须一致，否则界面与 MCP 会给出不同的条数。
+        let via_list = list_videos(&pool, "https://space.bilibili.com/601214690/", "", false)
+            .await
+            .unwrap();
+        assert_eq!(via_list.len(), 1, "list_videos 必须与 get_videos 同口径");
+
+        // 不同博主绝不能被误合并。
+        let other = get_videos(&pool, "https://space.bilibili.com/123456", "", false)
+            .await
+            .unwrap();
+        assert!(other.is_empty());
     }
 
     #[tokio::test]
