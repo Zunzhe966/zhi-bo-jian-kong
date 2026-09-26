@@ -778,8 +778,14 @@ export default function App() {
   const retryFailedNotify = async () => {
     setNotifyBusy(true)
     try {
+      // 后端 notify-retry 的 0 被改写成 100（不是「全部」），文案不许骗人
       const r = await window.desktop.cli('notify-retry', '0')
-      message.success(`已把 ${r.retried || 0} 条失败通知放回待发送队列，下一轮会自动重试`)
+      const n = r.retried || 0
+      message.success(
+        n >= 100
+          ? `已把 100 条失败通知放回待发送队列（单次上限 100 条，还有更多就再点一次）`
+          : `已把 ${n} 条失败通知放回待发送队列，下一轮会自动重试`
+      )
       await reloadNotifyPanel()
     } catch (e) {
       message.error(String(e.message || e))

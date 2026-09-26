@@ -31,17 +31,30 @@ const APP_BUNDLE_NAME = '尊者直播监控.app'
 const STAGE_PREFIX = '.zunzhe-update-'
 const OLD_PREFIX = '.zunzhe-old-'
 
-/** '1.2.3' / 'v1.2.3' / '1.2.3-beta.1' → [1,2,3,0,...]（非数字段忽略） */
+/** '1.2.3' / 'v1.2.3' / '1.2.3-beta.1' → [1,2,3]（只取主版本号段） */
 function parseVersion(v) {
   if (typeof v !== 'string') return [0]
-  const nums = v.trim().replace(/^v/i, '')
-    .split(/[.\-+_]/)
+  const s = v.trim().replace(/^v/i, '')
+  const dash = s.indexOf('-')
+  const main = dash >= 0 ? s.slice(0, dash) : s
+  const nums = main.split(/[.\-+_]/)
     .map((s) => parseInt(s, 10))
     .filter((n) => Number.isFinite(n))
   return nums.length ? nums : [0]
 }
 
-/** a > b → 1；a < b → -1；相等 → 0。缺位按 0 补齐。 */
+/** 预发布后缀：'1.2.3-beta.1' → 'beta.1'；正式版 → ''。 */
+function prereleaseOf(v) {
+  if (typeof v !== 'string') return ''
+  const s = v.trim().replace(/^v/i, '')
+  const dash = s.indexOf('-')
+  return dash >= 0 ? s.slice(dash + 1) : ''
+}
+
+/** a > b → 1；a < b → -1；相等 → 0。缺位按 0 补齐。
+ *  语义：主版本相同时**正式版比预发布版新**（1.7.3 > 1.7.3-beta.1）。
+ *  旧实现把 'beta.1' 里的 1 当成第 4 个数字，导致 beta 被判为比正式版新
+ *  ——一旦更新源混入 beta 包就会把正式版用户降版（2026-09-26 实测）。 */
 function compareVersion(a, b) {
   const x = parseVersion(a)
   const y = parseVersion(b)
@@ -50,6 +63,27 @@ function compareVersion(a, b) {
     const xi = x[i] || 0
     const yi = y[i] || 0
     if (xi !== yi) return xi > yi ? 1 : -1
+  }
+  const px = prereleaseOf(a)
+  const py = prereleaseOf(b)
+  if (px === py) return 0
+  if (!px) return 1
+  if (!py) return -1
+  const ax = px.split('.')
+  const by = py.split('.')
+  for (let i = 0; i < Math.max(ax.length, by.length); i++) {
+    const m = ax[i]
+    const k = by[i]
+    if (m === undefined) return -1
+    if (k === undefined) return 1
+    const mn = parseInt(m, 10)
+    const kn = parseInt(k, 10)
+    const bothNum = Number.isFinite(mn) && Number.isFinite(kn)
+    if (bothNum) {
+      if (mn !== kn) return mn > kn ? 1 : -1
+    } else if (m !== k) {
+      return m > k ? 1 : -1
+    }
   }
   return 0
 }
@@ -174,9 +208,31 @@ function checkForUpdate({ releasesDir, currentVersion, tmpDir }) {
   }
 }
 
+/**
+ * 删除一个目录树（里面可能含 .app / app.asar）。
+ *
+ * **不要用 fs.rmSync 删应用包。** Electron 会改写主进程的 fs，把任何含
+ * `.asar` 的路径当成压缩包的虚拟目录，于是 rmSync 递归到
+ * `Contents/Resources/app.asar` 时认定它是目录、去调 rmdir，内核直接回
+ * ENOTDIR。实测后果：旧包永远删不掉，每更新一次就在 /Applications 里
+ * 留一份 288MB 的残骸吃内盘空间。
+ *
+ * 交给系统 /bin/rm 走原始文件系统最稳；/bin/rm 不可用时再退回 Node 实现
+ * （对不含 asar 的路径有效）。
+ */
+function rmrf(target) {
+  const r = spawnSync('/bin/rm', ['-rf', target], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
+  if (r.status === 0) return { ok: true }
+  try {
+    fs.rmSync(target, { recursive: true, force: true })
+    return { ok: true }
+  } catch (e) {
+    return { ok: false, error: `${(r.stderr || '').trim() || e.message}` }
+  }
+}
+
 /** adhoc 签名。无 Apple 开发者证书时这是唯一正确做法（自签名证书会让 Team ID 不一致）。 */
-function signApp(appPath) {
-  const r = spawnSync('/usr/bin/codesign', ['--deep', '--force', '--sign', '-', appPath],
+function signApp(appPath) {  const r = spawnSync('/usr/bin/codesign', ['--deep', '--force', '--sign', '-', appPath],
     { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
   return { ok: r.status === 0, out: `${r.stdout || ''}${r.stderr || ''}`.trim() }
 }
@@ -241,19 +297,36 @@ function applyRelease({ release, installPath, log = () => {} }) {
   } catch (e) {
     return { ok: false, error: e.message }
   } finally {
-    if (unzipTmp) { try { fs.rmSync(unzipTmp, { recursive: true, force: true }) } catch (e) { /* 忽略 */ } }
+    if (unzipTmp) {
+      const del = rmrf(unzipTmp)
+      if (!del.ok) log(`解压临时目录清理失败 ${unzipTmp}: ${del.error}`)
+    }
   }
 }
 
-/** 清掉上一次更新留下的暂存/旧包目录。只在启动时调用，只删自己造的前缀。 */
-function cleanupStale(installDir) {
+/**
+ * 清掉上一次更新留下的暂存/旧包目录。只在启动时调用，只删自己造的前缀。
+ *
+ * 失败**不再静默**：macOS 13+ 的「App 管理」TCC 有可能拦住非公证应用删除
+ * /Applications 下的 .app 包，那样旧包会一直留在内盘上吃空间。这种情况必须
+ * 在日志里说清楚，否则用户只会看到磁盘莫名变小。
+ */
+function cleanupStale(installDir, log = () => {}) {
   const removed = []
   let names = []
-  try { names = fs.readdirSync(installDir) } catch (e) { return removed }
+  try { names = fs.readdirSync(installDir) } catch (e) {
+    log(`读取 ${installDir} 失败: ${e.message}`)
+    return removed
+  }
   for (const n of names) {
     if (!n.startsWith(STAGE_PREFIX) && !n.startsWith(OLD_PREFIX)) continue
     const full = path.join(installDir, n)
-    try { fs.rmSync(full, { recursive: true, force: true }); removed.push(full) } catch (e) { /* 忽略 */ }
+    const del = rmrf(full)
+    if (del.ok) {
+      removed.push(full)
+    } else {
+      log(`清理失败 ${n}: ${del.error}（留在原处，可手动删）`)
+    }
   }
   return removed
 }
@@ -270,6 +343,7 @@ module.exports = {
   checkForUpdate,
   signApp,
   verifyApp,
+  rmrf,
   applyRelease,
   cleanupStale,
 }

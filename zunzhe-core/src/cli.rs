@@ -26,7 +26,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// 添加监控（直播/短视频按 URL 自动识别；主播主页同时挂两种）
+    /// 添加监控（直播/短视频按 URL 自动识别；抖音主页会同时挂上直播监控，
+    /// B站主页只能挂短视频——直播间地址需另行添加）
     MonitorAdd {
         url: String,
         #[arg(default_value = "")]
@@ -372,6 +373,26 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 watch.add_live(&url, &format!("主播: {name}"), &quality)?;
                 added_live = true;
             } else if video_domain && !live_domain {
+                // 抖音主页：与 MCP monitor_add 同一行为——解析抖音号把直播一并挂上
+                // （live.douyin.com/{抖音号} 免登录检测）。1.7.5 之前 CLI 只挂短视频，
+                // 导致桌���端加的主播永不录直播、走 MCP 的却会录。
+                if lower.contains("douyin.com/user") {
+                    match platform::douyin_unique_id_from_url(&url, &project_dir).await {
+                        Ok(info) => {
+                            let uid = info.get("unique_id").and_then(|v| v.as_str()).unwrap_or("");
+                            if !uid.is_empty() && uid != "0" {
+                                let live_url = format!("https://live.douyin.com/{uid}");
+                                let lname = if name.is_empty() { uid.to_string() } else { name.clone() };
+                                watch.add_live(&live_url, &format!("主播: {lname}"), &quality)?;
+                                added_live = true;
+                            }
+                        }
+                        Err(e) => {
+                            // 解析失败不阻断短视频挂载，但要让调用方知道直播没挂上。
+                            tracing::warn!("抖音主页解析抖音号失败，未自动挂直播监控: {e:#}");
+                        }
+                    }
+                }
                 watch.add_video(&url, if name.is_empty() { &url } else { &name }, None, None)?;
                 added_video = true;
             } else {
@@ -892,8 +913,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Schema => {
             println!("{}", api.schema());
         }
-        // 已在打开数据库前分流返回；保留 arm 让命令枚举保持穷尽。
-        Command::Paths => unreachable!("paths 已在数据库打开前返回"),
+        // 已在打开数据库前分流返回；这里保留 arm 让命令枚举保持穷尽。
+        // 但绝不能 `unreachable!()`：任何一次重构把上面的提前 return 挪走，
+        // `paths`（桌面端冷启动读可信根的一等能力）就会直接 panic。
+        // 兜底走同一份只读输出，行为等价且不可能崩。
+        Command::Paths => {
+            println!("{}", paths_json(&paths));
+        }
         Command::McpInfo => {
             println!(
                 "{}",

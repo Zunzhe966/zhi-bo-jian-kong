@@ -960,7 +960,9 @@ async fn validate_media_readable(project_dir: &Path, path: &Path) -> anyhow::Res
     cmd.kill_on_drop(true)
         .args(["-v", "error", "-i"])
         .arg(path)
-        .args(["-t", "0", "-f", "null", "-"])
+        // `-t 0` 是输出侧时长=0，等于不解任何码：头部完整但数据被截断的文件
+        // 会直接返回 0 被误判为「可读」，坏文件照样入队。解 1 秒足够发现问题。
+        .args(["-t", "1", "-f", "null", "-"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());

@@ -403,6 +403,18 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
                 .get("anchor_name")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
+            // 与 CLI `process` 一致：daemon 不在就先拉起，否则任务落库 pending
+            // 却没有任何 worker 消费它——智能体看到「已加入队列」后永远等不到
+            // 结果（1.7.5 修复）。拉起失败**不阻断入队**（文件已入库还能由
+            // 之后的 daemon 消费），但必须把原因写进 startup_error 字段。
+            let (daemon_running, startup_error) = if crate::service::rust_daemon_alive(project_dir) {
+                (true, None)
+            } else {
+                match crate::service::ensure_core(project_dir) {
+                    Ok(_) => (true, None),
+                    Err(e) => (false, Some(format!("{e:#}"))),
+                }
+            };
             let result =
                 crate::download::enqueue_process(pool, project_dir, file_path, anchor_name).await?;
             tracing::info!(
@@ -411,7 +423,7 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
                 result.queued,
                 started.elapsed().as_millis()
             );
-            let daemon_running = crate::service::rust_daemon_alive(project_dir);
+            let daemon_running = daemon_running || crate::service::rust_daemon_alive(project_dir);
             tracing::info!(
                 "process_media daemon probe finished daemon_running={} elapsed_ms={}",
                 daemon_running,
@@ -424,6 +436,7 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
                 "status": result.status,
                 "disposition": result.disposition,
                 "daemon_running": daemon_running,
+                "startup_error": startup_error,
                 "file": file_path,
                 "anchor": anchor_name,
                 "hint": result.hint
