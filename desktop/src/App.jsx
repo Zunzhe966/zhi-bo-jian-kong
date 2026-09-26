@@ -438,7 +438,7 @@ export default function App() {
       // 裸抖音号（如 Glx6768）原样传给 CLI——1.7.2 起 Rust 侧 iesdouyin 免登录
       // 秒级解析，不再走 Chrome 浏览器反查（被风控、曾把界面拖到卡死）
       const url = v.url.trim()
-      await window.desktop.cli('add-video', url, v.name.trim(), v.autoDownload ? '是' : '否', v.notify || '跟随全局')
+      await window.desktop.cli('add-video', url, (v.name || '').trim(), v.autoDownload ? '是' : '否', v.notify || '跟随全局')
       await ensureStarted()
       message.success('已添加发布视频监控')
       setVideoOpen(false)

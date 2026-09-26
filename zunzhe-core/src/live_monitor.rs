@@ -580,8 +580,17 @@ impl<'a> LiveMonitor<'a> {
         // 磁盘剩余空间低于配置阈值时不启动录制，避免把磁盘写满导致 ffmpeg
         // 崩溃/丢状态。旧 Python 有 `录制空间剩余阈值(gb)`，Rust 必须遵守。
         self.ensure_disk_space()?;
-        let anchor = if status.anchor_name.is_empty() {
-            item.remark.clone()
+        // 目录主播名必须以监控源配置的名字为准（手册 R2：一级目录=主播名）。
+        // 房间昵称是营销文案且主播随时会改（如「关立新（早上7:00直播）」），
+        // 拿它当目录名会把一个主播的产物随改名裂成多棵树。
+        let remark = item
+            .remark
+            .trim()
+            .trim_start_matches("主播:")
+            .trim_start_matches("主播：")
+            .trim();
+        let anchor = if !remark.is_empty() {
+            remark.to_string()
         } else {
             status.anchor_name.clone()
         };
@@ -820,8 +829,14 @@ impl<'a> LiveMonitor<'a> {
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36".to_string(),
             "-reconnect_delay_max".to_string(),
             "60".to_string(),
+            // 布尔 AVOption 必须显式给值：裸写 -reconnect_streamed 会让 ffmpeg 把
+            // 下一个参数（-reconnect_at_eof）当成它的值，解析失败报
+            // 「Error opening input files: Invalid argument」——2026-09-26 实测
+            // 复现，此 bug 导致本机全部直播录制从未真正写入一个字节。
             "-reconnect_streamed".to_string(),
+            "1".to_string(),
             "-reconnect_at_eof".to_string(),
+            "1".to_string(),
             "-i".to_string(),
             stream_url.to_string(),
             "-map".to_string(),
@@ -1251,7 +1266,13 @@ pub async fn record_live_once(
     let ffmpeg = monitor.ffmpeg_bin();
     let mut args = monitor.ffmpeg_args(&status.stream_url, &output);
     if duration_secs > 0 {
-        args.extend(["-t".into(), duration_secs.to_string()]);
+        // -t 必须插在 -i 之前（输入侧限时）：追加在输出文件之后对直播流
+        // 不生效，会一路录到关播（2026-09-26 实测 12 秒参数录了 10 分钟未停）。
+        if let Some(i) = args.iter().position(|a| a == "-i") {
+            args.splice(i..i, ["-t".into(), duration_secs.to_string()]);
+        } else {
+            args.extend(["-t".into(), duration_secs.to_string()]);
+        }
     }
     let mut cmd = Command::new(&ffmpeg);
     let pid_for_cleanup = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -1320,6 +1341,32 @@ mod tests {
     fn clean_name_removes_invalid_chars() {
         assert_eq!(clean_name(" 主播/甲:测试? "), "主播_甲_测试");
         assert_eq!(clean_name("////"), "空白昵称");
+    }
+
+    #[tokio::test]
+    async fn ffmpeg_boolean_options_carry_explicit_values() {
+        // 回归锁：-reconnect_streamed / -reconnect_at_eof 裸写会被 ffmpeg 把下一个
+        // 参数当值解析，报「Invalid argument」导致全部直播录制从未成功（2026-09-26 实测）。
+        let dir = std::env::temp_dir().join(format!("zunzhe-ffmpeg-args-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::write(dir.join("config").join("config.ini"), "").unwrap();
+        std::fs::write(dir.join("config").join("fupan_config.ini"), "").unwrap();
+        let pool = crate::db::open_pool(&dir.join("args.db")).await.unwrap();
+        let cfg = crate::config::Config::load(&dir).unwrap();
+        let watch = Watchlist::new(dir.clone());
+        let monitor = LiveMonitor::new(&pool, &dir, &cfg, &watch);
+        let args = monitor.ffmpeg_args("http://example.com/s.m3u8", Path::new("/tmp/o.ts"));
+        for opt in ["-reconnect_streamed", "-reconnect_at_eof", "-reconnect"] {
+            if let Some(i) = args.iter().position(|a| a == opt) {
+                let next = args.get(i + 1).map(|s| s.as_str()).unwrap_or("");
+                assert!(
+                    next == "1" || next == "0",
+                    "{opt} 必须跟显式布尔值，实际后跟: {next:?}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
