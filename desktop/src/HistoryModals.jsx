@@ -19,8 +19,8 @@ export default function HistoryModals({
             <Input placeholder="用于文件夹命名，如 影视飓风" />
           </Form.Item>
           <Form.Item label="博主主页地址" name="url" rules={[{ required: true }]}
-            extra="B站填 space.bilibili.com/数字；其他平台填 RSS 订阅地址">
-            <Input placeholder="https://space.bilibili.com/946974" />
+            extra="B站填 space.bilibili.com/数字，也支持 b23.tv 分享短链、视频链接或直接填 UID；其他平台填 RSS 订阅地址">
+            <Input placeholder="https://space.bilibili.com/946974 或 b23.tv 短链" />
           </Form.Item>
         </Form>
       </Modal>

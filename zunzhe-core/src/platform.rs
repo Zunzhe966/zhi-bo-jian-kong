@@ -477,8 +477,14 @@ impl BilibiliAdapter {
     }
 
     fn mid_from_url(url: &str) -> Option<String> {
-        let re = regex::Regex::new(r"space\.bilibili\.com/(\d+)").ok()?;
-        re.captures(url)
+        let trimmed = url.trim();
+        // 纯数字直接当 UID（用户在「批量下载」里只填了数字的情况）。
+        if !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit()) {
+            return Some(trimmed.to_string());
+        }
+        // space.bilibili.com/数字 与 m.bilibili.com/space/数字 都要认。
+        let re = regex::Regex::new(r"(?:space\.bilibili\.com|/space)/(\d+)").ok()?;
+        re.captures(trimmed)
             .and_then(|caps| caps.get(1))
             .map(|m| m.as_str().to_string())
     }
@@ -1039,6 +1045,81 @@ fn unix_to_date_in_offset(ts: i64, offset: chrono::FixedOffset) -> String {
         .with_timezone(&offset)
         .format("%Y-%m-%d")
         .to_string()
+}
+
+/// B站分享短链域名：这些不含 `space.bilibili.com`，若直接交给通用分支会被当网页抓。
+fn is_bilibili_short_link(url: &str) -> bool {
+    ["b23.tv", "bili2233.cn", "bili22.cn", "acg.tv"]
+        .iter()
+        .any(|d| url.contains(d))
+}
+
+/// 跟随跳转拿到最终 URL（短链 → 真实地址）。失败返回 None，调用方退回原地址。
+async fn follow_redirect(url: &str) -> Option<String> {
+    let client = crate::net::client_builder()
+        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+        .timeout(Duration::from_secs(15))
+        .build()
+        .ok()?;
+    let resp = client.get(url).send().await.ok()?;
+    Some(resp.url().to_string())
+}
+
+/// 视频 BV 号 → UP 主 mid（官方 view 接口）。
+async fn bilibili_owner_mid(bvid: &str) -> Option<String> {
+    let client = crate::net::client_builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .ok()?;
+    let resp = client
+        .get(format!(
+            "https://api.bilibili.com/x/web-interface/view?bvid={bvid}"
+        ))
+        .header(
+            reqwest::header::REFERER,
+            reqwest::header::HeaderValue::from_static("https://www.bilibili.com"),
+        )
+        .send()
+        .await
+        .ok()?;
+    let data: serde_json::Value = resp.json().await.ok()?;
+    if data.get("code").and_then(|c| c.as_i64()) != Some(0) {
+        return None;
+    }
+    data["data"]["owner"]["mid"]
+        .as_i64()
+        .map(|m| m.to_string())
+}
+
+/// 把用户在各种入口粘贴的 B站链接归一化成 `space.bilibili.com/{mid}`：
+///   - 空间地址（space.bilibili.com/数字、m.bilibili.com/space/数字）原样可用；
+///   - `b23.tv` 等分享短链：跟随跳转拿真实地址，视频链接再经 view 接口取 UP 主 mid；
+///   - 纯数字：直接当 UID。
+/// 非 B站输入原样返回，交给 RssAdapter 处理其它平台/RSS 源。
+pub async fn normalize_blogger_input(input: &str) -> String {
+    let input = input.trim();
+    if input.is_empty() {
+        return String::new();
+    }
+    // 纯数字 → 当 UID。
+    if input.chars().all(|c| c.is_ascii_digit()) {
+        return format!("https://space.bilibili.com/{input}");
+    }
+    let mut target = input.to_string();
+    if is_bilibili_short_link(input) {
+        if let Some(final_url) = follow_redirect(input).await {
+            target = final_url;
+        }
+    }
+    // 视频链接（含短链跳到的视频页）→ 取 UP 主 mid，换成空间地址。
+    if target.contains("/video/") || target.contains("bvid=") {
+        if let Some(bv) = extract_bvids(&target).into_iter().next() {
+            if let Some(mid) = bilibili_owner_mid(&bv).await {
+                return format!("https://space.bilibili.com/{mid}");
+            }
+        }
+    }
+    target
 }
 
 /// RSS/Atom 适配器：解析标题/链接/封面/日期，返回统一 VideoMeta。
@@ -2190,6 +2271,34 @@ mod tests {
         assert_eq!(
             BilibiliAdapter::mid_from_url("https://space.bilibili.com/946974/video"),
             Some("946974".to_string())
+        );
+        // m.bilibili.com/space/数字 也要认。
+        assert_eq!(
+            BilibiliAdapter::mid_from_url("https://m.bilibili.com/space/1458143131"),
+            Some("1458143131".to_string())
+        );
+        // 纯数字直接当 UID。
+        assert_eq!(
+            BilibiliAdapter::mid_from_url("1458143131"),
+            Some("1458143131".to_string())
+        );
+        assert_eq!(BilibiliAdapter::mid_from_url("https://example.com/x"), None);
+    }
+
+    #[tokio::test]
+    async fn normalize_blogger_input_handles_uid_and_passthrough() {
+        // 纯数字 → 空间地址；非短链/非视频输入原样返回（不触发网络）。
+        assert_eq!(
+            normalize_blogger_input("1458143131").await,
+            "https://space.bilibili.com/1458143131"
+        );
+        assert_eq!(
+            normalize_blogger_input("  https://rsshub.app/bilibili/user/video/1  ").await,
+            "https://rsshub.app/bilibili/user/video/1"
+        );
+        assert_eq!(
+            normalize_blogger_input("https://space.bilibili.com/946974").await,
+            "https://space.bilibili.com/946974"
         );
     }
 
