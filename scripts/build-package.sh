@@ -177,8 +177,14 @@ if [ "$IS_MAC" = "1" ]; then
         [ -e "$old" ] || continue
         base="$(basename "$old")"
         old_ver="${base#尊者直播监控-}"; old_ver="${old_ver%.zip}"
-        # -e：文件存在；-v：更新器只认「更高版本」，故低于当前版本的清掉。
-        if [ "$old_ver" != "$VERSION" ] && ! [ "$old_ver" \> "$VERSION" ]; then
+        # 版本比较必须按「. 」分段数字化（1.7.10 > 1.7.9）。bash 的字符串 \>
+        # 是字典序，"1.7.9" > "1.7.10" 会误判，导致旧包清不掉。
+        cmp=$(awk -v a="$old_ver" -v b="$VERSION" 'BEGIN{
+          n=split(a,A,"."); m=split(b,B,"."); k=(n>m?n:m); r=0;
+          for(i=1;i<=k;i++){x=A[i]+0;y=B[i]+0; if(x>y){r=1;break} if(x<y){r=-1;break}}
+          print r}')
+        # r<=0：旧包不高于当前版本，清掉；r>0 保留（更新器只推更高版本）。
+        if [ "$old_ver" != "$VERSION" ] && [ "$cmp" -le 0 ]; then
           rm -f "$old"
         fi
       done
