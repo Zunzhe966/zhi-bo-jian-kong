@@ -105,8 +105,8 @@ export default function ItemSettingsModal({
         </Space>
         <div className="stash-box-hint">
           {type === 'live'
-            ? '按主播名分开存放：主播名 / 直播 /'
-            : '按博主名分开存放：博主名 / 短视频 /'}
+            ? '按分类存放：直播 / 主播名 /'
+            : '按分类存放：短视频 / 博主名 /'}
         </div>
       </div>
       <div style={{ marginTop: 24, paddingTop: 16, borderTop: '1px solid #f0f0f0' }}>

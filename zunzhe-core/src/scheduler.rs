@@ -834,7 +834,7 @@ async fn apply_source_outcome(
                         }
                         let should_download = item_download.unwrap_or(auto_download);
                         if should_download {
-                            match db::enqueue_task(pool, "download", &v.url, &name).await {
+                            match download::enqueue_download(pool, &v.url, &name, "短视频").await {
                                 Ok(_) => *enqueued += 1,
                                 Err(e) => warn!("下载任务入队失败: {e:#}"),
                             }

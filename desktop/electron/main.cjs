@@ -1,7 +1,7 @@
 const { app, BrowserWindow, Tray, Menu, ipcMain, shell, nativeImage, Notification, protocol, net } = require('electron')
 const path = require('path')
 const { pathToFileURL } = require('url')
-const { spawn } = require('child_process')
+const { spawn, execFileSync } = require('child_process')
 const fs = require('fs')
 const os = require('os')
 const { consumeNotifyQueue } = require('./local-notify.cjs')
@@ -901,6 +901,32 @@ app.whenReady().then(async () => {
     showLocalNotification(title, body)
     return { ok: true }
   })
+  // 打开文件/目录：按「文件类型」挑正确的本地程序打开，而不是交给系统默认关联。
+  //
+  // 为什么要这么改：以前直接 shell.openPath，走的是 macOS「默认打开方式」。
+  // 如果用户曾经把 .mp4/.txt 默认关联到某个代码编辑器（比如 Trae），点开就会在
+  // Trae 里打开并弹「格式不对」——这正是被吐槽的点。现在改成：
+  //   - 视频 → VLC / IINA / QuickTime Player（按安装顺序挑第一个存在的）
+  //   - 音频 → Music / VLC / QuickTime Player
+  //   - 图片 → Preview
+  //   - 文本(.txt/.srt/.md/.json/.csv…) → TextEdit
+  //   - 其它未知类型 / 首选 App 都没装 → 在访达里定位，而不是用错的程序硬开
+  // 这样「视频就开视频、文本就开文本」，不会再弹出编程语言编辑器。
+  function openWithPreferredApps(target, appNames) {
+    for (const appName of appNames) {
+      try {
+        execFileSync('open', ['-a', appName, target], { timeout: 8000 })
+        return true
+      } catch {
+        // 该 App 未安装或启动失败，尝试下一个候选。
+      }
+    }
+    return false
+  }
+  const MEDIA_VIDEO_EXTS = ['.mp4', '.mkv', '.mov', '.m4v', '.ts', '.m2ts', '.flv', '.webm', '.avi', '.mpg', '.mpeg', '.wmv', '.rmvb', '.3gp']
+  const MEDIA_AUDIO_EXTS = ['.mp3', '.m4a', '.wav', '.aac', '.flac', '.ogg', '.wma', '.opus']
+  const IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.heic', '.tiff']
+  const TEXT_EXTS = ['.txt', '.md', '.markdown', '.srt', '.ass', '.ssa', '.vtt', '.lrc', '.json', '.csv', '.log', '.xml', '.yaml', '.yml', '.sub']
   ipcMain.handle('open-path', async (_, p) => {
     const target = resolveOpenablePath(p)
     if (!target) {
@@ -911,11 +937,32 @@ app.whenReady().then(async () => {
       showLocalNotification('无法打开目录', `${p || '(空路径)'}\n${msg}`)
       return msg
     }
-    const err = await shell.openPath(target)
-    if (err) {
-      console.warn('[open-path] 打开失败', target, err)
-      showLocalNotification('无法打开目录', `${target}\n${err}`)
-      return err
+    // 目录永远用访达打开（Finder，不可能是 Trae），保持原来的「打开文件夹」体验。
+    let st = null
+    try { st = fs.statSync(target) } catch { /* 不存在就走下面的兜底 */ }
+    if (st && st.isDirectory()) {
+      const err = await shell.openPath(target)
+      if (err) {
+        console.warn('[open-path] 打开目录失败', target, err)
+        showLocalNotification('无法打开目录', `${target}\n${err}`)
+        return err
+      }
+      return ''
+    }
+    const ext = path.extname(target).toLowerCase()
+    let opened = false
+    if (MEDIA_VIDEO_EXTS.includes(ext)) {
+      opened = openWithPreferredApps(target, ['VLC', 'IINA', 'QuickTime Player'])
+    } else if (MEDIA_AUDIO_EXTS.includes(ext)) {
+      opened = openWithPreferredApps(target, ['Music', 'VLC', 'QuickTime Player'])
+    } else if (IMAGE_EXTS.includes(ext)) {
+      opened = openWithPreferredApps(target, ['Preview'])
+    } else if (TEXT_EXTS.includes(ext)) {
+      opened = openWithPreferredApps(target, ['TextEdit'])
+    }
+    if (!opened) {
+      // 未知类型或首选 App 都没装上：在访达里定位，而不是用错的程序硬开。
+      shell.showItemInFolder(target)
     }
     return ''
   })

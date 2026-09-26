@@ -764,9 +764,9 @@ impl<'a> LiveMonitor<'a> {
         crate::service::find_binary(self.project_dir, "ffmpeg", "ffmpeg.exe")
     }
 
-    /// 录制输出路径：`{直播保存路径|产物根}/{主播}/直播/{日期} {场次}/{场次}.{ext}`。
+    /// 录制输出路径：`{直播保存路径|产物根}/直播/{主播}/{日期} {场次}/{场次}.{ext}`。
     ///
-    /// 新布局（产品手册第 3 章）：产物根下一级永远是主播名，不再按平台分目录；
+    /// 新布局：类型在最上层、主播在下层，不再按平台/主播分目录；
     /// 转写产物随后落在同一目录（pipeline 的 out_dir = 录像所在目录），满足
     /// 「文字和视频在同一个文件夹」。旧 Python 的「保存文件夹是否以作者/时间/标题
     /// 区分」「保存文件名是否包含标题」四个开关随之作废——目录形态由手册固定，
@@ -783,7 +783,7 @@ impl<'a> LiveMonitor<'a> {
         } else {
             clean_name(title)
         };
-        let anchor_dir = root.join(clean_name(anchor)).join("直播");
+        let anchor_dir = root.join("直播").join(clean_name(anchor));
         // 同一天同标题复播（或前一场失败留了空目录）时给场次名加时刻后缀，
         // 保证场次目录互不覆盖——ffmpeg -y 会写穿已存在的同名文件。
         let mut session = base_session.clone();
@@ -1794,8 +1794,8 @@ mod tests {
         let out = monitor.output_path(&item, &status, "主播/甲").unwrap();
         let date = chrono::Local::now().format("%Y-%m-%d").to_string();
         let expect_dir = media
-            .join("主播_甲")
             .join("直播")
+            .join("主播_甲")
             .join(format!("{date} 测试_标题_一"));
         assert_eq!(
             out,
@@ -1844,8 +1844,8 @@ mod tests {
         let date = chrono::Local::now().format("%Y-%m-%d").to_string();
         std::fs::create_dir_all(
             media
-                .join("主播甲")
                 .join("直播")
+                .join("主播甲")
                 .join(format!("{date} 晚间闲聊")),
         )
         .unwrap();

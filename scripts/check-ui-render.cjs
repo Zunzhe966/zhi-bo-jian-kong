@@ -295,7 +295,7 @@ const modalText = (page) => page.evaluate(() => {
     await page.screenshot({ path: path.join(shotDir, '3-主播设置.png') })
     const t = await modalText(page)
     if (!t.includes('存到这里')) report.push('  ✗ 主播设置里没有「存到这里」这一块')
-    if (!t.includes('/Volumes/A区/尊者产物/侯翠翠')) report.push('  ✗ 主播设置里没显示真实存放路径（应为主播专属目录）')
+    if (!t.includes('/Volumes/A区/尊者产物/直播/侯翠翠')) report.push('  ✗ 主播设置里没显示真实存放路径（应为主播专属目录）')
     await page.keyboard.press('Escape')
     await page.waitForTimeout(700)
   } else {

@@ -30,7 +30,7 @@ pub async fn build(project_dir: &Path, pool: &SqlitePool, cfg: &Config) -> Resul
     let fupan_dir = dirs.fupan.clone();
     let logs_dir = dirs.logs();
     // 直播录像落点：`[录制设置] 直播保存路径` 填了就用它（与 live_monitor 同口径），
-    // 否则落在产物根（新布局 {产物根}/{主播}/直播/...）。界面「打开录制目录」
+    // 否则落在产物根（新布局 {产物根}/直播/{主播}/...）。界面「打开录制目录」
     // 必须开真正的录像目录。
     let recordings_dir = dirs.recordings();
 
@@ -38,7 +38,13 @@ pub async fn build(project_dir: &Path, pool: &SqlitePool, cfg: &Config) -> Resul
     let anchors = watch.live_anchor_view();
     let live = watch.list_live();
     let video_sources = watch.list_video();
-    let (recent_recordings, notes) = file_scan_cache(&media_root, &fupan_dir, project_dir)?;
+    let (recent_recordings, notes) = file_scan_cache(
+        &media_root,
+        &fupan_dir,
+        project_dir,
+        &recordings_dir,
+        &dirs.video_root,
+    )?;
     let recording_sessions = db::list_live_sessions(pool, "recording", 100).await?;
     let rust_running = service::rust_daemon_alive(project_dir);
     let heartbeat_ok = service::heartbeat_fresh_public(project_dir);
@@ -173,6 +179,8 @@ fn file_scan_cache(
     media_root: &Path,
     fupan_dir: &Path,
     project_dir: &Path,
+    recordings_dir: &Path,
+    video_root: &Path,
 ) -> Result<(Vec<Value>, Vec<Value>)> {
     let key_media = media_root.to_path_buf();
     let key_fupan = fupan_dir.to_path_buf();
@@ -189,7 +197,7 @@ fn file_scan_cache(
         }
     }
     let recent = recent_recordings(&key_media, &key_project);
-    let notes = pipeline_bridge::list_notes(&key_media, &key_fupan, "")?;
+    let notes = pipeline_bridge::list_notes(recordings_dir, video_root, &key_fupan, "")?;
     let mut guard = FILE_SCAN_CACHE.lock().unwrap_or_else(|p| p.into_inner());
     *guard = Some(FileScanCache {
         media_root: key_media,
@@ -202,7 +210,7 @@ fn file_scan_cache(
     Ok((recent, notes))
 }
 
-/// 递归扫描产物根下的最近媒体文件（新布局 `{产物根}/{主播}/{直播|短视频}/...`）。
+/// 递归扫描产物根下的最近媒体文件（新布局 `{产物根}/{直播|短视频|批量下载}/{主播}/...`）。
 /// 产物根下的系统目录（database/logs/downloads/fupan_output/covers/run）一律跳过，
 /// 只收媒体文件——日志、数据库、转写文本不该出现在「最近录制」里。
 fn recent_recordings(media_root: &Path, project_dir: &Path) -> Vec<Value> {
@@ -296,7 +304,7 @@ mod tests {
 
     #[test]
     fn recent_recordings_are_sorted_and_relative() {
-        // 新布局：{产物根}/{主播}/{直播|短视频}/{场次}/。扫描必须覆盖主播子目录、
+        // 新布局：{产物根}/{直播|短视频}/{主播}/{场次}/。扫描必须覆盖分类目录、
         // 跳过系统目录（logs/database/fupan_output 等），且只收媒体文件。
         let dir = std::env::temp_dir().join(format!(
             "zunzhe-status-rec-{}-{}",
@@ -307,11 +315,11 @@ mod tests {
                 .as_nanos()
         ));
         let media = dir.join("产物");
-        let video_dir = media.join("主播甲").join("短视频").join("某标题");
+        let video_dir = media.join("短视频").join("主播甲").join("某标题");
         std::fs::create_dir_all(&video_dir).unwrap();
         std::fs::write(video_dir.join("某标题.mp4"), b"12345").unwrap();
         std::fs::write(video_dir.join("某标题.转写.txt"), "文字").unwrap();
-        let live_dir = media.join("主播甲").join("直播").join("2026-09-22 场次一");
+        let live_dir = media.join("直播").join("主播甲").join("2026-09-22 场次一");
         std::fs::create_dir_all(&live_dir).unwrap();
         std::fs::write(live_dir.join("场次一.ts"), b"deep").unwrap();
         // 系统目录里的文件绝不许进「最近录制」。
@@ -328,14 +336,21 @@ mod tests {
         assert_eq!(
             rows.len(),
             2,
-            "只应收主播目录下的媒体文件（转写文本/系统目录除外）: {rows:?}"
+            "只应收分类目录下的媒体文件（转写文本/系统目录除外）: {rows:?}"
         );
         assert!(
             rows.iter().any(|row| row["file"]
                 .as_str()
                 .unwrap()
-                .contains("主播甲/直播/2026-09-22 场次一/场次一.ts")),
-            "桌面端最近录制应包含主播目录下的直播录像: {rows:?}"
+                .contains("直播/主播甲/2026-09-22 场次一/场次一.ts")),
+            "桌面端最近录制应包含直播目录下的直播录像: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row["file"]
+                .as_str()
+                .unwrap()
+                .contains("短视频/主播甲/某标题/某标题.mp4")),
+            "桌面端最近录制应包含短视频目录下的投稿: {rows:?}"
         );
         assert_eq!(rows[0]["size_mb"].as_f64().unwrap(), 0.0);
         assert!(rows[0]["probably_recording"].as_bool().unwrap());
@@ -624,21 +639,23 @@ mod tests {
         ));
         let media = dir.join("产物");
         let fupan = dir.join("fupan_output");
-        let video_dir = media.join("主播甲").join("短视频").join("一");
+        // 新布局：短视频/{主播}/{标题}/，且带复盘产物才会进 notes 列表。
+        let video_dir = media.join("短视频").join("主播甲").join("一");
         std::fs::create_dir_all(&video_dir).unwrap();
         std::fs::create_dir_all(&fupan).unwrap();
+        std::fs::write(video_dir.join("一.复盘笔记.md"), "# 笔记").unwrap();
         std::fs::write(video_dir.join("一.mp4"), b"1").unwrap();
 
-        let (first_rec, first_notes) = file_scan_cache(&media, &fupan, &dir).unwrap();
+        let (first_rec, first_notes) = file_scan_cache(&media, &fupan, &dir, &media, &media).unwrap();
         assert_eq!(first_rec.len(), 1);
-        assert!(first_notes.is_empty());
+        assert_eq!(first_notes.len(), 1, "新布局短视频目录下的复盘产物应被列出");
 
         // TTL 内新增文件不应触发全量扫描；30 秒窗口与桌面端轮询间隔一致。
         std::fs::write(video_dir.join("二.mkv"), b"2").unwrap();
         std::fs::create_dir_all(fupan.join("主播甲").join("场次1")).unwrap();
-        let (second_rec, second_notes) = file_scan_cache(&media, &fupan, &dir).unwrap();
+        let (second_rec, second_notes) = file_scan_cache(&media, &fupan, &dir, &media, &media).unwrap();
         assert_eq!(second_rec.len(), 1, "TTL 内应复用上一次扫描结果");
-        assert_eq!(second_notes.len(), 0);
+        assert_eq!(second_notes.len(), 1, "TTL 内应复用上一次笔记扫描结果");
 
         clear_file_scan_cache_for_tests();
         let _ = std::fs::remove_dir_all(&dir);

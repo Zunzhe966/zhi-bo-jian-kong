@@ -709,7 +709,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     return Ok(());
                 }
             }
-            match download::enqueue_download(&pool, &url, &name).await {
+            match download::enqueue_download(&pool, &url, &name, "短视频").await {
                 Ok(task_id) => println!(
                     "{}",
                     serde_json::to_string(&json!({
@@ -760,7 +760,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     (url.to_string(), name.to_string())
                 })
                 .collect();
-            match download::enqueue_downloads(&pool, &items).await {
+            match download::enqueue_downloads(&pool, &items, "批量下载").await {
                 Ok(summary) => println!("{}", serde_json::to_string(&summary)?),
                 Err(e) => println!(
                     "{}",
@@ -932,7 +932,12 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             );
         }
         Command::Notes { name } => {
-            let notes = pipeline_bridge::list_notes(&paths.media_root, &fupan_dir, &name)?;
+            let notes = pipeline_bridge::list_notes(
+                &paths.recordings(),
+                &paths.video_root,
+                &fupan_dir,
+                &name,
+            )?;
             println!("{}", json!({"ok": true, "notes": notes}));
         }
         Command::Status => {

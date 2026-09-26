@@ -18,11 +18,16 @@ use crate::process::{ChildError, ManagedChild};
 /// 否则手动请求会绕过队列，与 daemon 下载 worker 并发下载同一个 URL。
 /// `db::enqueue_task` 对同 kind+url 的 pending/processing 任务去重，因此重复
 /// 点击不会重复下载；若 daemon 未运行，调用方应先 `ensure_core` 拉起 worker。
-pub async fn enqueue_download(pool: &SqlitePool, url: &str, name: &str) -> anyhow::Result<i64> {
+pub async fn enqueue_download(
+    pool: &SqlitePool,
+    url: &str,
+    name: &str,
+    category: &str,
+) -> anyhow::Result<i64> {
     if url.trim().is_empty() {
         anyhow::bail!("下载地址不能为空");
     }
-    db::enqueue_task(pool, "download", url, name).await
+    db::enqueue_download_task(pool, url, name, category).await
 }
 
 /// 批量入队下载：供“勾选批量下载/全部下载”使用。
@@ -44,6 +49,7 @@ pub struct BatchDownloadSummary {
 pub async fn enqueue_downloads(
     pool: &SqlitePool,
     items: &[(String, String)],
+    category: &str,
 ) -> anyhow::Result<BatchDownloadSummary> {
     let mut summary = BatchDownloadSummary {
         requested: items.len(),
@@ -93,7 +99,7 @@ pub async fn enqueue_downloads(
             summary.task_ids.push(id);
             continue;
         }
-        match db::enqueue_task(pool, "download", url, name).await {
+        match db::enqueue_download_task(pool, url, name, category).await {
             Ok(id) => {
                 summary.queued += 1;
                 summary.task_ids.push(id);
@@ -108,8 +114,9 @@ pub async fn enqueue_downloads(
 }
 
 /// 下载器：优先走平台原生路径（B站浏览器内核提取直链 + ffmpeg 合流），
-/// 失败回退 yt-dlp。下载产物按产品手册第 3 章落盘：
-/// `{video_root}/<主播>/短视频/<标题>/<标题>.mp4`，转写文字与视频同目录。
+/// 失败回退 yt-dlp。下载产物按新布局落盘：
+/// `{video_root}/<分类>/<主播>/<标题>/<标题>.mp4`，分类 ∈ {短视频, 批量下载}，
+/// 转写文字与视频同目录。
 pub struct Downloader {
     project_dir: PathBuf,
 }
@@ -124,16 +131,19 @@ impl Downloader {
         url: &str,
         name: &str,
         pool: &SqlitePool,
+        category: &str,
     ) -> Result<DownloadResult> {
         // 主播名来自外部输入，必须清洗后再拼路径：防止 `../`、`/`、Windows
         // 保留设备名等把文件写到产物根之外或产生非法目录。
-        // 新布局（产品手册第 3 章）：{video_root}/{主播}/短视频/{标题}/{标题}.mp4。
-        // 标题要等下载完成才知道（yt-dlp 按标题命名），所以先落主播的短视频目录，
-        // 成功后由 finish_download 把文件收进以它自己命名的子目录。
+        // 新布局：{video_root}/{分类}/{主播}/{标题}/{标题}.mp4，分类先到
+        // （短视频 / 批量下载）。标题要等下载完成才知道（yt-dlp 按标题命名），
+        // 所以先落分类下的主播目录，成功后由 finish_download 收进以它自己命名的子目录。
         let safe_name = safe_dir_name(name);
+        // 分类只接受已知值，未知归一为「短视频」，避免外部输入拼出越界目录名。
+        let cat = if category == "批量下载" { "批量下载" } else { "短视频" };
         let dir = crate::paths::video_root(&self.project_dir)
-            .join(&safe_name)
-            .join("短视频");
+            .join(cat)
+            .join(&safe_name);
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("创建下载目录失败: {}", dir.display()))?;
 
@@ -299,7 +309,7 @@ impl Downloader {
     ) -> Result<DownloadResult> {
         // 新布局要求一个视频一个文件夹（{标题}/{标题}.mp4），且转写文字随后落在
         // 同一文件夹（pipeline 的 out_dir = 视频所在目录）。下载时标题未知，文件
-        // 先落在主播的短视频目录顶层，这里下载完成后收进以它自己命名的子目录。
+        // 先落在分类下的主播目录顶层，这里下载完成后收进以它自己命名的子目录。
         let file = move_into_own_folder(&file);
         let video_id = extract_video_id(url).unwrap_or_else(|| url.to_string());
         // 下载成功但视频库还没有该记录时补一行，保证“已下载”有事实源。
@@ -1279,7 +1289,7 @@ async fn run_single_task_with_timeout(
     }
     let outcome = tokio::time::timeout(
         timeout_duration,
-        downloader.download(&task.url, &task.name, pool),
+        downloader.download(&task.url, &task.name, pool, &task.category),
     )
     .await;
     match outcome {
@@ -1711,6 +1721,7 @@ mod tests {
                 (url_dup.to_string(), "主播".to_string()),
                 (String::new(), "主播".to_string()),
             ],
+            "短视频",
         )
         .await
         .unwrap();
@@ -1847,13 +1858,13 @@ mod tests {
         ));
         let pool = crate::db::open_pool(&file).await.unwrap();
 
-        let err = enqueue_download(&pool, "  ", "测试").await.unwrap_err();
+        let err = enqueue_download(&pool, "  ", "测试", "短视频").await.unwrap_err();
         assert!(err.to_string().contains("不能为空"));
 
-        let id = enqueue_download(&pool, "https://x.test/video", "博主")
+        let id = enqueue_download(&pool, "https://x.test/video", "博主", "短视频")
             .await
             .unwrap();
-        let dup = enqueue_download(&pool, "https://x.test/video", "博主2")
+        let dup = enqueue_download(&pool, "https://x.test/video", "博主2", "短视频")
             .await
             .unwrap();
         assert_eq!(id, dup, "同一 URL 未完成任务必须去重，不能并发下载");
@@ -1862,7 +1873,7 @@ mod tests {
         crate::db::set_task_status(&pool, id, "failed")
             .await
             .unwrap();
-        let retry = enqueue_download(&pool, "https://x.test/video", "博主")
+        let retry = enqueue_download(&pool, "https://x.test/video", "博主", "短视频")
             .await
             .unwrap();
         assert_ne!(retry, id, "failed 终态应允许用户再次入队");

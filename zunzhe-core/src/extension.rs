@@ -383,7 +383,7 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
             if !crate::service::rust_daemon_alive(project_dir) {
                 crate::service::ensure_core(project_dir)?;
             }
-            let task_id = crate::download::enqueue_download(pool, &url, &name).await?;
+            let task_id = crate::download::enqueue_download(pool, &url, &name, "短视频").await?;
             Ok(serde_json::to_string(&json!({
                 "ok": true,
                 "queued": true,
@@ -447,8 +447,13 @@ async fn call_tool(name: &str, args: &Value, ctx: &ToolContext<'_>) -> Result<St
                 .get("name")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            let media_root = crate::paths::media_root(project_dir);
-            let notes = crate::pipeline_bridge::list_notes(&media_root, fupan_dir, name)?;
+            let dirs = crate::paths::storage(project_dir);
+            let notes = crate::pipeline_bridge::list_notes(
+                &dirs.recordings(),
+                &dirs.video_root,
+                fupan_dir,
+                name,
+            )?;
             Ok(serde_json::to_string(&json!({"ok":true,"notes":notes}))?)
         }
         "paths" => Ok(serde_json::to_string(

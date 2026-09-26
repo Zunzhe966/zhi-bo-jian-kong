@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     url        TEXT NOT NULL DEFAULT '',
     name       TEXT NOT NULL DEFAULT '',
     anchor_id  TEXT NOT NULL DEFAULT '',
+    category   TEXT NOT NULL DEFAULT '短视频',
     status     TEXT NOT NULL DEFAULT 'pending',
     attempts      INTEGER NOT NULL DEFAULT 0,
     payload       TEXT NOT NULL DEFAULT '',
@@ -173,6 +174,21 @@ pub async fn init_db(pool: &SqlitePool) -> anyhow::Result<()> {
                 .await
                 .with_context(|| format!("迁移 tasks.{column} 字段"))?;
         }
+    }
+
+    // 旧版本 tasks 没有 category 列：下载产物按 直播/短视频/批量下载 分顶层目录，
+    // 任务需携带 category 才能落到正确目录。
+    let has_category = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name='category'",
+    )
+    .fetch_one(pool)
+    .await
+    .context("检查 tasks.category 字段")?;
+    if has_category == 0 {
+        sqlx::query("ALTER TABLE tasks ADD COLUMN category TEXT NOT NULL DEFAULT '短视频'")
+            .execute(pool)
+            .await
+            .context("迁移 tasks.category 字段")?;
     }
 
     // 旧版本 monitor_baseline 没有失败计数/冷却时间：CREATE TABLE IF NOT EXISTS
@@ -1836,6 +1852,42 @@ pub async fn enqueue_task(
     Ok(result.last_insert_rowid())
 }
 
+/// 下载任务入队（带分类）：短视频监控与「批量下载」要落到不同的顶层目录，
+/// 因此任务需携带 `category`（短视频 / 批量下载），worker 据此决定落盘位置。
+/// 与 `enqueue_task` 相同的 pending/processing 去重语义，避免重复下载。
+pub async fn enqueue_download_task(
+    pool: &SqlitePool,
+    url: &str,
+    name: &str,
+    category: &str,
+) -> anyhow::Result<i64> {
+    if url.trim().is_empty() {
+        anyhow::bail!("下载地址不能为空");
+    }
+    let existing: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM tasks WHERE kind='download' AND url=? AND status IN ('pending','processing') LIMIT 1",
+    )
+    .bind(url)
+    .fetch_optional(pool)
+    .await
+    .context("查询已有下载任务")?;
+    if let Some(id) = existing {
+        return Ok(id);
+    }
+    let result = sqlx::query(
+        "INSERT INTO tasks (kind, url, name, anchor_id, category, status) VALUES (?, ?, ?, ?, ?, 'pending')",
+    )
+    .bind("download")
+    .bind(url)
+    .bind(name)
+    .bind(resolve_anchor_id(name))
+    .bind(category)
+    .execute(pool)
+    .await
+    .context("写入 tasks")?;
+    Ok(result.last_insert_rowid())
+}
+
 /// 原子认领一条待处理任务：把 `pending` 置为 `processing` 并返回任务。
 /// 认领后崩溃会把任务留在 processing，下次启动用 `recover_processing` 归还队列；
 /// 单实例 daemon 下也防止同批任务被并发重复执行。
@@ -1886,7 +1938,7 @@ pub async fn claim_pending_task_by_kind(
     // 第 3 次 15 分钟；attempts>=3 在进入本函数时已落定 failed，因此实际只会
     // 遇到 1/2 分钟档。新任务（attempts=0）不等待，坏时间戳按“已到期”处理。
     let mut sql = String::from(
-        "SELECT id, kind, url, name, status, attempts, payload, last_error, next_retry_at, created_at, updated_at
+        "SELECT id, kind, url, name, category, status, attempts, payload, last_error, next_retry_at, created_at, updated_at
          FROM tasks
          WHERE status = 'pending'",
     );
@@ -1942,6 +1994,7 @@ pub async fn claim_pending_task_by_kind(
             kind: row.try_get("kind")?,
             url: row.try_get("url")?,
             name: row.try_get("name")?,
+            category: row.try_get("category")?,
             status: "processing".to_string(),
             // 认领时 DB 里已经 `attempts+1`，这里返回最新值，调用方据此决定是否落定 failed。
             attempts: attempts + 1,
@@ -2007,7 +2060,7 @@ pub async fn fail_stale_processing_by_kind(
 
 pub async fn list_tasks(pool: &SqlitePool, status: &str, limit: i64) -> anyhow::Result<Vec<Task>> {
     let mut sql = String::from(
-        "SELECT id, kind, url, name, status, attempts, payload, last_error, next_retry_at, created_at, updated_at FROM tasks WHERE 1=1",
+        "SELECT id, kind, url, name, category, status, attempts, payload, last_error, next_retry_at, created_at, updated_at FROM tasks WHERE 1=1",
     );
     if !status.is_empty() {
         sql.push_str(" AND status = ?");
@@ -2026,6 +2079,7 @@ pub async fn list_tasks(pool: &SqlitePool, status: &str, limit: i64) -> anyhow::
             kind: row.try_get("kind")?,
             url: row.try_get("url")?,
             name: row.try_get("name")?,
+            category: row.try_get("category")?,
             status: row.try_get("status")?,
             attempts: row.try_get("attempts")?,
             payload: row.try_get("payload")?,
@@ -2048,7 +2102,7 @@ pub async fn list_tasks_by_kind(
     limit: i64,
 ) -> anyhow::Result<Vec<Task>> {
     let rows = sqlx::query(
-        "SELECT id, kind, url, name, status, attempts, payload, last_error, next_retry_at, created_at, updated_at
+        "SELECT id, kind, url, name, category, status, attempts, payload, last_error, next_retry_at, created_at, updated_at
          FROM tasks WHERE kind=? ORDER BY id DESC LIMIT ?",
     )
     .bind(kind)
@@ -2063,6 +2117,7 @@ pub async fn list_tasks_by_kind(
             kind: row.try_get("kind")?,
             url: row.try_get("url")?,
             name: row.try_get("name")?,
+            category: row.try_get("category")?,
             status: row.try_get("status")?,
             attempts: row.try_get("attempts")?,
             payload: row.try_get("payload")?,

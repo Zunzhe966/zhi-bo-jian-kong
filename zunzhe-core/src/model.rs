@@ -48,6 +48,7 @@ pub struct Task {
     pub kind: String,
     pub url: String,
     pub name: String,
+    pub category: String,
     pub status: String,
     pub attempts: i64,
     pub payload: String,
