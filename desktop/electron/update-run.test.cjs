@@ -52,6 +52,12 @@ ok(u.compareVersion('1.2.0', '1.1.9') === 1, '1.2.0 > 1.1.9')
 ok(u.compareVersion('1.1.0', '1.1') === 0, '1.1.0 == 1.1（缺位按 0 补）')
 ok(u.compareVersion('1.0.0', '1.0.1') === -1, '1.0.0 < 1.0.1')
 ok(u.compareVersion('2.0.0', '10.0.0') === -1, '2.0.0 < 10.0.0（按数值比，不是字典序）')
+// 预发布语义：正式版必须比同名 beta 新。旧实现把 'beta.1' 的 1 当成第 4 个数字，
+// 判成 beta 更新 —— 更新源混入 beta 就会把正式版用户降版（2026-09-26 实测）。
+ok(u.compareVersion('1.7.3-beta.1', '1.7.3') === -1, '1.7.3-beta.1 < 1.7.3（beta 更旧）')
+ok(u.compareVersion('1.7.3', '1.7.3-beta.1') === 1, '1.7.3 > 1.7.3-beta.1（正式版更新）')
+ok(u.compareVersion('1.7.3-beta.2', '1.7.3-beta.1') === 1, 'beta.2 > beta.1')
+ok(u.compareVersion('1.7.3-beta.1', '1.7.3-beta.1') === 0, '同名 beta 相等')
 
 // ---------- 在解压目录里找 .app（含嵌套） ----------
 const nested = fs.mkdtempSync(path.join(tmp, 'nested-'))

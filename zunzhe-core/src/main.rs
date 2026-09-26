@@ -20,6 +20,12 @@ async fn main() -> anyhow::Result<()> {
         }));
         let _ = tracing_subscriber::fmt()
             .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+            // 时间戳改用本地时区：默认输出是 UTC，而心跳/uptime 日志写的是本地时间，
+            // 两者差 8 小时会让排查时把「刚刚的日志」误判成「几小时前断流」
+            // （2026-09-26 实测踩过一次误报）。
+            .with_timer(tracing_subscriber::fmt::time::ChronoLocal::new(
+                "%Y-%m-%d %H:%M:%S%.3f".to_string(),
+            ))
             // extension 的 stdout 是 JSON-RPC 协议通道；任何普通日志混进去都会
             // 让桌面端把日志当协议行解析并直接报错。日志必须显式走 stderr。
             .with_writer(std::io::stderr)

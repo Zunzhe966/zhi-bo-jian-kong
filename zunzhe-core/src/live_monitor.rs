@@ -818,6 +818,15 @@ impl<'a> LiveMonitor<'a> {
 
     fn ffmpeg_args(&self, stream_url: &str, output: &Path) -> Vec<String> {
         let split_enabled = self.config.is_yes("录制设置", "分段录制是否开启", false);
+        let ext = output
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("ts")
+            .to_lowercase();
+        // 纯音频格式不能先写通用的 `-map 0`：ffmpeg 的 -map 是累加，视频轨会被
+        // 一起选进 MP3/M4A 容器，写头即失败（实测 exit=234「Invalid audio stream」
+        // + 0 字节产物；去掉 -map 0 后正常写出 82693 字节）。
+        let audio_only = matches!(ext.as_str(), "mp3" | "m4a");
         let mut args = vec![
             "-y".to_string(),
             "-hide_banner".to_string(),
@@ -839,18 +848,27 @@ impl<'a> LiveMonitor<'a> {
             "1".to_string(),
             "-i".to_string(),
             stream_url.to_string(),
-            "-map".to_string(),
-            "0".to_string(),
-            "-c:v".to_string(),
-            "copy".to_string(),
-            "-c:a".to_string(),
-            "copy".to_string(),
         ];
-        let ext = output
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("ts")
-            .to_lowercase();
+        if audio_only {
+            args.extend([
+                "-map".to_string(),
+                "0:a".to_string(),
+                "-vn".to_string(),
+                "-c:a".to_string(),
+                if ext == "mp3" { "libmp3lame".to_string() } else { "aac".to_string() },
+                "-ab".to_string(),
+                "320k".to_string(),
+            ]);
+        } else {
+            args.extend([
+                "-map".to_string(),
+                "0".to_string(),
+                "-c:v".to_string(),
+                "copy".to_string(),
+                "-c:a".to_string(),
+                "copy".to_string(),
+            ]);
+        }
         let is_aac_container = is_aac_container(&ext);
         if is_aac_container {
             args.extend(["-bsf:a".to_string(), "aac_adtstoasc".to_string()]);
@@ -887,28 +905,9 @@ impl<'a> LiveMonitor<'a> {
                 "mkv" => {
                     args.extend(["-f".into(), "matroska".into()]);
                 }
-                "mp3" => {
-                    // 只取音频流并重编码为 MP3；不套 AAC bitstream filter。
-                    args.extend([
-                        "-map".into(),
-                        "0:a".into(),
-                        "-c:a".into(),
-                        "libmp3lame".into(),
-                        "-ab".into(),
-                        "320k".into(),
-                    ]);
-                }
-                "m4a" => {
-                    // m4a 容器配合 AAC bitstream filter，输出纯音频。
-                    args.extend([
-                        "-map".into(),
-                        "0:a".into(),
-                        "-c:a".into(),
-                        "aac".into(),
-                        "-ab".into(),
-                        "320k".into(),
-                    ]);
-                }
+                // mp3/m4a 的轨道选择与编码器已在上面按 audio_only 处理完，
+                // 这里不再追加 -map（否则又把视频轨拉回来，写头失败）。
+                "mp3" | "m4a" => {}
                 _ => {
                     args.extend(["-f".into(), "mpegts".into()]);
                 }
@@ -1341,6 +1340,32 @@ mod tests {
     fn clean_name_removes_invalid_chars() {
         assert_eq!(clean_name(" 主播/甲:测试? "), "主播_甲_测试");
         assert_eq!(clean_name("////"), "空白昵称");
+    }
+
+    #[tokio::test]
+    async fn ffmpeg_audio_only_formats_drop_video_stream() {
+        // 回归锁：mp3/m4a 出现 `-map 0`（全轨道）会把视频轨塞进音频容器，
+        // 实测写头失败 exit=234、0 字节产物。
+        let dir = std::env::temp_dir().join(format!("zunzhe-ffmpeg-audio-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::write(dir.join("config").join("config.ini"), "").unwrap();
+        std::fs::write(dir.join("config").join("fupan_config.ini"), "").unwrap();
+        let pool = crate::db::open_pool(&dir.join("audio.db")).await.unwrap();
+        let cfg = crate::config::Config::load(&dir).unwrap();
+        let watch = Watchlist::new(dir.clone());
+        let monitor = LiveMonitor::new(&pool, &dir, &cfg, &watch);
+        for ext in ["mp3", "m4a"] {
+            let args = monitor.ffmpeg_args("http://e.com/s.m3u8", Path::new(&format!("/tmp/o.{ext}")));
+            assert!(!args.windows(2).any(|w| w[0] == "-map" && w[1] == "0"),
+                "{ext} 不得出现 -map 0（会把视频轨选进音频容器）: {args:?}");
+            assert!(args.iter().any(|a| a == "-vn"), "{ext} 必须有 -vn: {args:?}");
+            assert!(args.iter().any(|a| a == "0:a"), "{ext} 必须选 0:a: {args:?}");
+        }
+        // 视频格式保持 -map 0（不能被上面的改动误伤）
+        let ts = monitor.ffmpeg_args("http://e.com/s.m3u8", Path::new("/tmp/o.ts"));
+        assert!(ts.windows(2).any(|w| w[0] == "-map" && w[1] == "0"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

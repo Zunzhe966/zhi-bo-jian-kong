@@ -451,12 +451,20 @@ export default function App() {
     }
   }
 
+  // 后端「操作类」命令失败时是 exit 0 + {ok:false, error}（不抛异常），
+  // 只看 try/catch 会把失败当成功——必须检查 r.ok。
   const setItemNotify = async (url, channel, name = '') => {
+    let reported = false
     try {
-      await window.desktop.cli('set-notify', url, channel, name)
+      const r = await window.desktop.cli('set-notify', url, channel, name)
+      if (r && r.ok === false) {
+        reported = true
+        message.error(r.error || '保存通知方式失败')
+        throw new Error(r.error || '保存通知方式失败')
+      }
       await fetchStatus()
     } catch (e) {
-      message.error(String(e.message || e))
+      if (!reported) message.error(String(e.message || e))
       throw e
     }
   }
@@ -618,10 +626,13 @@ export default function App() {
     setLoading(true)
     try {
       if (itemSettingsType === 'live') {
-        await window.desktop.cli('delete-live', itemSettingsRow.url)
+        const r = await window.desktop.cli('delete-live', itemSettingsRow.url)
+        // 后端删除失败是 exit 0 + {ok:false}，不看 r.ok 会谎报成功
+        if (r && r.ok === false) { message.error(r.error || '删除失败'); return }
         message.success('已删除，不再关注该主播')
       } else {
-        await window.desktop.cli('remove-video', itemSettingsRow.url)
+        const r = await window.desktop.cli('remove-video', itemSettingsRow.url)
+        if (r && r.ok === false) { message.error(r.error || '删除失败'); return }
         message.success('已删除，不再关注该博主')
       }
       setItemSettingsOpen(false)
@@ -636,7 +647,8 @@ export default function App() {
   const toggleVideoDownload = async (row, checked) => {
     setLoading(true)
     try {
-      await window.desktop.cli('add-video', row.url, row.name, checked ? '是' : '否')
+      const r = await window.desktop.cli('add-video', row.url, row.name, checked ? '是' : '否')
+      if (r && r.ok === false) { message.error(r.error || '保存下载开关失败'); return }
       message.success(checked ? '发现新视频将自动下载' : '发现新视频只通知，不下载')
       await fetchStatus()
     } catch (e) {

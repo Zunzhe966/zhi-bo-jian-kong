@@ -31,17 +31,30 @@ const APP_BUNDLE_NAME = '尊者直播监控.app'
 const STAGE_PREFIX = '.zunzhe-update-'
 const OLD_PREFIX = '.zunzhe-old-'
 
-/** '1.2.3' / 'v1.2.3' / '1.2.3-beta.1' → [1,2,3,0,...]（非数字段忽略） */
+/** '1.2.3' / 'v1.2.3' / '1.2.3-beta.1' → [1,2,3]（只取主版本号段） */
 function parseVersion(v) {
   if (typeof v !== 'string') return [0]
-  const nums = v.trim().replace(/^v/i, '')
-    .split(/[.\-+_]/)
+  const s = v.trim().replace(/^v/i, '')
+  const dash = s.indexOf('-')
+  const main = dash >= 0 ? s.slice(0, dash) : s
+  const nums = main.split(/[.\-+_]/)
     .map((s) => parseInt(s, 10))
     .filter((n) => Number.isFinite(n))
   return nums.length ? nums : [0]
 }
 
-/** a > b → 1；a < b → -1；相等 → 0。缺位按 0 补齐。 */
+/** 预发布后缀：'1.2.3-beta.1' → 'beta.1'；正式版 → ''。 */
+function prereleaseOf(v) {
+  if (typeof v !== 'string') return ''
+  const s = v.trim().replace(/^v/i, '')
+  const dash = s.indexOf('-')
+  return dash >= 0 ? s.slice(dash + 1) : ''
+}
+
+/** a > b → 1；a < b → -1；相等 → 0。缺位按 0 补齐。
+ *  语义：主版本相同时**正式版比预发布版新**（1.7.3 > 1.7.3-beta.1）。
+ *  旧实现把 'beta.1' 里的 1 当成第 4 个数字，导致 beta 被判为比正式版新
+ *  ——一旦更新源混入 beta 包就会把正式版用户降版（2026-09-26 实测）。 */
 function compareVersion(a, b) {
   const x = parseVersion(a)
   const y = parseVersion(b)
@@ -50,6 +63,27 @@ function compareVersion(a, b) {
     const xi = x[i] || 0
     const yi = y[i] || 0
     if (xi !== yi) return xi > yi ? 1 : -1
+  }
+  const px = prereleaseOf(a)
+  const py = prereleaseOf(b)
+  if (px === py) return 0
+  if (!px) return 1
+  if (!py) return -1
+  const ax = px.split('.')
+  const by = py.split('.')
+  for (let i = 0; i < Math.max(ax.length, by.length); i++) {
+    const m = ax[i]
+    const k = by[i]
+    if (m === undefined) return -1
+    if (k === undefined) return 1
+    const mn = parseInt(m, 10)
+    const kn = parseInt(k, 10)
+    const bothNum = Number.isFinite(mn) && Number.isFinite(kn)
+    if (bothNum) {
+      if (mn !== kn) return mn > kn ? 1 : -1
+    } else if (m !== k) {
+      return m > k ? 1 : -1
+    }
   }
   return 0
 }

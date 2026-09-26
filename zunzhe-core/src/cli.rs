@@ -268,6 +268,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let cfg = config::Config::load(&start_dir)?;
     // 所有路径以项目根为基准，避免从 zunzhe-core/ 运行时把 DB/下载写错位置。
     let project_dir = cfg.project_dir.clone();
+    // 出站代理策略必须在任何网络请求之前装载：`net.rs` 的 policy() 走
+    // get_or_init 默认值，不显式初始化则 [网络] 出站代理 配置**完全失效**——
+    // yt-dlp 拿不到 --proxy、needs_proxy() 恒 false（2026-09-26 实测：全仓
+    // 只有 net.rs 的定义，没有任何调用点）。
+    crate::net::init_with_config(&project_dir);
     let paths = storage_paths_for(&project_dir, cli.db);
     // 桌面端启动时用 `paths` 刷新可信根；它必须是纯只读查询。若先执行
     // ensure_dirs，用户只是打开界面就会在外部盘创建一整套尚未使用的目录。
@@ -343,7 +348,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                         )
                     })?;
                 let display = if name.is_empty() { &nickname } else { &name };
-                let _ = watch.add_live(&live_url, &format!("主播: {display}"), &quality);
+                watch.add_live(&live_url, &format!("主播: {display}"), &quality)?;
                 watch.add_video(&home_url, display, None, None)?;
                 println!(
                     "{}",
@@ -364,13 +369,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             let mut added_live = false;
             let mut added_video = false;
             if live_domain && !video_domain {
-                let _ = watch.add_live(&url, &format!("主播: {name}"), &quality);
+                watch.add_live(&url, &format!("主播: {name}"), &quality)?;
                 added_live = true;
             } else if video_domain && !live_domain {
                 watch.add_video(&url, if name.is_empty() { &url } else { &name }, None, None)?;
                 added_video = true;
             } else {
-                let _ = watch.add_live(&url, &format!("主播: {name}"), &quality);
+                watch.add_live(&url, &format!("主播: {name}"), &quality)?;
                 added_live = true;
                 watch.add_video(&url, if name.is_empty() { &url } else { &name }, None, None)?;
                 added_video = true;
@@ -465,7 +470,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             } else {
                 (url, name)
             };
-            let _ = watch.add_live(&url, &name, &quality);
+            watch.add_live(&url, &name, &quality)?;
             println!(
                 "{}",
                 json!({"ok": true, "url": url, "name": name, "quality": quality, "action": "add-anchor"})
