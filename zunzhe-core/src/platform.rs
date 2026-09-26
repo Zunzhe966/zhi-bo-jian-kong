@@ -556,8 +556,13 @@ impl Platform for BilibiliAdapter {
         count: u32,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<VideoMeta>>> + Send + 'a>> {
         Box::pin(async move {
-            let mid =
-                Self::mid_from_url(url).with_context(|| format!("不是 B站空间地址: {url}"))?;
+            let mid = Self::mid_from_url(url).with_context(|| {
+                format!(
+                    "这个地址不是 B站UP主主页，认不出是哪个 UP主：{url}。\
+请改用「space.bilibili.com/数字」——在 B站打开该 UP主主页后复制地址栏；\
+或改用该 UP主的任意视频链接 / b23.tv 分享短链（会自动识别 UP主）"
+                )
+            })?;
             // RSSHub 优先（平台缓存、抗 412），官方 wbi/arc 接口（带 cookie）
             // 次之，最后 yt-dlp 兜底。RSS 通道不直接打 B站接口，是三种途径
             // 里最不容易触发风控的；官方接口仅在 RSS 不可用时才调用。
