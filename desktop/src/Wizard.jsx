@@ -6,6 +6,9 @@ export default function SetupWizard({ open, onDone }) {
   const [form] = Form.useForm()
   const [saving, setSaving] = useState(false)
 
+  // 服务拉起失败绝不能把界面锁死：配置已经保存，用户回到主界面还能手动重试。
+  // 旧实现把 ensure-services 的失败当成致命错误，弹窗又不允许关闭，
+  // 一次失败就再也进不去主界面。
   const finish = async () => {
     setSaving(true)
     try {
@@ -20,14 +23,30 @@ export default function SetupWizard({ open, onDone }) {
       if (v.openAtLogin && window.desktop.setLoginItem) {
         await window.desktop.setLoginItem(true)
       }
-      await window.desktop.cli('ensure-services')
-      message.success('初始化完成，监控服务已在后台运行')
+      try {
+        await window.desktop.cli('ensure-services')
+        message.success('初始化完成，监控服务已在后台运行')
+      } catch (e) {
+        message.warning(`配置已保存；后台服务启动失败：${String(e.message || e)}。可在主界面手动启动`)
+      }
       onDone()
     } catch (e) {
       message.error(String(e.message || e))
     } finally {
       setSaving(false)
     }
+  }
+
+  // 跳过出口：只标记向导已看过，不动其它偏好，也不强行拉服务。
+  // 没有这个出口时，向导一旦出错就是死路（弹窗不可关闭）。
+  const skip = async () => {
+    setSaving(true)
+    try {
+      await window.desktop.cli('set-app-prefs', JSON.stringify({ wizardDone: true }))
+    } catch (e) {
+      message.warning(`偏好保存失败：${String(e.message || e)}，下次启动会再次显示本向导`)
+    }
+    onDone()
   }
 
   const steps = [
@@ -81,11 +100,13 @@ export default function SetupWizard({ open, onDone }) {
     <Modal
       title="首次使用向导"
       open={open}
-      closable={false}
+      closable
+      onCancel={skip}
       maskClosable={false}
       width={560}
       footer={[
         step > 0 && <Button key="prev" onClick={() => setStep(step - 1)}>上一步</Button>,
+        <Button key="skip" type="text" onClick={skip}>跳过</Button>,
         step < steps.length - 1
           ? <Button key="next" type="primary" onClick={() => setStep(step + 1)}>下一步</Button>
           : <Button key="done" type="primary" loading={saving} onClick={finish}>完成并开始监控</Button>,

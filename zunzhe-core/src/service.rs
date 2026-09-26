@@ -1239,6 +1239,28 @@ pub fn remove_rust_live_pid(project_dir: &Path, url: &str) {
     let _ = std::fs::remove_file(path);
 }
 
+/// 只在该 pid 文件仍写着 `pid` 时才删除。
+///
+/// 强制回收僵尸会话后会立刻开一场新录制并写入新 pid；旧会话的后台回收任务
+/// 晚一步执行时若无条件删文件，会把新会话的 pid 文件抹掉，让外部工具
+/// （service-status / 兜底清理）误判「没在录」。带 pid 比对可消除这个竞态。
+pub fn remove_rust_live_pid_if(project_dir: &Path, url: &str, pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    let path = crate::paths::run_dir(project_dir)
+        .join("rust_live")
+        .join(format!("{}.pid", rust_live_pid_name(url)));
+    let current = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| t.trim().parse::<u32>().ok());
+    // 没有文件 / 内容不可解析 / 内容正是本 pid —— 都可安全删除；
+    // 只有写着别的 pid（说明已换了新一场录制）时必须保留。
+    if current.is_none() || current == Some(pid) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// 直播地址 -> 录制 pid 文件名（同一 URL 稳定映射，供停止兜底清理）。
 pub fn rust_live_pid_name(text: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
@@ -1379,6 +1401,14 @@ mod tests {
     fn remove_pid_if_never_deletes_new_instance_pid() {
         let dir = std::env::temp_dir().join(format!("zunzhe-pid-if-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        // 必须显式把产物根指到临时目录：留空时 paths::resolve 会退回
+        // `~/Documents/尊者产物`，这条单测就会往用户真实数据目录里写 pid 文件。
+        std::fs::write(
+            dir.join("config").join("config.ini"),
+            format!("[路径设置]\n产物根目录 = {}", dir.display()),
+        )
+        .unwrap();
         std::fs::create_dir_all(dir.join("fupan_output").join("run")).unwrap();
 
         // 模拟旧实例退出时看到新实例已经写入 pid：只删自己 pid 的接口不能误删。

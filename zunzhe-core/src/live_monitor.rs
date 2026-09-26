@@ -16,7 +16,8 @@ use crate::config::Config;
 use crate::db;
 use crate::live_python_bridge::PythonLiveAdapter;
 use crate::notify::Notifier;
-use crate::service::{remove_rust_live_pid, write_rust_live_pid};
+use crate::model::LiveSession;
+use crate::service::{remove_rust_live_pid, remove_rust_live_pid_if, write_rust_live_pid};
 use crate::watchlist::{LiveItem, Watchlist};
 
 /// 平台无关的直播状态。适配器只输出这一种结构。
@@ -567,10 +568,16 @@ impl<'a> LiveMonitor<'a> {
     async fn ensure_recording(&self, item: &LiveItem, status: &LiveStatus) -> Result<()> {
         if let Some(session) = db::active_live_session(self.pool, &item.url).await? {
             if session.pid > 0 && process_alive(session.pid as u32) {
-                info!("[{}] 已在录制 (session {})", item.remark, session.id);
-                return Ok(());
-            }
-            if session.pid > 0 {
+                // 进程还活着 ≠ 还在录。断流后 ffmpeg 可能永久挂着：不回收它，
+                // 这个主播之后每一场直播都会被「已在录制」挡在外面。
+                match self.zombie_reason(&session) {
+                    Some(reason) => self.recycle_session(&session, &reason).await,
+                    None => {
+                        info!("[{}] 已在录制 (session {})", item.remark, session.id);
+                        return Ok(());
+                    }
+                }
+            } else if session.pid > 0 {
                 warn!("[{}] 检测到录制进程已退出，结束旧会话", item.remark);
                 db::end_live_session(self.pool, session.id, "interrupted", "录制进程已退出")
                     .await?;
@@ -669,13 +676,15 @@ impl<'a> LiveMonitor<'a> {
                 .unwrap_or(false);
             if !still_recording {
                 info!("[{}] 会话已被外部停止，跳过状态回收", anchor_name);
-                remove_rust_live_pid(&project_dir, &item_url);
+                // 只删属于自己的 pid 文件：若这场已被回收、同一主播紧接着开了
+                // 新录制，pid 文件里已是新 pid，不能抹掉。
+                remove_rust_live_pid_if(&project_dir, &item_url, pid);
                 return;
             }
             if code == 0 {
                 info!("[{}] 录制正常结束", anchor_name);
                 let _ = db::end_live_session(&pool, session_id, "done", "").await;
-                remove_rust_live_pid(&project_dir, &item_url);
+                remove_rust_live_pid_if(&project_dir, &item_url, pid);
                 // 录制结束后入队复盘任务；失败只记日志，不拖垮 daemon。
                 let media = if split_enabled {
                     // ffmpeg 分段录制退出后，最后一段可能刚写完还没来得及收尾；
@@ -702,7 +711,7 @@ impl<'a> LiveMonitor<'a> {
                 let msg = format!("录制退出 code={code}: {}", last_log_lines(&log, 200));
                 error!("[{}] {msg}", anchor_name);
                 let _ = db::end_live_session(&pool, session_id, "failed", &msg).await;
-                remove_rust_live_pid(&project_dir, &item_url);
+                remove_rust_live_pid_if(&project_dir, &item_url, pid);
             }
         });
         Ok(())
@@ -712,6 +721,12 @@ impl<'a> LiveMonitor<'a> {
     async fn finish_if_stopped(&self, url: &str) {
         if let Some(session) = db::active_live_session(self.pool, url).await.ok().flatten() {
             if session.pid > 0 && process_alive(session.pid as u32) {
+                // 主播已下播但 ffmpeg 没退出：正常情况它自己会在几秒内收尾退出，
+                // 这里不打断它。只有当它已经变成僵尸（超限 / 文件不再增长）时
+                // 才强制回收，否则这个会话会一直挂在 recording 挡住下一场。
+                if let Some(reason) = self.zombie_reason(&session) {
+                    self.recycle_session(&session, &reason).await;
+                }
                 return;
             }
             let _ = db::end_live_session(self.pool, session.id, "interrupted", "直播已结束").await;
@@ -804,6 +819,103 @@ impl<'a> LiveMonitor<'a> {
             );
         }
         Ok(())
+    }
+
+    /// 单场录制最长时长（小时）。`0` / 空 / 非法 = 不限制。
+    ///
+    /// 护栏意义：ffmpeg 在直播流断流后会一直挂着不退出，状态机只要看到
+    /// "进程还活着" 就认定「已在录制」，从此再也不会为这个主播开新录制——
+    /// 一场卡死会永久堵死该主播后续所有直播。默认 12 小时足够覆盖超长直播，
+    /// 超过后强制结束并立刻重开一场，录像不中断只是换文件。
+    fn max_record_hours(&self) -> f64 {
+        let raw = self
+            .config
+            .get_main("录制设置", "单场最长录制时长(小时)")
+            .trim()
+            .to_string();
+        if raw.is_empty() {
+            return 12.0;
+        }
+        raw.parse::<f64>().unwrap_or(12.0).max(0.0)
+    }
+
+    /// 录制文件停止增长多久后判定为假死（分钟）。`0` = 不做增长检查。
+    fn stall_minutes(&self) -> u64 {
+        let raw = self
+            .config
+            .get_main("录制设置", "录制无增长回收(分钟)")
+            .trim()
+            .to_string();
+        if raw.is_empty() {
+            return 30;
+        }
+        raw.parse::<u64>().unwrap_or(30)
+    }
+
+    /// 判断一个"进程仍在"的会话是否已经变成僵尸，返回 Some(原因) 表示要回收。
+    ///
+    /// 两条独立判据：
+    /// 1. 时长超限：`started_at` 距今超过 `单场最长录制时长(小时)`；
+    /// 2. 文件假死：输出文件（分段录制取最新一段）超过 `录制无增长回收(分钟)`
+    ///    没有再变大。ffmpeg 卡在断流/重试时会一直挂着但一个字节都不写，
+    ///    只靠"进程活着"永远发现不了。
+    fn zombie_reason(&self, session: &LiveSession) -> Option<String> {
+        let max_hours = self.max_record_hours();
+        if max_hours > 0.0 {
+            if let Some(started) = parse_local_datetime(&session.started_at) {
+                let elapsed_min = (chrono::Local::now() - started).num_minutes();
+                if elapsed_min >= (max_hours * 60.0) as i64 {
+                    return Some(format!(
+                        "单场录制已 {elapsed_min} 分钟，超过上限 {} 小时",
+                        max_hours
+                    ));
+                }
+            }
+        }
+        let stall = self.stall_minutes();
+        if stall > 0 && !session.file_path.is_empty() {
+            let candidate = find_latest_segment(&session.file_path)
+                .unwrap_or_else(|| session.file_path.clone());
+            match std::fs::metadata(&candidate) {
+                Ok(meta) => match meta.modified() {
+                    Ok(mtime) => {
+                        let age_min = chrono::DateTime::<chrono::Local>::from(mtime);
+                        let idle = (chrono::Local::now() - age_min).num_minutes();
+                        if idle >= stall as i64 {
+                            return Some(format!(
+                                "录制文件已 {idle} 分钟没有增长，判定为假死（{}）",
+                                candidate
+                            ));
+                        }
+                    }
+                    Err(_) => {}
+                },
+                Err(_) => {
+                    // 输出文件根本不存在：ffmpeg 还挂着却什么都没写出来，
+                    // 同样按假死处理，否则这个主播会被永久堵住。
+                    if let Some(started) = parse_local_datetime(&session.started_at) {
+                        let idle = (chrono::Local::now() - started).num_minutes();
+                        if idle >= stall as i64 {
+                            return Some(format!(
+                                "录制已启动 {idle} 分钟但输出文件不存在，判定为假死（{}）",
+                                candidate
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// 强制回收一个会话：终止进程组、结束会话、清理 pid 文件。
+    async fn recycle_session(&self, session: &LiveSession, reason: &str) {
+        warn!("[{}] 回收僵尸录制会话: {reason}", session.anchor);
+        if session.pid > 0 && process_alive(session.pid as u32) {
+            terminate_process(session.pid as u32).await;
+        }
+        let _ = db::end_live_session(self.pool, session.id, "interrupted", reason).await;
+        remove_rust_live_pid_if(self.project_dir, &session.url, session.pid as u32);
     }
 
     /// 读取并解析磁盘阈值（GB）。配置缺失/非法时回退默认 1.0 GB，
@@ -1204,6 +1316,32 @@ async fn terminate_process(pid: u32) {
     }
 }
 
+/// 解析 SQLite `datetime('now','localtime')` 写出的 `"YYYY-MM-DD HH:MM:SS"`。
+///
+/// 本机时区下的会话时间没有时区后缀，不能用 RFC3339 解析；解析失败返回 None，
+/// 调用方按"时间未知"处理（不做时长判定），绝不因为时间解析问题误杀录制。
+fn parse_local_datetime(text: &str) -> Option<chrono::DateTime<chrono::Local>> {
+    use chrono::TimeZone;
+    let text = text.trim();
+    let (date, time) = text.split_once(' ')?;
+    let mut d = date.split('-');
+    let (y, m, day) = (
+        d.next()?.parse::<i32>().ok()?,
+        d.next()?.parse::<u32>().ok()?,
+        d.next()?.parse::<u32>().ok()?,
+    );
+    let mut t = time.split(':');
+    let (h, mi, s) = (
+        t.next()?.parse::<u32>().ok()?,
+        t.next()?.parse::<u32>().ok()?,
+        t.next()?.parse::<u32>().ok()?,
+    );
+    chrono::Local
+        .with_ymd_and_hms(y, m, day, h, mi, s)
+        .single()
+        .map(|dt| dt.with_timezone(&chrono::Local))
+}
+
 fn clean_name(input: &str) -> String {
     let mut out = String::new();
     for ch in input.trim().chars() {
@@ -1340,6 +1478,138 @@ mod tests {
     fn clean_name_removes_invalid_chars() {
         assert_eq!(clean_name(" 主播/甲:测试? "), "主播_甲_测试");
         assert_eq!(clean_name("////"), "空白昵称");
+    }
+
+    /// 造一个带自定义 [录制设置] 的临时项目目录，返回 (目录, monitor)。
+    async fn monitor_with_config(name: &str, ini: &str) -> (std::path::PathBuf, Config, Watchlist) {
+        let dir = std::env::temp_dir().join(format!("zunzhe-zombie-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::write(dir.join("config").join("config.ini"), ini).unwrap();
+        std::fs::write(dir.join("config").join("fupan_config.ini"), "").unwrap();
+        let cfg = Config::load(&dir).unwrap();
+        let watch = Watchlist::new(dir.clone());
+        (dir, cfg, watch)
+    }
+
+    fn session_at(started_minutes_ago: i64, file_path: &str) -> LiveSession {
+        let started = chrono::Local::now() - chrono::Duration::minutes(started_minutes_ago);
+        LiveSession {
+            id: 1,
+            url: "https://live.example.test/1".into(),
+            anchor: "测试主播".into(),
+            title: "标题".into(),
+            platform: "test".into(),
+            stream_url: String::new(),
+            status: "recording".into(),
+            pid: 4242,
+            file_path: file_path.into(),
+            started_at: started.format("%Y-%m-%d %H:%M:%S").to_string(),
+            ended_at: String::new(),
+            error: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    /// 把文件 mtime 改成 N 分钟前（模拟 ffmpeg 卡住不再写数据）。
+    fn age_file(path: &Path, minutes: i64) {
+        use std::fs::FileTimes;
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs((minutes * 60) as u64);
+        f.set_times(FileTimes::new().set_modified(old)).unwrap();
+    }
+
+    #[test]
+    fn parse_local_datetime_reads_sqlite_local_format() {
+        let dt = parse_local_datetime("2026-09-24 09:29:04").expect("应解析 SQLite localtime 文本");
+        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2026-09-24 09:29:04");
+        assert!(parse_local_datetime("").is_none());
+        assert!(parse_local_datetime("not-a-time").is_none());
+        // RFC3339（带时区后缀）不该被误解析成本地时间文本
+        assert!(parse_local_datetime("2026-09-24T09:29:04Z").is_none());
+    }
+
+    #[tokio::test]
+    async fn zombie_reason_flags_overlong_session() {
+        // 回归锁：ffmpeg 断流后永久挂着，状态机只认「进程还活着」→
+        // 这个主播之后每一场直播都被「已在录制」挡住，永久录不上。
+        let (dir, cfg, watch) = monitor_with_config("overlong", "[录制设置]\n单场最长录制时长(小时) = 2\n").await;
+        let pool = crate::db::open_pool(&dir.join("z.db")).await.unwrap();
+        let monitor = LiveMonitor::new(&pool, &dir, &cfg, &watch);
+        let file = dir.join("live.ts");
+        std::fs::write(&file, "x").unwrap();
+        let reason = monitor.zombie_reason(&session_at(300, &file.display().to_string()));
+        assert!(reason.is_some(), "5 小时的会话应超过 2 小时上限");
+        assert!(reason.unwrap().contains("超过上限"));
+
+        let reason = monitor.zombie_reason(&session_at(10, &file.display().to_string()));
+        assert!(reason.is_none(), "10 分钟、文件刚写的会话不该被判僵尸");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn zombie_reason_flags_stalled_file() {
+        let (dir, cfg, watch) =
+            monitor_with_config("stall", "[录制设置]\n单场最长录制时长(小时) = 12\n录制无增长回收(分钟) = 30\n").await;
+        let pool = crate::db::open_pool(&dir.join("z.db")).await.unwrap();
+        let monitor = LiveMonitor::new(&pool, &dir, &cfg, &watch);
+        let file = dir.join("live.ts");
+        std::fs::write(&file, "x").unwrap();
+        age_file(&file, 45);
+        // 只跑了 5 分钟（没超时），但文件 45 分钟没动静 → 假死
+        let reason = monitor.zombie_reason(&session_at(5, &file.display().to_string()));
+        assert!(reason.is_some(), "文件 45 分钟没增长应判假死");
+        assert!(reason.unwrap().contains("没有增长"));
+
+        let missing = dir.join("不存在.ts");
+        let reason = monitor.zombie_reason(&session_at(45, &missing.display().to_string()));
+        assert!(reason.is_some(), "启动 45 分钟却没产出文件应判假死");
+
+        // 时长上限设为 0 = 不限制，只剩增长判据
+        let (dir2, cfg2, watch2) =
+            monitor_with_config("nolimit", "[录制设置]\n单场最长录制时长(小时) = 0\n录制无增长回收(分钟) = 30\n").await;
+        let pool2 = crate::db::open_pool(&dir2.join("z.db")).await.unwrap();
+        let monitor2 = LiveMonitor::new(&pool2, &dir2, &cfg2, &watch2);
+        let file2 = dir2.join("live.ts");
+        std::fs::write(&file2, "x").unwrap();
+        assert!(
+            monitor2
+                .zombie_reason(&session_at(600, &file2.display().to_string()))
+                .is_none(),
+            "上限为 0 时不按时长杀录制"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn remove_pid_file_only_when_it_belongs_to_that_pid() {
+        let dir = std::env::temp_dir().join(format!("zunzhe-pidkeep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        // 必须显式把产物根指到临时目录：留空时 paths::resolve 会退回
+        // `~/Documents/尊者产物`，单测就会往用户真实数据目录里写 pid 文件。
+        std::fs::write(
+            dir.join("config").join("config.ini"),
+            format!("[路径设置]\n产物根目录 = {}", dir.display()),
+        )
+        .unwrap();
+        let url = "https://live.example.test/9";
+        crate::service::write_rust_live_pid(&dir, url, 111);
+        // 新一场录制已经写了自己的 pid；旧会话的回收任务晚到一步也不能删它
+        crate::service::write_rust_live_pid(&dir, url, 222);
+        crate::service::remove_rust_live_pid_if(&dir, url, 111);
+        let path = crate::paths::run_dir(&dir)
+            .join("rust_live")
+            .join(format!("{}.pid", crate::service::rust_live_pid_name(url)));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().trim(),
+            "222",
+            "旧会话不得抹掉新会话的 pid 文件"
+        );
+        crate::service::remove_rust_live_pid_if(&dir, url, 222);
+        assert!(!path.exists(), "属于自己的 pid 文件应当被清理");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

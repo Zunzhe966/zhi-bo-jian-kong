@@ -151,6 +151,26 @@ const del = u.rmrf(path.join(tmp, 'bundleLike'))
 ok(del.ok, 'rmrf 能删掉含 app.asar + framework 软链的包目录')
 ok(!fs.existsSync(path.join(tmp, 'bundleLike')), 'rmrf 删完确实不存在了')
 
+// ---------- 非 .app 形态必须拒绝替换 ----------
+//
+// 回归测试。applyRelease 会先把目标 rename 成 `.zunzhe-old-*` 再换新版，
+// 目标一旦不是本软件的 .app（开发态的 node_modules/Electron.app、Windows
+// 便携目录），这一步就是直接把别人的目录改名搞坏。必须硬拒绝。
+{
+  const portableDir = fs.mkdtempSync(path.join(tmp, 'portable-'))
+  const before = fs.readdirSync(portableDir).length
+  for (const bad of [portableDir, null, undefined, path.join(installDir, '尊者直播监控.exe')]) {
+    const r = u.applyRelease({ release: { path: path.join(installDir, '不存在.app'), kind: 'app' }, installPath: bad })
+    ok(!r.ok, `非 .app 目标应被拒绝替换: ${bad}`)
+    ok(/不是 \.app/.test(r.error || ''), `拒绝原因要说明不是 .app: ${r.error}`)
+  }
+  ok(fs.readdirSync(portableDir).length === before, '被拒绝的目录没被改名/删内容')
+  ok(
+    !fs.readdirSync(installDir).some((n) => n.startsWith('.zunzhe-old-')),
+    '拒绝路径下不应产生 .zunzhe-old-* 残留',
+  )
+}
+
 // cleanupStale 走的就是 rmrf，所以对「包形态」的残留同样有效
 const pkgLeftover = path.join(installDir, '.zunzhe-old-999')
 fs.mkdirSync(path.join(pkgLeftover, 'Contents', 'Resources'), { recursive: true })

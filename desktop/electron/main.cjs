@@ -668,9 +668,22 @@ function ensureRuntime() {
 // 更新源 = <数据目录>/releases/，离线可用、不需要服务器。
 // 程序目录和数据目录是物理分离的两处，所以「点更新」不可能导致数据消失
 // —— 这正是根治「更新一次数据像丢一次」的关键。
+/**
+ * 当前程序本体路径（要被新版替换的那个）。
+ *
+ * 只在**打包态**且形态符合 macOS .app 时返回路径，否则返回 null。
+ * 原因：开发态 `process.execPath` 指向 node_modules 里的 Electron.app，
+ * 上溯三级得到的是 Electron 本体而不是本软件；一旦照常执行替换，
+ * 会把开发用的 Electron.app 改名成 `.zunzhe-old-*`（开发机直接跑不起来）。
+ * 非 macOS 打包形态同理：本更新器用 ditto/codesign，只认 .app。
+ */
 function appInstallPath() {
+  if (!app.isPackaged) return null
   // /Applications/X.app/Contents/MacOS/X → /Applications/X.app
-  return path.resolve(process.execPath, '..', '..', '..')
+  const p = path.resolve(process.execPath, '..', '..', '..')
+  if (process.platform !== 'darwin') return null
+  if (!p.endsWith('.app')) return null
+  return p
 }
 
 function releasesDir() {
@@ -684,6 +697,15 @@ async function checkForUpdateInteractive(opts = {}) {
   const installPath = appInstallPath()
   const current = app.getVersion()
   const rd = releasesDir()
+  if (!installPath) {
+    // 开发态 / 非 macOS 打包形态：更新器只替换 macOS .app，这里明确拒绝，
+    // 不能拿 execPath 上溯出来的路径去改名，否则会搞坏开发环境。
+    const why = app.isPackaged
+      ? `更新器只支持 macOS 的 .app 形态（当前平台 ${process.platform}）`
+      : '开发模式不执行替换更新（打包后的程序才可以自我更新）'
+    if (!quiet) await dialog.showMessageBox({ type: 'warning', message: '当前形态不支持就地更新', detail: why, buttons: ['好'] })
+    return { ok: false, current, latest: null, hasUpdate: false, releasesDir: rd, error: why }
+  }
   const r = updater.checkForUpdate({ releasesDir: rd, currentVersion: current })
   if (!r.ok) {
     if (!quiet) await dialog.showMessageBox({ type: 'warning', message: '检查更新失败', detail: r.error || '', buttons: ['好'] })
@@ -773,9 +795,11 @@ app.whenReady().then(async () => {
   if (!gotLock) return
   // 先确认数据目录，再谈别的：这一步没过就什么都不做。
   if (!(await bootDataDirGuard())) return
-  if (isPackaged()) {
+  const installRoot = appInstallPath()
+  if (installRoot) {
     // 清掉上一次更新留下的 `.zunzhe-old-*` / `.zunzhe-update-*`（只删自己造的前缀）
-    const removed = updater.cleanupStale(path.dirname(appInstallPath()),
+    // 只在本体是已打包的 .app 时才做：其余形态下没有"安装目录"可言。
+    const removed = updater.cleanupStale(path.dirname(installRoot),
       (m) => console.warn('[更新]', m))
     if (removed.length) console.log('[更新] 已清理上次更新残留:', removed.join(', '))
   }

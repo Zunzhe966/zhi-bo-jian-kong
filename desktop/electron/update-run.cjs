@@ -254,6 +254,12 @@ function verifyApp(appPath) {
  * 全程**不触碰数据目录**。
  */
 function applyRelease({ release, installPath, log = () => {} }) {
+  // 只认 macOS .app。Windows/Linux 的便携目录或开发态的 Electron.app 都不是
+  // 本软件的"本体"——照着改名会把整个目录搞坏。ditto/codesign 也只存在于
+  // macOS，这一步先挡住，后面的 rename 才不会误伤。
+  if (typeof installPath !== 'string' || !installPath.endsWith('.app')) {
+    return { ok: false, error: `目标不是 .app，拒绝替换（${installPath}）` }
+  }
   const installDir = path.dirname(installPath)
   let unzipTmp = null
   try {
