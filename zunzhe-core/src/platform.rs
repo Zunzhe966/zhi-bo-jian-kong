@@ -1104,7 +1104,24 @@ const MRSS_NS: &str = "http://search.yahoo.com/mrss/";
 /// `<atom:link>`、`<media:thumbnail>`）和 CDATA 文本；这两类在真实订阅源里很常见，
 /// 旧 Python 依赖 `xml.etree.ElementTree`，Rust 侧也必须对齐同样的解析语义。
 pub fn parse_rss(text: &str) -> Result<Vec<VideoMeta>> {
-    let doc = roxmltree::Document::parse(text).context("RSS/Atom XML 解析失败")?;
+    // roxmltree 默认禁止 DTD：一旦订阅源里出现 `<!DOCTYPE>` 就直接报
+    // 「XML with DTD detected」。但部分 RSSHub 实例或前置代理会在 XML 里带 DTD
+    // 声明，必须允许才能解析。roxmltree 是只读、不联网的 DOM 解析器，开 allow_dtd
+    // 只是允许解析 DTD 子集，不会读取/加载外部实体，不存在 XXE 注入风险。
+    let opt = roxmltree::ParsingOptions {
+        allow_dtd: true,
+        ..Default::default()
+    };
+    let doc = roxmltree::Document::parse_with_options(text, opt).map_err(|e| {
+        let lowered = text.trim_start().to_ascii_lowercase();
+        if lowered.starts_with("<!doctype html") || text.contains("<html") {
+            anyhow!(
+                "RSS/Atom 解析失败：返回内容像是网页（可能 RSSHub 被限流或代理拦截），不是合法订阅源"
+            )
+        } else {
+            anyhow!("RSS/Atom XML 解析失败: {e}")
+        }
+    })?;
 
     let mut rss = Vec::new();
     for item in doc
@@ -2096,6 +2113,39 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title, "一个 <带标签> 的标题");
         assert_eq!(items[0].url, "https://x.test/cdata");
+    }
+
+    #[test]
+    fn parses_feed_with_doctype_declaration() {
+        // 回归：roxmltree 默认禁止 DTD，带 `<!DOCTYPE>` 的订阅源（部分 RSSHub
+        // 实例/前置代理会加）之前会报「XML with DTD detected」。开启 allow_dtd 后
+        // 必须能正常解析。
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE feed [
+  <!ENTITY x "y">
+]>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry><title>带 DTD 的 Atom</title><id>urn:dt-1</id>
+  <link href="https://x.test/dt"/></entry>
+</feed>"#;
+        let items = parse_rss(xml).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "带 DTD 的 Atom");
+        assert_eq!(items[0].url, "https://x.test/dt");
+    }
+
+    #[test]
+    fn rss_html_error_page_is_reported_clearly() {
+        // RSSHub 被限流/代理拦截时常返回 `<!DOCTYPE html>` 网页。开启 allow_dtd 后
+        // 这种网页会被解析器判定为非法 XML，应给出可读错误而非把 DOCTYPE 当致命错。
+        let html = r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>403</title></head>
+<body>RSSHub 访问受限</body></html>"#;
+        let err = parse_rss(html).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("网页") || msg.contains("订阅源"),
+            "应给出可读错误，实际: {msg}"
+        );
     }
 
     #[test]
