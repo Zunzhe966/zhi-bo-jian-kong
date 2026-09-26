@@ -212,10 +212,10 @@ function trimSlash(p) {
 /**
  * 算出一个主播/博主的产物目录。
  *
- * 新布局（分类在最上层）：产物根下第一级是分类目录，主播名在第二级。
- * kind='live'  → <产物根>/直播/<主播名>/
- * kind='video' → <短视频根>/短视频/<博主名>/
- * 批量下载      → <短视频根>/批量下载/<博主名>/
+ * 布局（主播名在最上层，一个主播的东西都在他自己的文件夹里）：
+ * kind='live'  → <录像根>/<主播名>/直播/
+ * kind='video' → <短视频根>/<博主名>/短视频/
+ * 批量下载      → <短视频根>/<博主名>/批量下载/
  *
  * 目录可能还没建（刚添加、还没跑过一轮），主进程的 resolveOpenablePath 会自动
  * 退到「仍在白名单内、且真实存在的最近祖先」，所以点下去总能到某个真实位置，
@@ -230,7 +230,7 @@ export function itemStashDir({ kind, name, url, paths, category }) {
   )
   if (!base) return ''
   const anchor = kind === 'live' ? cleanDirName(name) : safeDirName(name)
-  return `${base}/${cat}/${anchor}`
+  return `${base}/${anchor}/${cat}`
 }
 
 /** 更上一层的兜底目录：主播自己的文件夹还没建时，至少能落到产物根。 */

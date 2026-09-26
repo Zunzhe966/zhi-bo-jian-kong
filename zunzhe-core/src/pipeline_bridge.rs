@@ -12,6 +12,10 @@ use crate::process::{ChildError, ManagedChild};
 use crate::service::python_binary_available;
 
 /// 产物根下的系统目录名：这些不是主播目录，扫描产物时必须跳过。
+///
+/// 只放「系统目录」。三个分类名（直播/短视频/批量下载）刻意不放在这里——
+/// `walk_media_files` 会在任意深度按这个表跳过目录，而「最近录制」正是靠
+/// `{主播}/直播/` 这种二级目录找文件的，放进来会把直播录像整片漏掉。
 pub(crate) const NON_ANCHOR_DIRS: &[&str] = &[
     "database",
     "logs",
@@ -28,10 +32,10 @@ pub(crate) const MEDIA_SUFFIXES: &[&str] = &[
 
 /// 列出全部转写产物（含绝对路径）——智能体找文件就靠它。
 ///
-/// 新布局（产品手册第 3 章）：分类在最上层，主播名在二级目录。
-///   直播    录像 落在  {recordings_root}/直播/{主播}/{场次}/
-///   短视频  下载 落在  {video_root}/短视频/{主播}/{标题}/
-///   批量下载 落在  {video_root}/批量下载/{主播}/{标题}/
+/// 布局：主播名在最上层，分类在其下（一个主播的东西都在他自己的文件夹里）。
+///   直播    录像 落在  {recordings_root}/{主播}/直播/{场次}/
+///   短视频  下载 落在  {video_root}/{主播}/短视频/{标题}/
+///   批量下载 落在  {video_root}/{主播}/批量下载/{标题}/
 /// 旧布局（`fupan_output/{名字}/{场次}/`，目录合并迁移前的历史产物）一并列出，
 /// kind 标为「旧布局」，保证迁移完成前智能体仍能找到旧文件。
 pub fn list_notes(
@@ -41,17 +45,18 @@ pub fn list_notes(
     name_filter: &str,
 ) -> Result<Vec<serde_json::Value>> {
     let mut results = Vec::new();
-    // 新布局：三个分类目录，主播名在分类下一级。
-    for (base, kind) in [
+    // 主播名在最上层，分类（直播/短视频/批量下载）在主播目录下一级。
+    // recordings_root 与 video_root 通常同为产物根，这里按 (根, 分类) 组合逐轮
+    // 扫描各自的根目录；某个根/分类不存在时直接跳过，不会误报。
+    for (base, category) in [
         (recordings_root, "直播"),
         (video_root, "短视频"),
         (video_root, "批量下载"),
     ] {
-        let cat_dir = base.join(kind);
-        if !cat_dir.is_dir() {
+        if !base.is_dir() {
             continue;
         }
-        let mut anchors: Vec<PathBuf> = std::fs::read_dir(&cat_dir)
+        let mut anchors: Vec<PathBuf> = std::fs::read_dir(base)
             .map_err(anyhow::Error::from)?
             .filter_map(|e| e.ok())
             .map(|e| e.path())
@@ -69,7 +74,12 @@ pub fn list_notes(
             if !name_filter.is_empty() && anchor != name_filter {
                 continue;
             }
-            let mut sessions: Vec<PathBuf> = std::fs::read_dir(&anchor_dir)
+            // 分类目录在主播目录下一级，不存在就说明这个主播还没有该分类的产物。
+            let cat_dir = anchor_dir.join(category);
+            if !cat_dir.is_dir() {
+                continue;
+            }
+            let mut sessions: Vec<PathBuf> = std::fs::read_dir(&cat_dir)
                 .map_err(anyhow::Error::from)?
                 .filter_map(|e| e.ok())
                 .map(|e| e.path())
@@ -77,7 +87,7 @@ pub fn list_notes(
                 .collect();
             sessions.sort();
             for session_dir in sessions {
-                if let Some(entry) = scan_session_dir(&anchor, &session_dir, kind) {
+                if let Some(entry) = scan_session_dir(&anchor, &session_dir, category) {
                     results.push(entry);
                 }
             }
@@ -525,8 +535,8 @@ mod tests {
     }
 
     #[test]
-    fn list_notes_scans_new_layout_with_category_on_top() {
-        // 重排后：分类目录（直播/短视频/批量下载）在最上层，主播名在二级。
+    fn list_notes_scans_anchor_first_layout() {
+        // 布局：主播名在最上层，分类（直播/短视频/批量下载）在主播目录下一级。
         let dir = std::env::temp_dir().join(format!(
             "zunzhe-listnotes-{}-{}",
             std::process::id(),
@@ -536,24 +546,24 @@ mod tests {
                 .as_nanos()
         ));
         let media = dir.join("产物");
-        // 直播：{media}/直播/侯翠翠/2026-09-22 场次一
-        let live_session = media.join("直播").join("侯翠翠").join("2026-09-22 场次一");
+        // 直播：{media}/侯翠翠/直播/2026-09-22 场次一
+        let live_session = media.join("侯翠翠").join("直播").join("2026-09-22 场次一");
         std::fs::create_dir_all(&live_session).unwrap();
         std::fs::write(live_session.join("场次一.复盘笔记.md"), "# 笔记").unwrap();
         std::fs::write(live_session.join("场次一.ts"), b"x").unwrap();
-        // 短视频：{media}/短视频/影视飓风/某标题
-        let vid_session = media.join("短视频").join("影视飓风").join("某标题");
+        // 短视频：{media}/影视飓风/短视频/某标题
+        let vid_session = media.join("影视飓风").join("短视频").join("某标题");
         std::fs::create_dir_all(&vid_session).unwrap();
         std::fs::write(vid_session.join("某标题.转写.txt"), "文字").unwrap();
         std::fs::write(vid_session.join("某标题.mp4"), b"y").unwrap();
-        // 批量下载：{media}/批量下载/老白/合集A
-        let batch_session = media.join("批量下载").join("老白").join("合集A");
+        // 批量下载：{media}/老白/批量下载/合集A
+        let batch_session = media.join("老白").join("批量下载").join("合集A");
         std::fs::create_dir_all(&batch_session).unwrap();
         std::fs::write(batch_session.join("合集A.知识点.json"), "{}").unwrap();
         std::fs::write(batch_session.join("合集A.mp4"), b"z").unwrap();
 
         let notes = list_notes(&media, &media, &dir.join("fupan_output"), "").unwrap();
-        assert_eq!(notes.len(), 3, "新布局三个分类下的复盘产物都应被列出: {notes:?}");
+        assert_eq!(notes.len(), 3, "三个分类下的复盘产物都应被列出: {notes:?}");
         let mut by_anchor: std::collections::HashMap<String, serde_json::Value> = notes
             .into_iter()
             .map(|n| (n["anchor"].as_str().unwrap().to_string(), n))
@@ -561,23 +571,23 @@ mod tests {
         assert!(by_anchor.contains_key("侯翠翠"));
         assert!(by_anchor.contains_key("影视飓风"));
         assert!(by_anchor.contains_key("老白"));
-        // 路径顺序必须是 分类/主播/场次（而非旧布局的 主播/分类/场次）。
+        // 路径顺序必须是 主播/分类/场次（主播名在最上层）。
         let live = by_anchor.remove("侯翠翠").unwrap();
         assert_eq!(live["session"].as_str().unwrap(), "2026-09-22 场次一");
         assert!(
             live["notes_file"]
                 .as_str()
                 .unwrap()
-                .contains("直播/侯翠翠/2026-09-22 场次一/场次一.复盘笔记.md"),
-            "直播笔记路径应按 直播/主播/场次 组织: {live:?}"
+                .contains("侯翠翠/直播/2026-09-22 场次一/场次一.复盘笔记.md"),
+            "直播笔记路径应按 主播/直播/场次 组织: {live:?}"
         );
         let vid = by_anchor.remove("影视飓风").unwrap();
         assert!(
             vid["transcript_file"]
                 .as_str()
                 .unwrap()
-                .contains("短视频/影视飓风/某标题/某标题.转写.txt"),
-            "短视频转写路径应按 短视频/主播/标题 组织: {vid:?}"
+                .contains("影视飓风/短视频/某标题/某标题.转写.txt"),
+            "短视频转写路径应按 主播/短视频/标题 组织: {vid:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

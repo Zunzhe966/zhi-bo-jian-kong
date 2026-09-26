@@ -114,9 +114,9 @@ pub async fn enqueue_downloads(
 }
 
 /// 下载器：优先走平台原生路径（B站浏览器内核提取直链 + ffmpeg 合流），
-/// 失败回退 yt-dlp。下载产物按新布局落盘：
-/// `{video_root}/<分类>/<主播>/<标题>/<标题>.mp4`，分类 ∈ {短视频, 批量下载}，
-/// 转写文字与视频同目录。
+/// 失败回退 yt-dlp。下载产物按布局落盘：
+/// `{video_root}/<主播>/<分类>/<标题>/<标题>.mp4`，分类 ∈ {短视频, 批量下载}，
+/// 主播名在最上层（一个主播的东西都在自己的文件夹里），转写文字与视频同目录。
 pub struct Downloader {
     project_dir: PathBuf,
 }
@@ -135,15 +135,16 @@ impl Downloader {
     ) -> Result<DownloadResult> {
         // 主播名来自外部输入，必须清洗后再拼路径：防止 `../`、`/`、Windows
         // 保留设备名等把文件写到产物根之外或产生非法目录。
-        // 新布局：{video_root}/{分类}/{主播}/{标题}/{标题}.mp4，分类先到
-        // （短视频 / 批量下载）。标题要等下载完成才知道（yt-dlp 按标题命名），
-        // 所以先落分类下的主播目录，成功后由 finish_download 收进以它自己命名的子目录。
+        // 布局：{video_root}/{主播}/{分类}/{标题}/{标题}.mp4，主播名先到（一个
+        // 主播的东西都在他自己的文件夹里），分类（短视频/批量下载）在其下。标题
+        // 要等下载完成才知道（yt-dlp 按标题命名），所以先落分类下的主播目录，
+        // 成功后由 finish_download 收进以它自己命名的子目录。
         let safe_name = safe_dir_name(name);
         // 分类只接受已知值，未知归一为「短视频」，避免外部输入拼出越界目录名。
         let cat = if category == "批量下载" { "批量下载" } else { "短视频" };
         let dir = crate::paths::video_root(&self.project_dir)
-            .join(cat)
-            .join(&safe_name);
+            .join(&safe_name)
+            .join(cat);
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("创建下载目录失败: {}", dir.display()))?;
 

@@ -15,7 +15,8 @@ export default function HistoryModals({
           输入博主主页地址，列出其历史视频后勾选批量下载（无需先加入监控）。
         </p>
         <Form form={batchForm} layout="vertical">
-          <Form.Item label="博主名称" name="name">
+          <Form.Item label="博主名称" name="name"
+            rules={[{ required: true, message: '请填写博主名称：下载会存到「<博主名>/批量下载/」，留空就没法放进他本人的文件夹' }]}>
             <Input placeholder="用于文件夹命名，如 影视飓风" />
           </Form.Item>
           <Form.Item label="博主主页地址" name="url" rules={[{ required: true }]}
@@ -44,7 +45,7 @@ export default function HistoryModals({
         ]}
       >
         <p style={{ marginBottom: 12, color: '#666' }}>
-          勾选想要的视频，点「下载选中」批量保存到 <b>{paths.video_root || paths.media_root || "产物根目录"}/{blogger?.name || "博主名"}/短视频/</b> 并自动转写复盘。
+          勾选想要的视频，点「下载选中」批量保存到 <b>{paths.video_root || paths.media_root || "产物根目录"}/{blogger?.name || "博主名"}/批量下载/</b> 并自动转写复盘。
         </p>
         <Table
           rowKey="key"

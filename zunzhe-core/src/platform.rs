@@ -83,9 +83,10 @@ fn upload_list_failure_message(official: &str, rsshub: &str, ytdlp: &str) -> Str
         || detail.contains("wbi")
         || detail.contains("签名")
     {
-        "若为 412 风控请配置 B站 cookie".to_string()
+        "B站按 412 风控拦下了这次请求：请在设置页点「B站授权」用浏览器登录一次再重试——带 Cookie 请求就不容易被拦；不想登录就隔几分钟、换个网络再试"
+            .to_string()
     } else {
-        "可稍后重试或检查 B站 cookie".to_string()
+        "可稍后重试；仍失败就在设置页点「B站授权」登录一次".to_string()
     };
     format!("B站投稿列表拉取失败: {detail}（{hint}）")
 }
@@ -709,7 +710,16 @@ impl BilibiliAdapter {
         let candidates = rsshub_candidates(&configured, mid);
         let mut failures = Vec::new();
         for rss in &candidates {
-            match self.client.get(rss).send().await {
+            // 必须给每个实例一个硬上限：RSSHub 公共实例被打到黑洞（丢包、不响应）
+            // 时，裸请求会一直挂着，整条「列主播历史」就永远回不来——上层再放宽
+            // 超时也没用，因为根本没有可等的终态。20 秒 × 2 个实例 = 最多 40 秒。
+            match self
+                .client
+                .get(rss)
+                .timeout(Duration::from_secs(20))
+                .send()
+                .await
+            {
                 Ok(resp) => {
                     let status = resp.status();
                     if !status.is_success() {
@@ -2408,14 +2418,14 @@ mod tests {
         assert!(net.contains("检查网络"), "{net}");
         assert!(!net.contains("请配置 B站 cookie"), "{net}");
 
-        // 风控：提示配置 cookie。
+        // 风控：提示去「B站授权」登录（比笼统的“配置 cookie”更可操作）。
         let risk = upload_list_failure_message(
             "官方 wbi 接口未返回 BV（可能是 412 风控或接口变更）",
             "RSSHub 返回 HTTP 403",
             "yt-dlp 未返回 BV 号",
         );
         assert!(risk.contains("412"), "{risk}");
-        assert!(risk.contains("请配置 B站 cookie"), "{risk}");
+        assert!(risk.contains("B站授权"), "{risk}");
 
         // 完全无原因：给出通用提示，不崩溃。
         let empty = upload_list_failure_message("", "", "");

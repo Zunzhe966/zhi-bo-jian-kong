@@ -59,7 +59,7 @@ pub struct StoragePaths {
     /// 短视频下载落点（历史字段：默认 `<产物根>/downloads`，仅作可信根/旧产物位置保留；
     /// 新下载落点见 `video_root`）。
     pub downloads: PathBuf,
-    /// 短视频产物根：新下载落在 `{video_root}/短视频/{主播}/{标题}/`。
+    /// 短视频产物根：新下载落在 `{video_root}/{主播}/{分类}/{标题}/`。
     /// 等于 `[路径设置] 短视频下载目录` 覆盖值；未覆盖时为 `media_root`。
     pub video_root: PathBuf,
     /// 复盘输出落点（转写/知识点/切片/封面都在这下面）。
@@ -88,8 +88,8 @@ impl StoragePaths {
         self.logs.clone()
     }
 
-    /// 直播录像落点：`直播保存路径` 优先，否则落在产物根（新布局
-    /// `{recordings}/直播/{主播}/{日期} {场次}/`，见产品手册第 3 章）。
+    /// 直播录像落点：`直播保存路径` 优先，否则落在产物根（布局
+    /// `{recordings}/{主播}/直播/{日期} {场次}/`，见产品手册第 3 章）。
     pub fn recordings(&self) -> PathBuf {
         self.live_save
             .clone()
@@ -171,7 +171,7 @@ pub fn downloads(project_dir: &Path) -> PathBuf {
     storage(project_dir).downloads.clone()
 }
 
-/// 短视频产物根：新下载落在 `{video_root}/短视频/{主播}/{标题}/`。
+/// 短视频产物根：新下载落在 `{video_root}/{主播}/{分类}/{标题}/`。
 pub fn video_root(project_dir: &Path) -> PathBuf {
     storage(project_dir).video_root.clone()
 }
@@ -352,9 +352,9 @@ fn resolve(project_dir: &Path) -> StoragePaths {
     let media_root = expand(project_dir, &read("产物根目录")).unwrap_or_else(default_media_root);
     let downloads = expand(project_dir, &read("短视频下载目录"))
         .unwrap_or_else(|| media_root.join("downloads"));
-    // 新布局（产品手册第 3 章）：短视频落在 `{video_root}/短视频/{主播}/{标题}/`。
+    // 布局：短视频落在 `{video_root}/{主播}/{分类}/{标题}/`（分类 ∈ 短视频/批量下载）。
     // 用户显式覆盖 `短视频下载目录` 时以覆盖值为根，否则直接以产物根为根——
-    // 产物根下一级只能是主播目录，不再经过 downloads/ 这层历史目录。
+    // 产物根下一级是主播目录，不再经过 downloads/ 这层历史目录。
     let video_root = expand(project_dir, &read("短视频下载目录"))
         .unwrap_or_else(|| media_root.clone());
     let fupan = expand(project_dir, &read("复盘输出目录"))

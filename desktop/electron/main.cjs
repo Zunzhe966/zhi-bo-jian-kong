@@ -321,22 +321,42 @@ function reloadUiWindow() {
   })
 }
 
+// 需要联网抓平台数据的命令：慢是正常的，绝不能按本地命令的 30 秒一刀切。
+//
+// 「列出主播历史」（blogger-videos）要依次试 RSSHub → 官方 wbi/arc 接口 → yt-dlp
+// 三套兜底，实测 B站单个主播约 80 秒；批量下载一次入队几十条也要时间。统一 30 秒
+// 硬超时会把它们全部杀掉，用户看到的就是「Rust 核心命令超时」——这条命令本身没坏，
+// 是被自己的超时误杀的。所以按命令给不同的上限，其余仍保持 30 秒。
+const CLI_TIMEOUT_OVERRIDES_MS = {
+  // 三兜底走完（RSSHub 40s + 官方接口 + yt-dlp 90s + 并发补全）最坏约 165s，
+  // 给到 240s 留足余量；正常情况下 RSSHub 或官方接口几秒内就返回。
+  'blogger-videos': 240000,
+  'check-videos': 240000,
+  'download-videos': 240000,
+  'download-video': 240000,
+  'monitor-add': 120000,
+}
+
+function cliTimeoutMs(cmd) {
+  return CLI_TIMEOUT_OVERRIDES_MS[cmd] || 30000
+}
+
 function runCli(args) {
   return new Promise((resolve, reject) => {
     const exe = fs.existsSync(rustExe()) ? rustExe() : RUST_DEBUG_EXE
     if (!fs.existsSync(exe)) {
       return reject(new Error(`找不到 Rust 核心，请先构建：cd zunzhe-core && cargo build --release\n${rustExe()}`))
     }
-    const timeoutMs = 30000
+    const timeoutMs = cliTimeoutMs(args[0])
     const proc = spawn(exe, args, {
       cwd: runtimeDir(),
       windowsHide: true,
     })
     const timer = setTimeout(() => {
       proc.kill('SIGTERM')
-      // 30 秒后再强制结束，避免进程组残留。
+      // 3 秒后再强制结束，避免进程组残留。
       setTimeout(() => { try { proc.kill('SIGKILL') } catch (e) {} }, 3000)
-      reject(new Error(`Rust 核心命令超时（${timeoutMs}ms）: ${args[0]}`))
+      reject(new Error(`Rust 核心命令超时（${Math.round(timeoutMs / 1000)} 秒）: ${args[0]}`))
     }, timeoutMs)
     let stdout = ''
     let stderr = ''

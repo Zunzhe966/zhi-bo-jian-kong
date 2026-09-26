@@ -169,11 +169,11 @@ console.log('pending transcription path normalization: ok')
 const realPaths = { media_root: '/Volumes/A区/尊者产物' }
 assert.equal(
   itemStashDir({ kind: 'video', name: '影视飓风', url: 'https://space.bilibili.com/1', paths: realPaths }),
-  '/Volumes/A区/尊者产物/短视频/影视飓风',
+  '/Volumes/A区/尊者产物/影视飓风/短视频',
 )
 assert.equal(
   itemStashDir({ kind: 'live', name: '侯翠翠', url: 'https://live.bilibili.com/1', paths: realPaths }),
-  '/Volumes/A区/尊者产物/直播/侯翠翠',
+  '/Volumes/A区/尊者产物/侯翠翠/直播',
 )
 assert.equal(
   itemStashFallback({ kind: 'video', url: 'https://space.bilibili.com/1', paths: realPaths }),
@@ -182,7 +182,7 @@ assert.equal(
 assert.equal(
   itemStashDir({ kind: 'video', name: '影视飓风', url: 'https://space.bilibili.com/1',
     paths: { media_root: '/Volumes/A区/尊者产物', video_root: '/Volumes/B区/短视频' } }),
-  '/Volumes/B区/短视频/短视频/影视飓风',
+  '/Volumes/B区/短视频/影视飓风/短视频',
 )
 
 console.log('real stash paths: ok')
@@ -194,7 +194,7 @@ assert.deepEqual(
   ),
   {
     type: 'success',
-    text: '已加入下载队列：2 个，已存在 1 个，已下载跳过 3 个，失败 0 个。完成后文件在 /Volumes/A区/尊者产物/批量下载/影视飓风/',
+    text: '已加入下载队列：2 个，已存在 1 个，已下载跳过 3 个，失败 0 个。完成后文件在 /Volumes/A区/尊者产物/影视飓风/批量下载/',
   },
 )
 assert.deepEqual(

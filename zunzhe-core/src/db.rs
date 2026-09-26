@@ -176,8 +176,8 @@ pub async fn init_db(pool: &SqlitePool) -> anyhow::Result<()> {
         }
     }
 
-    // 旧版本 tasks 没有 category 列：下载产物按 直播/短视频/批量下载 分顶层目录，
-    // 任务需携带 category 才能落到正确目录。
+    // 旧版本 tasks 没有 category 列：下载产物按 <主播>/<分类>（分类 ∈
+    // 短视频/批量下载）分目录，任务需携带 category 才能落到正确目录。
     let has_category = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name='category'",
     )

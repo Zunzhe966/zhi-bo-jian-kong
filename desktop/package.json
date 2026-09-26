@@ -1,6 +1,6 @@
 {
   "name": "live-review-desktop",
-  "version": "1.7.10",
+  "version": "1.7.11",
   "description": "尊者直播监控桌面界面",
   "main": "electron/main.cjs",
   "author": "Zunzhe",
