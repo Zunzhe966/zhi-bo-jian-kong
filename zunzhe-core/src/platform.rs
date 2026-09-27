@@ -21,12 +21,23 @@ const MIXIN_KEY_TAB: [usize; 64] = [
     54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52,
 ];
 
+/// 按官方算法把 `img_key + sub_key` 置换出 mixin_key。
+///
+/// **必须只取前 32 位**。官方 JS 参考实现是
+/// `mixinKeyEncTab.map(i => raw[i]).join('').slice(0, 32)`——置换表有 64 项，
+/// 但结果要截断到 32 字符再参与 `w_rid` 计算。
+///
+/// 2026-09-27 实测：漏掉这一步（用完整 64 位去算）时 `w_rid` 全错，B站
+/// 对签名错误的请求返回的是 **`code=-403 访问权限不足`**，而不是更直观的
+/// `-352`。于是整条官方投稿接口每轮都失败、被日志错误归因成「需要登录态」，
+/// 用户反复去登录也修不好；而同一份 Cookie 手工按官方算法签名立刻 `code=0`。
 fn mixin_key(img_key: &str, sub_key: &str) -> String {
     let raw = format!("{img_key}{sub_key}");
     let chars: Vec<char> = raw.chars().collect();
     MIXIN_KEY_TAB
         .iter()
         .map(|&i| chars.get(i).copied().unwrap_or('a'))
+        .take(32)
         .collect()
 }
 
@@ -61,8 +72,9 @@ fn upload_list_failure_message(official: &str, rsshub: &str, ytdlp: &str) -> Str
     };
     // 判定顺序很有讲究：
     // 1) 网络故障优先——即使同时带“请求失败”和“风控”，根因也是网络；
-    // 2) “-403 访问权限不足/需要登录态”单独成一档——此时风控已过，只差登录，
-    //    提示用户去配置 B站 cookie 才是唯一正解，不能笼统说“412 风控”；
+    // 2) “-403 访问权限不足”单独成一档——2026-09-27 实测：B站对**签名未通过**
+    //    的请求（缺 w_rid / w_rid 算错）返回的就是 -403，而不是 -352。
+    //    所以这一档的根因是「签名没被认」，不能误导用户去反复登录；
     // 3) 其余风控类（-352/-799/412/签名）再归为风控档。
     let hint = if detail.contains("解析失败")
         || detail.contains("请求失败")
@@ -74,7 +86,8 @@ fn upload_list_failure_message(official: &str, rsshub: &str, ytdlp: &str) -> Str
     {
         "若为网络/DNS 故障请检查网络后重试".to_string()
     } else if detail.contains("访问权限不足") || detail.contains("-403") {
-        "B站该接口需要登录态，请在桌面端「B站授权」中勾选登录账号后再试".to_string()
+        "B站没把这次请求当成「已签名」的请求：多为 wbi 签名缺失/算错（不是需要重新登录）；\
+若已是最新版仍持续出现，请反馈一下".to_string()
     } else if detail.contains("-352")
         || detail.contains("-799")
         || detail.contains("412")
@@ -146,9 +159,72 @@ const DM_COVER_IMG_STR: &str = "QU5HTEUgKEFwcGxlLCBBTkdMRSBNZXRhbCBSZW5kZXJlcjog
 /// 风险控制参数：页面交互采样。
 const DM_IMG_INTER: &str = "{\"ds\":[],\"wh\":[0,0,0],\"of\":[0,0,0]}";
 
-/// 用 B 站 WBI 公钥和投稿列表参数生成签名查询串。
+/// 当前 Unix 秒，供 `wts` 使用（取不到时钟时返回 0，与旧行为一致）。
+pub(crate) fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 按官方 WBI 规则对任意参数表签名：**排序 → encodeURIComponent → 拼串 →
+/// `md5(查询串 + mixin_key)`**，返回可直接拼到 URL `?` 后面的完整查询串。
 ///
-/// 纯函数便于单测；排序、URL 编码、拼参、`w_rid` 均按官方 WBI 规则执行。
+/// 抽成通用函数是因为 B站所有 WBI 接口（投稿列表 `space/wbi/arc/search`、
+/// 直播弹幕 `xlive/.../getDanmuInfo` 等）用的是同一套签名，只有参数表不同。
+/// 任何一处漏了排序 / 编码 / 32 位截断，整条接口都会静默失效。
+///
+/// 纯函数便于单测；`wts` 由这里统一追加并参与排序，调用方不要再自己塞。
+pub(crate) fn wbi_signed_query(
+    img_key: &str,
+    sub_key: &str,
+    params: &[(&str, String)],
+    wts: u64,
+) -> String {
+    let mut all: Vec<(&str, String)> = params.to_vec();
+    all.push(("wts", wts.to_string()));
+    all.sort_by(|a, b| a.0.cmp(b.0));
+    let query = all
+        .iter()
+        .map(|(k, v)| format!("{}={}", encode_uri_component(k), encode_uri_component(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+    let mixin = mixin_key(img_key, sub_key);
+    let digest = md5_hex(&format!("{query}{mixin}"));
+    format!("{query}&w_rid={digest}")
+}
+
+/// 取 WBI 签名用的 `(img_key, sub_key)`（来源：`x/web-interface/nav`）。
+///
+/// 有登录态/匿名指纹时必须一并带上，否则可能被当成匿名出口。失败返回 Err，
+/// 调用方自行决定是回退无签名请求还是放弃。
+pub(crate) async fn wbi_keys(
+    client: &reqwest::Client,
+    cookie: &str,
+) -> anyhow::Result<(String, String)> {
+    let mut req = client
+        .get("https://api.bilibili.com/x/web-interface/nav")
+        .header("Referer", "https://www.bilibili.com");
+    if !cookie.is_empty()
+        && let Ok(v) = reqwest::header::HeaderValue::from_str(cookie)
+    {
+        req = req.header(reqwest::header::COOKIE, v);
+    }
+    let nav = req.send().await?.json::<serde_json::Value>().await?;
+    let img_url = nav["data"]["wbi_img"]["img_url"].as_str().unwrap_or("");
+    let sub_url = nav["data"]["wbi_img"]["sub_url"].as_str().unwrap_or("");
+    if img_url.is_empty() || sub_url.is_empty() {
+        anyhow::bail!("wbi nav 缺少 img_url");
+    }
+    let img_key = img_url.rsplit('/').next().unwrap_or("").replace(".png", "");
+    let sub_key = sub_url.rsplit('/').next().unwrap_or("").replace(".png", "");
+    if img_key.is_empty() || sub_key.is_empty() {
+        anyhow::bail!("wbi key 为空");
+    }
+    Ok((img_key, sub_key))
+}
+
+/// 用 B 站 WBI 公钥和投稿列表参数生成签名查询串。
 ///
 /// 参数表必须与网页端 `x/space/wbi/arc/search` 保持一致：B站把整串参与
 /// `w_rid` 签名，少一个都会被判成 `code=-352`「风控校验失败」。尤其是
@@ -164,7 +240,7 @@ fn build_wbi_query(
     page: u32,
     wts: u64,
 ) -> String {
-    let mut params = vec![
+    let params: Vec<(&str, String)> = vec![
         ("mid", mid.to_string()),
         ("ps", count.to_string()),
         ("pn", page.to_string()),
@@ -182,17 +258,8 @@ fn build_wbi_query(
         ("dm_img_str", DM_IMG_STR.to_string()),
         ("dm_cover_img_str", DM_COVER_IMG_STR.to_string()),
         ("dm_img_inter", DM_IMG_INTER.to_string()),
-        ("wts", wts.to_string()),
     ];
-    params.sort_by(|a, b| a.0.cmp(b.0));
-    let query = params
-        .iter()
-        .map(|(k, v)| format!("{}={}", encode_uri_component(k), encode_uri_component(v)))
-        .collect::<Vec<_>>()
-        .join("&");
-    let mixin = mixin_key(img_key, sub_key);
-    let digest = md5_hex(&format!("{query}{mixin}"));
-    format!("{query}&w_rid={digest}")
+    wbi_signed_query(img_key, sub_key, &params, wts)
 }
 
 /// 合并两组 Cookie 头：以 `base` 为主，仅追加 `extra` 中 base 没有的键。
@@ -361,7 +428,7 @@ pub struct BilibiliAdapter {
 /// 的浏览器 UA，B站会直接判定成爬虫并返回 412 风控。后果很隐蔽：官方投稿
 /// 接口永远打不通，「列出主播历史」只能退回 RSSHub 的半截列表，于是官方
 /// 46 条只列出 45 条，用户怎么点都补不上那一条。
-const DESKTOP_CHROME_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+pub(crate) const DESKTOP_CHROME_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
 AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
 
 /// B站相关请求统一使用的中文语言偏好（真实浏览器都会带，缺了更像爬虫）。
@@ -457,7 +524,7 @@ impl BilibiliAdapter {
             let message = data["message"].as_str().unwrap_or("未知错误");
             let hint = match code {
                 -352 => "（风控校验失败：设备指纹或出口 IP 被拦）",
-                -403 => "（风控已过但访问权限不足：该空间接口需要登录态，请配置 B站 cookie）",
+                -403 => "（签名未被 B站认可：wbi 的 w_rid 缺失或算错，不是需要登录）",
                 -799 => "（请求过于频繁：出口 IP 被限流）",
                 _ => "",
             };
@@ -487,30 +554,8 @@ impl BilibiliAdapter {
         // 否则即使用户已授权，这一步仍可能被 B站当成匿名出口并 412，导致
         // 官方投稿接口永远回退到 RSSHub/yt-dlp。
         let cookie = self.effective_cookie().await;
-        let mut req = client
-            .get("https://api.bilibili.com/x/web-interface/nav")
-            .header("Referer", "https://www.bilibili.com");
-        if !cookie.is_empty()
-            && let Ok(v) = reqwest::header::HeaderValue::from_str(&cookie)
-        {
-            req = req.header(reqwest::header::COOKIE, v);
-        }
-        let nav = req.send().await?.json::<serde_json::Value>().await?;
-        let img_url = nav["data"]["wbi_img"]["img_url"].as_str().unwrap_or("");
-        let sub_url = nav["data"]["wbi_img"]["sub_url"].as_str().unwrap_or("");
-        if img_url.is_empty() || sub_url.is_empty() {
-            anyhow::bail!("wbi nav 缺少 img_url");
-        }
-        let img_key = img_url.rsplit('/').next().unwrap_or("").replace(".png", "");
-        let sub_key = sub_url.rsplit('/').next().unwrap_or("").replace(".png", "");
-        if img_key.is_empty() || sub_key.is_empty() {
-            anyhow::bail!("wbi key 为空");
-        }
-        let wts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        Ok(build_wbi_query(&img_key, &sub_key, mid, count, page, wts))
+        let (img_key, sub_key) = wbi_keys(&client, &cookie).await?;
+        Ok(build_wbi_query(&img_key, &sub_key, mid, count, page, now_unix_secs()))
     }
 
     pub fn with_project_dir(project_dir: PathBuf) -> Self {
@@ -765,8 +810,9 @@ impl Platform for BilibiliAdapter {
     /// 把「官方接口这次为什么没给出完整列表」翻译成用户能照着做的一句话。
     ///
     /// 关键区分（顺序即严重度，越靠前越需要用户动手）：
-    /// - `-403` 访问权限不足：风控已过，**只差登录态**——这就是「官方 46 条、
-    ///   界面 45 条」在当前机器上的真实原因，用户点一次「B站授权」即可补齐；
+    /// - `-403` 访问权限不足：**签名没被 B站认可**（缺 w_rid / w_rid 算错）——
+    ///   2026-09-27 实测确认，与「有没有登录」无关；真正的登录态问题会返回
+    ///   `-352` 或直接 412，所以这里绝不能再提示用户去登录；
     /// - `-352` 风控校验失败：设备指纹或出口 IP 被拦，换网络/稍后重试或授权；
     /// - `-799` 频率限制：出口 IP 被限流，只能等；
     /// - `-1000` HTTP 层失败（412 等）、`-1001` 网络/签名失败：偏环境问题。
@@ -782,13 +828,12 @@ impl Platform for BilibiliAdapter {
                 .last_official_had_login
                 .load(std::sync::atomic::Ordering::Relaxed)
             {
-                "已检测到 B站 登录态，但官方接口这次仍拒绝访问（多为出口 IP 被限流，\
-或该接口对本次请求额外校验）：稍后重试即可；本次列表来自兜底源，条目通常仍然齐全，\
-只是取数慢一些，不需要再去登录一次"
+                "B站没把这次请求当成「已签名」的请求（wbi 签名未通过校验），这与登录态无关：\
+不需要再去登录一次；本次列表来自兜底源，条目通常仍然齐全，只是取数慢一些"
                     .to_string()
             } else {
-                "B站官方接口已放行但要求登录态：请到设置页点「B站授权」用浏览器登录一次，\
-之后就能拿到该主播的完整投稿列表（当前列表来自兜底源，可能少几条）"
+                "B站没把这次请求当成「已签名」的请求（wbi 签名缺失或算错）：\
+到设置页点「B站授权」登录一次可以顺带刷新设备指纹；当前列表来自兜底源，可能少几条"
                     .to_string()
             }),
             -352 => Some(
@@ -1348,6 +1393,39 @@ fn is_plausible_bvid(text: &str) -> bool {
         && bytes[3..].iter().all(|b| b.is_ascii_alphanumeric())
 }
 
+/// 解析投稿条目的「时长」字段。
+///
+/// 官方 `x/space/wbi/arc/search` 的 vlist 里，时长叫 `length` 且是**字符串**
+/// —— `"04:53"` / `"1:02:03"`，不是整数秒。旧实现直接 `as_i64()`，于是线上
+/// 永远是 `duration: 0`（单测里喂的是整数，所以一直没暴露）。整数形态也一并
+/// 兼容，防止接口变体再次踩坑。
+fn parse_duration_field(v: &serde_json::Value) -> i64 {
+    if let Some(n) = v.as_i64() {
+        return n;
+    }
+    let Some(text) = v.as_str() else { return 0 };
+    let mut secs: i64 = 0;
+    for part in text.trim().split(':') {
+        let Ok(n) = part.trim().parse::<i64>() else {
+            return 0;
+        };
+        secs = secs * 60 + n;
+    }
+    secs
+}
+
+/// 解析投稿条目的「发布时间」字段（Unix 秒）。
+///
+/// 官方 vlist 用的是 `created`；旧实现读的是 `pubdate`——这个字段在当前接口
+/// 的返回里根本不存在，于是线上发布日期永远是空的。两个名字都认，接口变体
+/// 也不用再改代码。
+fn parse_published_ts(r: &serde_json::Value) -> i64 {
+    r.get("created")
+        .and_then(|t| t.as_i64())
+        .or_else(|| r.get("pubdate").and_then(|t| t.as_i64()))
+        .unwrap_or(0)
+}
+
 /// 从 B站官方 `arc/search` 成功 JSON 中提取 BV 列表。
 ///
 /// `code != 0`、缺 `data.list.vlist` 或数组中无 BV 都视为“没有可用结果”，
@@ -1372,7 +1450,7 @@ fn parse_official_upload_response_in_offset(
     rows.iter()
         .filter_map(|r| {
             let bvid = r.get("bvid").and_then(|b| b.as_str())?;
-            let ts = r.get("pubdate").and_then(|t| t.as_i64()).unwrap_or(0);
+            let ts = parse_published_ts(r);
             Some(VideoMeta {
                 id: bvid.to_string(),
                 platform: "bilibili".to_string(),
@@ -1392,7 +1470,7 @@ fn parse_official_upload_response_in_offset(
                 } else {
                     String::new()
                 },
-                duration: r.get("length").and_then(|l| l.as_i64()).unwrap_or(0),
+                duration: r.get("length").map(parse_duration_field).unwrap_or(0),
             })
         })
         .take(if count == 0 {
@@ -2550,15 +2628,18 @@ mod tests {
 
     #[test]
     fn failure_message_distinguishes_login_required_from_risk_control() {
-        // -403 访问权限不足：风控已过、仅差登录，提示必须指向“勾选登录账号”。
-        let login_msg = upload_list_failure_message(
-            "官方接口业务错误 code=-403 访问权限不足（风控已过但访问权限不足：该空间接口需要登录态，请配置 B站 cookie）",
+        // -403 访问权限不足：2026-09-27 实测＝签名没被 B站认可（缺 w_rid /
+        // w_rid 算错），**不是**「需要登录」。提示必须指向签名，绝不能再让用户
+        // 去反复登录（这正是「我明明登录过」这类困惑的来源）。
+        let sign_msg = upload_list_failure_message(
+            "官方接口业务错误 code=-403 访问权限不足（签名未被 B站认可：wbi 的 w_rid 缺失或算错，不是需要登录）",
             "",
             "",
         );
-        assert!(login_msg.contains("勾选登录账号"), "实际: {login_msg}");
+        assert!(sign_msg.contains("签名"), "实际: {sign_msg}");
+        assert!(!sign_msg.contains("勾选登录账号"), "实际: {sign_msg}");
 
-        // -352 风控：仍归为风控档，提示配置 cookie。
+        // -352 风控：仍归为风控档，提示去「B站授权」登录以降低被拦概率。
         let risk_msg = upload_list_failure_message("-352 风控校验失败", "", "");
         assert!(risk_msg.contains("412 风控"), "实际: {risk_msg}");
         assert!(!risk_msg.contains("勾选登录账号"));
@@ -2848,8 +2929,23 @@ mod tests {
         // 固定输入 → 固定签名，防止编码/拼接规则被改坏。
         assert_eq!(
             query,
-            "dm_cover_img_str=QU5HTEUgKEFwcGxlLCBBTkdMRSBNZXRhbCBSZW5kZXJlcjogQXBwbGUgTTEsIFVuc3BlY2lmaWVkIFZlcnNpb24pR29vZ2xlIEluYy4gKEFwcGxl&dm_img_inter=%7B%22ds%22%3A%5B%5D%2C%22wh%22%3A%5B0%2C0%2C0%5D%2C%22of%22%3A%5B0%2C0%2C0%5D%7D&dm_img_list=%5B%7B%22x%22%3A0%2C%22y%22%3A0%2C%22z%22%3A0%2C%22timestamp%22%3A1%2C%22k%22%3A1%2C%22type%22%3A1%7D%5D&dm_img_str=V2ViR0wgMS4wIChPcGVuR0wgRVMgMi4wIENocm9taXVtKQ&index=0&keyword=&mid=946974&order=pubdate&order_avoided=true&platform=web&pn=1&ps=40&special_type=&tid=0&web_location=333.1387&wts=1786550400&x-bili-device-req-json=%7B%22platform%22%3A%22web%22%2C%22device%22%3A%22pc%22%2C%22spmid%22%3A%22333.1387%22%2C%22mobi_app%22%3A%22web_cn%22%7D&x-bili-locale-json=%7B%22c_locale%22%3A%7B%22language%22%3A%22zh%22%2C%22script%22%3A%22Hans%22%7D%2C%22always_translate%22%3Afalse%7D&w_rid=4c4e9ed6108a92589e6e26d9810558c4"
+            "dm_cover_img_str=QU5HTEUgKEFwcGxlLCBBTkdMRSBNZXRhbCBSZW5kZXJlcjogQXBwbGUgTTEsIFVuc3BlY2lmaWVkIFZlcnNpb24pR29vZ2xlIEluYy4gKEFwcGxl&dm_img_inter=%7B%22ds%22%3A%5B%5D%2C%22wh%22%3A%5B0%2C0%2C0%5D%2C%22of%22%3A%5B0%2C0%2C0%5D%7D&dm_img_list=%5B%7B%22x%22%3A0%2C%22y%22%3A0%2C%22z%22%3A0%2C%22timestamp%22%3A1%2C%22k%22%3A1%2C%22type%22%3A1%7D%5D&dm_img_str=V2ViR0wgMS4wIChPcGVuR0wgRVMgMi4wIENocm9taXVtKQ&index=0&keyword=&mid=946974&order=pubdate&order_avoided=true&platform=web&pn=1&ps=40&special_type=&tid=0&web_location=333.1387&wts=1786550400&x-bili-device-req-json=%7B%22platform%22%3A%22web%22%2C%22device%22%3A%22pc%22%2C%22spmid%22%3A%22333.1387%22%2C%22mobi_app%22%3A%22web_cn%22%7D&x-bili-locale-json=%7B%22c_locale%22%3A%7B%22language%22%3A%22zh%22%2C%22script%22%3A%22Hans%22%7D%2C%22always_translate%22%3Afalse%7D&w_rid=cca86b9c6b0edc3a6af588269b599e98"
         );
+    }
+
+    #[test]
+    fn mixin_key_is_truncated_to_32_chars() {
+        // 官方算法是 `置换表.map(i => raw[i]).join('').slice(0, 32)`：置换表有
+        // 64 项，但 mixin_key 只取前 32 位。漏掉截断时 w_rid 全错，B站对签名
+        // 错误的请求返回 -403「访问权限不足」（不是 -352），于是官方投稿接口
+        // 每轮都失败、还被日志归因成「需要登录态」，用户反复登录也修不好。
+        // 2026-09-27 用同一组 key 实测：截断 → code=0；不截断 → code=-403。
+        let key = mixin_key(
+            "1234567890abcdefghijklmnopqrstuvwxyz",
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ01",
+        );
+        assert_eq!(key.len(), 32, "mixin_key 必须截断到 32 位：{key}");
+        assert_eq!(key, "KLi3R9nwfOavW4JzrH6Nx0GjtseDcCFd");
     }
 
     #[test]
@@ -2965,6 +3061,37 @@ mod tests {
     }
 
     #[test]
+    fn official_upload_response_reads_real_field_names() {
+        // 2026-09-27 抓的真实响应：发布时间字段是 `created`（不是 `pubdate`），
+        // 时长字段是**字符串** `"04:53"`（不是整数秒）。旧实现两个都读错，于是
+        // 线上「列出历史」的日期为空、时长为 0；而且因为 wbi 签名一直有 bug、
+        // 这条官方通道从没真正跑通过，所以错了很久也没暴露。
+        let ok = serde_json::json!({
+            "code": 0,
+            "data": {"list": {"vlist": [
+                {"bvid": "BV1hctP6KEaf", "title": "这就是锡林郭勒啊",
+                 "pic": "http://i2.hdslb.com/bfs/archive/x.jpg",
+                 "created": 1787907703, "length": "04:53"},
+                {"bvid": "BV1xxxxxxxxx", "title": "长视频",
+                 "created": 1787907703, "length": "1:02:03"},
+                {"bvid": "BV1yyyyyyyyy", "title": "旧形状兼容",
+                 "pubdate": 1786464000, "length": 61}
+            ]}}
+        });
+        let east8 = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+        let parsed = parse_official_upload_response_in_offset(&ok, 10, east8);
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].duration, 293, "\"04:53\" 应解析成 293 秒");
+        assert!(
+            !parsed[0].published_at.is_empty(),
+            "created 必须能解析出发布日期"
+        );
+        assert_eq!(parsed[1].duration, 3723, "\"1:02:03\" 应解析成 3723 秒");
+        assert_eq!(parsed[2].duration, 61, "整数时长仍要兼容");
+        assert_eq!(parsed[2].published_at, "2026-08-12", "pubdate 兜底仍可用");
+    }
+
+    #[test]
     fn upload_failure_message_distinguishes_network_from_risk_control() {
         // 网络/DNS 故障：必须提示查网络，不能误导成“请配置 cookie”。
         let net = upload_list_failure_message(
@@ -2999,16 +3126,16 @@ mod tests {
         let ok = BilibiliAdapter::default();
         assert_eq!(ok.authoritative_hint(), None);
 
-        // -403 是「官方 46 条、界面 45 条」在这台机器上的真实原因：
-        // 风控已过、只差登录态 → 提示必须明确指向「B站授权」这个动作，
-        // 否则用户看到「少一条」也无从下手。
+        // -403 的真实成因（2026-09-27 实测确认）：B站对**签名未通过**的请求
+        // 返回的是 -403，而不是 -352；它和「有没有登录」无关（真正的登录问题
+        // 会返回 -352 或 412）。所以提示必须指向「签名」，绝不能再骗用户
+        // 去反复登录——「我明明登录过」就是这么被误导出来的。
         let login = BilibiliAdapter::default();
         login.note_official_code(-403);
         let hint = login.authoritative_hint().expect("-403 必须给出提示");
-        assert!(hint.contains("B站授权"), "{hint}");
+        assert!(hint.contains("签名"), "{hint}");
 
-        // 已经带上登录态却仍被 -403：绝不能再叫用户「去登录一次」——
-        // 「我明明登录过」正是这样被反复误导出来的。
+        // 已经带上登录态却仍被 -403：更不能再叫用户「去登录一次」。
         let logged_in = BilibiliAdapter::default();
         logged_in.note_official_code(-403);
         logged_in
@@ -3017,7 +3144,7 @@ mod tests {
         let logged_hint = logged_in.authoritative_hint().unwrap();
         assert_ne!(logged_hint, hint);
         assert!(!logged_hint.contains("请到设置页"), "{logged_hint}");
-        assert!(logged_hint.contains("限流"), "{logged_hint}");
+        assert!(logged_hint.contains("不需要再去登录"), "{logged_hint}");
 
         // -352 / -799 / HTTP 层 / 网络层各自给出不同的话，不能被混成一句，
         // 否则用户按错的建议去操作（例如明明是限流却去登录）。

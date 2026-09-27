@@ -1,6 +1,6 @@
 [package]
 name = "zunzhe-core"
-version = "1.7.17"
+version = "1.7.18"
 edition = "2024"
 
 [lib]
@@ -24,7 +24,11 @@ md-5 = "0.10"
 fs2 = "0.4"
 futures-util = "0.3"
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = "0.30"
+# 必须显式启用 TLS：tokio-tungstenite 默认**不含任何 TLS 后端**，而 B站弹幕
+# 服务器只提供 `wss://`。漏掉这一步时 `connect_async` 会直接报
+# `URL error: TLS support not compiled in`——弹幕实时监听永远连不上，只能靠
+# 轮询兜底。选 rustls（与 reqwest 的 rustls-tls 一致），避免引入系统 OpenSSL。
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 flate2 = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "chrono"] }

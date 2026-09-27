@@ -118,16 +118,35 @@ async fn connect_and_listen(
     tx: &Sender<String>,
 ) -> anyhow::Result<()> {
     // 1) 取弹幕服务器地址与 token。
-    // 带上用户已授权/浏览器导出的 B站 Cookie：匿名 getDanmuInfo 经常被
-    // 风控返回 -352（实测 24931109 匿名请求连续 -352，带 cookie 后成功）。
-    let info_url = format!(
-        "https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo?id={room_id}"
-    );
+    //
+    // 这个接口和「投稿列表」一样走 WBI 风控，**必须做 wbi 签名**：
+    // 2026-09-27 实测 24931109 —— 裸请求、仅带 cookie、仅加 web_location
+    // 三种都稳定返回 `-352 风控校验失败`；补上签名后立刻 `code=0`。
+    // 旧实现漏了签名，于是弹幕 WS 每 5 分钟失败重连一次、B站直播只能靠
+    // 300 秒轮询兜底，开播提醒平均慢了好几分钟。
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
-        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+        // 必须是完整浏览器 UA：截断的 UA 会被 B站当爬虫。
+        .user_agent(crate::platform::DESKTOP_CHROME_UA)
         .build()?;
-    let mut req = client.get(&info_url);
+    let (img_key, sub_key) = crate::platform::wbi_keys(&client, &cookie).await?;
+    let params: Vec<(&str, String)> = vec![
+        ("id", room_id.to_string()),
+        ("type", "0".to_string()),
+        ("web_location", "444.8".to_string()),
+    ];
+    let query = crate::platform::wbi_signed_query(
+        &img_key,
+        &sub_key,
+        &params,
+        crate::platform::now_unix_secs(),
+    );
+    let info_url =
+        format!("https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo?{query}");
+    let mut req = client.get(&info_url).header(
+        reqwest::header::REFERER,
+        format!("https://live.bilibili.com/{room_id}"),
+    );
     if !cookie.is_empty()
         && let Ok(v) = reqwest::header::HeaderValue::from_str(&cookie)
     {
@@ -160,6 +179,9 @@ async fn connect_and_listen(
     // 2) 建立连接并认证。
     let (mut ws, _resp) =
         tokio_tungstenite::connect_async(&ws_url).await.map_err(|e| anyhow::anyhow!("WS 连接失败: {e}"))?;
+    // 连上之后一定要留一条成功日志：以前这里只记录失败，运维在日志里
+    // 永远看不到「WS 到底连没连上」，只能从「没有失败日志」倒推。
+    info!("[B站WS] {room_id} 已连上弹幕服务器 {ws_url}，开始认证/心跳");
     ws.send(Message::binary(auth_packet(room_id, &token))).await?;
 
     // 3) 心跳 + 读循环。
@@ -313,27 +335,38 @@ mod tests {
         let room_id = 24931109u64; // 侯翠翠 B站直播间
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
         let mut task = tokio::spawn(async move {
-            let _ = connect_and_listen(room_id, "https://live.bilibili.com/24931109".to_string(), String::new(), &tx).await;
-        });
-        // 等待：连接建立后要么收到开播事件（rx 有值），要么连接被服务端
-        // 关闭/报错（task 结束）。任一都说明“链路可通”；45 秒超时算失败。
-        tokio::time::timeout(Duration::from_secs(45), async {
-            loop {
-                tokio::select! {
-                    _ = rx.recv() => {
-                        println!("收到开播事件通知，链路通");
-                        break;
-                    }
-                    _ = &mut task => {
-                        println!("监听任务结束（连接被关闭/出错），链路已尝试");
-                        break;
-                    }
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-                }
+            // 返回 Ok(()) 的含义是「getDanmuInfo 成功 → wss 握手成功 → 认证后
+            // 服务端正常关闭」，也就是整条链路真的走通了。
+            match connect_and_listen(
+                room_id,
+                "https://live.bilibili.com/24931109".to_string(),
+                String::new(),
+                &tx,
+            )
+            .await
+            {
+                Ok(()) => Ok(()),
+                // 失败原因必须带出来：这个测试的用途就是定位「签名 / TLS 握手 /
+                // 网络」到底哪一环断了，把错误吞掉等于白跑。
+                Err(e) => Err(format!("{e:#}")),
             }
-        })
-        .await
-        .expect("45 秒内未观察到任何结果，链路疑似不通");
+        });
+        // 判据：健康的弹幕连接会一直保持心跳、**不会自己结束**，所以「10 秒内
+        // 没有以 Err 结束」正是链路走通的证据（getDanmuInfo 失败或 wss 握手失败
+        // 都会在零点几秒内立即返回 Err）。旧的判据假设连接会自己结束，还顺手把
+        // `rx.recv()` 的 `None`（发送端被丢弃）当成「收到开播事件」，于是链路
+        // 断了也报 ok。
+        let outcome = tokio::time::timeout(Duration::from_secs(10), &mut task).await;
         task.abort();
+        // 三层 Result：timeout → JoinError → connect_and_listen 的业务 Result。
+        match outcome {
+            Err(_) => {
+                let _ = rx.try_recv();
+                println!("链路通：getDanmuInfo 与 wss 握手成功，连接保持（心跳运行中）");
+            }
+            Ok(Ok(Ok(()))) => println!("链路通：握手成功后服务端关闭了连接"),
+            Ok(Ok(Err(e))) => panic!("链路失败: {e}"),
+            Ok(Err(e)) => panic!("任务 join 失败: {e}"),
+        }
     }
 }
