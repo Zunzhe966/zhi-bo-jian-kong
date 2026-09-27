@@ -844,12 +844,32 @@ app.whenReady().then(async () => {
     const { exportSessionCookies } = require('./bili-cookie.cjs')
     const runDir = runDirResolved()
     process.env.ZUNZHE_RUN_DIR = runDir
-    const outFile = path.join(runDir, 'bilibili_browser_cookies.txt')
-    const r = await exportSessionCookies(app, outFile)
-    if (r.ok) console.log(`[B站授权] 已从浏览器会话同步 ${r.count} 项登录状态 → ${r.file}`)
-    else console.log('[B站授权] 浏览器会话里没有 B站 Cookie（尚未授权过），跳过同步')
+    // B站 与 抖音 必须一视同仁：B站 09-27 补了这一步，抖音当时被漏掉，
+    // 于是「抖音授权」永远不落地、浏览器兜底通道永远读不到 cookie，
+    // 表现成「点过授权但就是不生效」——和 B站 当时那个坑是同一个。
+    const targets = [
+      { label: 'B站', file: 'bilibili_browser_cookies.txt' },
+      {
+        label: '抖音',
+        file: 'douyin_browser_cookies.txt',
+        partition: 'persist:douyin',
+        domainSuffix: 'douyin.com',
+      },
+    ]
+    for (const t of targets) {
+      try {
+        const r = await exportSessionCookies(app, path.join(runDir, t.file), {
+          partition: t.partition,
+          domainSuffix: t.domainSuffix,
+        })
+        if (r.ok) console.log(`[${t.label}授权] 已从浏览器会话同步 ${r.count} 项状态 → ${t.file}`)
+        else console.log(`[${t.label}授权] 浏览器会话里没有 ${t.label} Cookie（尚未授权过），跳过同步`)
+      } catch (e) {
+        console.warn(`[${t.label}授权] 同步失败:`, e && e.message)
+      }
+    }
   } catch (e) {
-    console.warn('[B站授权] 同步登录状态失败:', e && e.message)
+    console.warn('[授权同步] 失败:', e && e.message)
   }
 
   // ---------- 安全加固：IPC 入参校验（纵深防御） ----------

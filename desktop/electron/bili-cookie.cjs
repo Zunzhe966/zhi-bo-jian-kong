@@ -89,19 +89,24 @@ async function harvestBilibiliCookies(app, outFile = defaultOut(), visible = fal
  * 文件被别的工具覆写了、用户只是重新登录了，都能自动自愈，不需要再点授权。
  * @param {Electron.App} app
  * @param {string} outFile Netscape cookie 输出路径
+ * @param {{partition?: string, domainSuffix?: string}} [opts] 默认 B站；
+ *        抖音传 `{ partition: 'persist:douyin', domainSuffix: 'douyin.com' }` 复用同一逻辑。
  */
-async function exportSessionCookies(app, outFile = defaultOut()) {
+async function exportSessionCookies(app, outFile = defaultOut(), opts = {}) {
   const { session } = require('electron')
-  const ses = session.fromPartition('persist:bilibili')
+  // 默认仍是 B站（保持原有调用行为不变）；抖音复用同一份逻辑，只是换分区与域。
+  const partition = opts.partition || 'persist:bilibili'
+  const domainSuffix = opts.domainSuffix || 'bilibili.com'
+  const ses = session.fromPartition(partition)
   const all = await ses.cookies.get({})
-  // 只留 B站 域；并按 cookie 名去重——`.bilibili.cn` 与 `.bilibili.com`
+  // 只留目标平台域；并按 cookie 名去重——`.bilibili.cn` 与 `.bilibili.com`
   // 会各存一份同名的 SESSDATA，重复写进去会让后台程序拼出
   // "SESSDATA=a; ...; SESSDATA=a" 这种头（多数服务端能容忍，但没必要）。
   const seen = new Set()
   const cookies = []
   for (const c of all) {
     const host = String(c.domain || '')
-    if (!host.endsWith('bilibili.com')) continue
+    if (!host.endsWith(domainSuffix)) continue
     if (!c.name || seen.has(c.name)) continue
     seen.add(c.name)
     cookies.push(c)

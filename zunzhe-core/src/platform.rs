@@ -1162,10 +1162,16 @@ impl BilibiliAdapter {
                 } else {
                     cmd.arg("--flat-playlist");
                 }
-                // 让 yt-dlp 顺带报出播放列表总数（`playlist_count`，实测这台机器
-                // 上就是 46，与官方 `page.count` 一致）。这是官方接口打不通时
-                // 唯一能拿到的权威总数——有了它才敢说「列表是全的」，而不是
-                // 一边明明列全了 46 条、一边给用户弹「本次列表可能不完整」的假警报。
+                // 让 yt-dlp 顺带报出它自己数出来的播放列表条数（`playlist_count`）。
+                //
+                // 注意：**这不是「权威总数」**，只是兜底源自己的口径，可能与官方
+                // `page.count` 不同。2026-09-27 实测：
+                //   - 老猫AI创业班（space/601214690）→ yt-dlp 46、官方 46，一致；
+                //   - 侯翠翠（space/1458143131）→ yt-dlp 197、官方 203，差 6 条。
+                // 另外 `--playlist-end N`（count>0 时）会让 yt-dlp 直接打印 `NA`，
+                // 所以只有「全部」这一路才可能拿到数字。用它是为了避免「明明列全了
+                // 却弹『本次列表可能不完整』」的假警报；反过来也要清楚：拿兜底源自
+                // 己的数当总数，是自洽的，因此**永远比不出兜底源自身的缺口**。
                 cmd.args(["--print", "%(id)s\t%(playlist_count)s"])
                     .arg(format!("https://space.bilibili.com/{mid}/video"));
                 // 出站分流：按目标 URL 决定直连或走用户配置的出站代理。
@@ -1778,11 +1784,33 @@ fn normalize_rss_date(raw: Option<String>) -> String {
 #[derive(Debug)]
 pub struct DouyinAdapter {
     project_dir: PathBuf,
+    /// 本次「全部」请求是否正好顶到单页上限（=列表可能被接口截断）。
+    /// 必须是原子量：`list_videos` 与 `authoritative_hint` 是两次不同的调用。
+    last_hit_page_cap: std::sync::atomic::AtomicBool,
 }
 
 impl DouyinAdapter {
+    /// 免登录桥（`fupan/douyin_post_list.py`）单次最多返回的作品数：
+    /// 脚本内是 `min(max(count,1),50)`，所以「全部」最多也就一页 50 条。
+    const DOUYIN_MAX_PER_PAGE: u32 = 50;
+
+    /// 取满一页失败（多为桥侧太慢撞上 40 秒超时）时的重试条数。
+    /// 实测这个量级通常几秒内返回，能把「刷新」从「直接掉缓存」救回「至少更新最近一批」。
+    const DOUYIN_RETRY_PAGE: u32 = 20;
+
     pub fn new(project_dir: PathBuf) -> Self {
-        Self { project_dir }
+        Self {
+            project_dir,
+            last_hit_page_cap: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// 记录「这次『全部』是否顶到了接口单页上限」。只有「全部」请求才可能被截断；
+    /// 用户明确只要 N 条时，拿满 N 条是正常的，不能当成被截断去报警。
+    fn note_page_cap(&self, is_all_request: bool, got: usize) {
+        let capped = is_all_request && got as u32 >= Self::DOUYIN_MAX_PER_PAGE;
+        self.last_hit_page_cap
+            .store(capped, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// 抖音登录态 Cookie 的 Netscape 文件路径（由 douyin-cookie.cjs 导出）。
@@ -1931,17 +1959,46 @@ impl Platform for DouyinAdapter {
         count: u32,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<VideoMeta>>> + Send + 'a>> {
         Box::pin(async move {
+            // 每次取数先清空上一次的结论，避免把上一轮的状态当成这一轮的。
+            self.last_hit_page_cap
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             let sec_uid = Self::sec_uid_from_url(url).ok_or_else(|| {
                 anyhow!(
                     "抖音视频源需要「完整主页链接」（douyin.com/user/MS4wLjABAAAA... 开头），\
                      短链或抖音号无法直接识别，请在抖音 App 打开博主主页 → 分享 → 复制链接"
                 )
             })?;
-            // 首选：Python 桥纯 HTTP（免登录）。失败不静默——带上原因回退授权通道。
-            let bridge_err = match self.list_via_python_bridge(&sec_uid, count).await {
-                Ok(videos) => return Ok(videos),
-                Err(e) => e,
+            // `count == 0` 表示「全部」（桌面端打开历史就是传 0）。旧实现直接把
+            // 0 透给桥：桥被要求返回 0 条 → 空列表 → 上层 `browse_videos` 再用
+            // 数据库里累积的旧条补成「看起来有 N 条」，并标记 `from_cache=false`。
+            // 表现就是「刷新永远刷新不动」：用户看到的是陈旧缓存，却被当成刚抓的新结果。
+            // 这里把「全部」翻成接口单页上限，末尾也不再截成 0（见下方 take）。
+            //
+            // 「全部」先按接口上限（50）取一页；但抖音对较大 count 会明显变慢
+            // （2026-09-27 实测同一账号：count=10 → 4.7s，20 → 18.3s，30 → 55.9s，
+            // 50 → 25.0s，抖动极大），而桥在 Rust 这边有 40 秒硬超时。与其一超时就
+            // 整个掉进缓存，不如退一步用较小页重试——至少保证「刷新」能拿到最近一批
+            // 新作品，而不是把陈旧缓存当新结果显示。
+            let plan: Vec<u32> = if count == 0 {
+                vec![Self::DOUYIN_MAX_PER_PAGE, Self::DOUYIN_RETRY_PAGE]
+            } else {
+                vec![count]
             };
+            // 首选：Python 桥纯 HTTP（免登录）。失败不静默——带上原因回退授权通道。
+            let mut last_err: Option<anyhow::Error> = None;
+            for want in &plan {
+                match self.list_via_python_bridge(&sec_uid, *want).await {
+                    Ok(videos) => {
+                        self.note_page_cap(count == 0, videos.len());
+                        return Ok(videos);
+                    }
+                    Err(e) => {
+                        tracing::warn!("抖音免登录通道 count={want} 未成功: {e:#}");
+                        last_err = Some(e);
+                    }
+                }
+            }
+            let bridge_err = last_err.unwrap_or_else(|| anyhow!("抖音免登录通道无可用结果"));
             tracing::warn!("抖音免登录列表通道失败，回退 Electron 授权通道: {bridge_err:#}");
             // 兜底：Electron 隐藏浏览器（需要「抖音授权」cookie）。
             let cookie_path = self.cookie_path();
@@ -2015,8 +2072,35 @@ impl Platform for DouyinAdapter {
                     "抖音列表提取成功但为空（博主可能暂无作品或触发风控）"
                 ));
             }
-            Ok(videos.into_iter().take(count as usize).collect())
+            // count==0 是「全部」：只能截到接口单页上限，绝不能截成 0
+            // （截成 0 会让上层拿库里的旧条目充数，见 list_videos 开头注释）。
+            let out: Vec<VideoMeta> = if count == 0 {
+                videos
+            } else {
+                videos.into_iter().take(count as usize).collect()
+            };
+            self.note_page_cap(count == 0, out.len());
+            Ok(out)
         })
+    }
+
+    /// 抖音这边没有「官方总数」可对（免登录接口只给一页，不给 count），
+    /// 所以只能如实说明「可能被单页上限截断」，而不是假装列表是全的。
+    fn authoritative_hint(&self) -> Option<String> {
+        if self
+            .last_hit_page_cap
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            Some(format!(
+                "抖音免登录接口单次最多返回 {} 条作品，本次「全部」正好取满一页，\
+                 更早的作品这次没能列出来——这是接口本身的限制，不是作品被删、\
+                 也不是本地文件丢了。想看更早的可以到博主主页往下翻，\
+                 或在设置页做「抖音授权」增加一条浏览器兜底通道",
+                Self::DOUYIN_MAX_PER_PAGE
+            ))
+        } else {
+            None
+        }
     }
 }
 
@@ -2806,13 +2890,14 @@ mod tests {
 
     #[test]
     fn parses_ytdlp_flat_playlist_ids_and_total() {
-        // 正常：每行都带同一个 playlist_count（实测这台机器上就是 46）。
+        // 正常：每行都带同一个 playlist_count（yt-dlp 全量枚举时会这么打印）。
         let text = "BV1abcdefghi\t46\nBV1abcdefghj\t46\nBV1abcdefghk\t46\n";
         let (ids, total) = parse_ytdlp_flat_playlist(text, 0);
         assert_eq!(ids, vec!["BV1abcdefghi", "BV1abcdefghj", "BV1abcdefghk"]);
         assert_eq!(total, Some(46));
 
-        // count > 0（只取最近 N 条）时按 count 截断，但总数仍是完整总数。
+        // count > 0（只取最近 N 条）：这里只验证「若输入里带了总数，仍原样保留」。
+        // 真实 yt-dlp 在 `--playlist-end N` 下会打印 NA（实测），此断言不代表它能拿到总数。
         let (ids, total) = parse_ytdlp_flat_playlist(text, 2);
         assert_eq!(ids.len(), 2);
         assert_eq!(total, Some(46));
@@ -2963,6 +3048,37 @@ mod tests {
         // 成功一次之后旧失败码必须被清掉，否则界面上会一直挂着过期提示。
         other.note_official_code(0);
         assert_eq!(other.authoritative_hint(), None);
+    }
+
+    #[test]
+    fn douyin_all_request_flags_page_cap_instead_of_truncating_to_zero() {
+        // 「全部」（count==0）曾把结果截成 0 条：上层 `browse_videos` 再用数据库里
+        // 累积的旧条目补成「看起来有 N 条」，并标记 `from_cache=false`——刷新永远
+        // 刷新不动，用户看到的是陈旧缓存冒充新结果。这里锁住新的判定口径。
+        let dy = DouyinAdapter::new(std::path::PathBuf::from("/tmp"));
+
+        // 还没取过数：不下任何结论。
+        assert_eq!(dy.authoritative_hint(), None);
+
+        // 「全部」但条数没顶满单页上限 → 列表就是这些，不该报警。
+        dy.note_page_cap(true, 30);
+        assert_eq!(dy.authoritative_hint(), None);
+
+        // 「全部」正好顶满接口上限 → 明确告知可能被截断，且必须点名「不是丢了」。
+        dy.note_page_cap(true, DouyinAdapter::DOUYIN_MAX_PER_PAGE as usize);
+        let capped = dy.authoritative_hint().expect("顶满一页必须给出提示");
+        assert!(capped.contains("50"), "{capped}");
+        assert!(capped.contains("不是作品被删") || capped.contains("不是本地"), "{capped}");
+
+        // 用户明确只要 20 条、拿满 20 条：正常，不能当成被截断去打扰用户。
+        dy.note_page_cap(false, 20);
+        assert_eq!(dy.authoritative_hint(), None);
+
+        // 「全部」少于上限时，上一轮的「截断」结论必须被清掉。
+        dy.note_page_cap(true, DouyinAdapter::DOUYIN_MAX_PER_PAGE as usize);
+        assert!(dy.authoritative_hint().is_some());
+        dy.note_page_cap(true, 5);
+        assert_eq!(dy.authoritative_hint(), None);
     }
 
     #[test]
