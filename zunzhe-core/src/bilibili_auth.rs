@@ -270,6 +270,11 @@ pub fn cookie_header_from_netscape_public(text: &str) -> String {
     let mut pairs = Vec::new();
     for line in text.lines() {
         let line = line.trim();
+        // Chrome / 部分导出工具会给 HttpOnly cookie 加 `#HttpOnly_` 前缀，
+        // 而 SESSDATA / DedeUserID 恰恰都是 HttpOnly。若直接按「# 开头即注释」
+        // 跳过，登录态会被整行丢掉——症状正是「设置页明明授权过，列历史却仍是
+        // 匿名」，且不会有任何报错。先剥掉前缀再判断注释。
+        let line = line.strip_prefix("#HttpOnly_").unwrap_or(line);
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
@@ -294,6 +299,23 @@ mod tests {
 ";
         let header = cookie_header_from_netscape(text);
         assert_eq!(header, "SESSDATA=abc123");
+    }
+
+    #[test]
+    fn keeps_httponly_prefixed_login_cookies() {
+        // SESSDATA / DedeUserID 都是 HttpOnly，Chrome 系与部分导出工具会写成
+        // `#HttpOnly_` 前缀。旧实现按「# 开头 = 注释」整行跳过，登录态就此丢失，
+        // 症状正是「明明授权过，列历史却仍是匿名」——且没有任何报错可查。
+        let text = "\
+# Netscape HTTP Cookie File
+#HttpOnly_.bilibili.com\tTRUE\t/\tTRUE\t1800000000\tSESSDATA\tsecret
+#HttpOnly_.bilibili.com\tTRUE\t/\tTRUE\t1800000000\tDedeUserID\t42
+.bilibili.com\tTRUE\t/\tFALSE\t1800000000\tbuvid3\tdev
+";
+        let header = cookie_header_from_netscape(text);
+        assert!(header.contains("SESSDATA=secret"), "{header}");
+        assert!(header.contains("DedeUserID=42"), "{header}");
+        assert!(header.contains("buvid3=dev"), "{header}");
     }
 
     #[test]

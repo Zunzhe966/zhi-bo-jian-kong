@@ -681,6 +681,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             // 平台自己报告的总数（B站官方接口的 data.page.count）。RSSHub/yt-dlp
             // 兜底路径拿不到总数，会是 None。必须在 list_videos 之后读。
             let expected_total = adapter.expected_total();
+            // 「官方接口这次为什么没给全」——必须和总数一起读，且必须在
+            // list_videos 之后（两者都是那一次调用的副产物）。
+            let authoritative_hint = adapter.authoritative_hint();
             let outcome = video_library::browse_with_fallback(&library, fetch, &url).await?;
             // count==0 = 「全部」：只有这种请求下「官方总数 vs 实取条数」才有可比性
             // （用户明确只要 30 条时，少于总数是正常的）。且缓存回退时不下这个结论。
@@ -694,17 +697,42 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             let shortfall_note = shortfall.map(|t| {
                 let listed = outcome.videos.len();
                 let missing = t.saturating_sub(listed);
-                format!(
-                    "这个博主官方共有 {t} 条投稿，本次只列出 {listed} 条，差 {missing} 条。\
-少的这些通常是 B站自己不返回的：已下架、设为「仅自己可见」、审核中，\
-或联合投稿（该接口默认不给）——不是你的文件丢了。"
-                )
+                match &authoritative_hint {
+                    // 差额 + 已定位的原因：直接给出「为什么」和「怎么补」，
+                    // 而不是笼统地说「可能是 B站自己不给」。
+                    Some(hint) => format!(
+                        "这个博主官方共有 {t} 条投稿，本次只列出 {listed} 条，差 {missing} 条。\
+原因已定位：{hint}"
+                    ),
+                    // 官方接口这次没报错，差额只能来自 B站自己：如实说明，
+                    // 别让用户以为文件丢了。
+                    None => format!(
+                        "这个博主官方共有 {t} 条投稿，本次只列出 {listed} 条，差 {missing} 条。\
+官方接口这次没有报错，少的这些通常是 B站自己不返回的：已下架、设为「仅自己可见」、\
+审核中，或联合投稿（该接口默认不给）——不是你的文件丢了。"
+                    ),
+                }
             });
-            let warning = match (outcome.warning.clone(), shortfall_note) {
-                (Some(w), Some(note)) => Some(format!("{w}；{note}")),
-                (Some(w), None) => Some(w),
-                (None, Some(note)) => Some(note),
-                (None, None) => None,
+            let mut notes: Vec<String> = Vec::new();
+            if let Some(w) = outcome.warning.clone() {
+                notes.push(w);
+            }
+            match shortfall_note {
+                Some(note) => notes.push(note),
+                // 官方接口这次没成功（拿不到总数、比不出差额），但失败原因照样
+                // 要让用户看到：兜底源给的半截列表和完整列表在界面上长得一模一样，
+                // 不说就等于让用户以为「本来就只有这么多」。
+                None if !outcome.from_cache => {
+                    if let Some(hint) = &authoritative_hint {
+                        notes.push(format!("本次列表可能不完整：{hint}"));
+                    }
+                }
+                None => {}
+            }
+            let warning = if notes.is_empty() {
+                None
+            } else {
+                Some(notes.join("；"))
             };
             let result = json!({
                 "ok": true,
@@ -712,6 +740,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 "url": url,
                 "count": outcome.videos.len(),
                 "expected_total": expected_total,
+                "authoritative_hint": authoritative_hint,
                 "from_cache": outcome.from_cache,
                 "warning": warning,
                 "videos": video_library::videos_compat_json(&outcome.videos),

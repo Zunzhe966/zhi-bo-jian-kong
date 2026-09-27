@@ -5,8 +5,8 @@ import { Button, Form, Input, Modal, Table } from 'antd'
 
 export default function HistoryModals({
   batchOpen, batchForm, onBatchBrowse, onCloseBatch,
-  blogger, open, videos, selected, loading, downloading, paths, expectedTotal,
-  onClose, onDownloadAll, onDownloadSelected, onSelect,
+  blogger, open, videos, selected, loading, downloading, paths, expectedTotal, hint,
+  onClose, onDownloadAll, onDownloadSelected, onSelect, onBiliLogin,
 }) {
   return (
     <>
@@ -50,7 +50,20 @@ export default function HistoryModals({
         {Number(expectedTotal) > videos.length ? (
           <p style={{ marginBottom: 12, color: '#d46b08' }}>
             官方共 {expectedTotal} 条，本次列出 {videos.length} 条，差 {Number(expectedTotal) - videos.length} 条。
-            少的这些一般是 B站自己不返回的（已下架 / 设为仅自己可见 / 审核中 / 联合投稿），不是文件丢了。
+            {hint
+              ? '原因见下方提示。'
+              : '少的这些是 B站自己没返回的（已下架 / 设为仅自己可见 / 审核中 / 联合投稿），不是文件丢了。'}
+          </p>
+        ) : null}
+        {hint ? (
+          <p style={{ marginBottom: 12, color: '#d46b08' }}>
+            {hint}
+            {hint.includes('授权') ? (
+              <>
+                {' '}
+                <Button size="small" onClick={onBiliLogin}>去 B站 授权</Button>
+              </>
+            ) : null}
           </p>
         ) : null}
         <Table

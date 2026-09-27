@@ -73,6 +73,54 @@ async function harvestBilibiliCookies(app, outFile = defaultOut(), visible = fal
 }
 
 /**
+ * 只做「搬运」：把 persist:bilibili 分区里**已经存在**的 Cookie 直接导出成
+ * Netscape 文件——不打开网页、不发任何网络请求。
+ *
+ * 为什么必须有这一步（2026-09-27 实测事故）：
+ *   用户 09-24 在授权窗口里登录成功，登录态存进了 Electron 分区
+ *   （Partitions/bilibili/Cookies 里 SESSDATA 有效期到 2027-03-23），
+ *   但「列出历史」走的是后台程序直接请求 api.bilibili.com，只认这个
+ *   Netscape 文件——它当时压根没被写出来（唯一一份还是 9-18 留下的
+ *   28 字节空壳，而且落在旧产物根 ~/Documents/尊者产物 下）。
+ *   结果就是用户反复质问「我明明登录过」，而程序一直以匿名身份取数，
+ *   官方 46 条只能列出 45 条。
+ *
+ * 每次启动都静默重导一次，让「浏览器分区」成为唯一事实来源：产物根改了、
+ * 文件被别的工具覆写了、用户只是重新登录了，都能自动自愈，不需要再点授权。
+ * @param {Electron.App} app
+ * @param {string} outFile Netscape cookie 输出路径
+ */
+async function exportSessionCookies(app, outFile = defaultOut()) {
+  const { session } = require('electron')
+  const ses = session.fromPartition('persist:bilibili')
+  const all = await ses.cookies.get({})
+  // 只留 B站 域；并按 cookie 名去重——`.bilibili.cn` 与 `.bilibili.com`
+  // 会各存一份同名的 SESSDATA，重复写进去会让后台程序拼出
+  // "SESSDATA=a; ...; SESSDATA=a" 这种头（多数服务端能容忍，但没必要）。
+  const seen = new Set()
+  const cookies = []
+  for (const c of all) {
+    const host = String(c.domain || '')
+    if (!host.endsWith('bilibili.com')) continue
+    if (!c.name || seen.has(c.name)) continue
+    seen.add(c.name)
+    cookies.push(c)
+  }
+  if (!cookies.length) return { ok: false, count: 0, reason: 'session-empty' }
+  const lines = ['# Netscape HTTP Cookie File']
+  for (const c of cookies) {
+    const expires = c.expirationDate ? Math.floor(c.expirationDate) : Math.floor(Date.now() / 1000) + 86400 * 180
+    lines.push([
+      c.domain.startsWith('.') ? c.domain : `.${c.domain}`,
+      'TRUE', c.path || '/', c.secure ? 'TRUE' : 'FALSE', expires, c.name, c.value,
+    ].join('\t'))
+  }
+  fs.mkdirSync(path.dirname(outFile), { recursive: true })
+  fs.writeFileSync(outFile, lines.join('\n') + '\n', 'utf-8')
+  return { ok: true, count: cookies.length, file: outFile }
+}
+
+/**
  * 独立进程入口：由 harvest-run.cjs 调用（electron 主脚本里 require.main 不可靠，
  * 所以单独用一个无条件执行的启动脚本，而不是在这里用 require.main 判断）。
  * @param {string} out cookie 输出路径
@@ -148,6 +196,7 @@ async function extractBilibiliStreams(app, videoUrl) {
 
 module.exports = {
   harvestBilibiliCookies,
+  exportSessionCookies,
   extractBilibiliStreams,
   runStandalone,
   defaultOut,

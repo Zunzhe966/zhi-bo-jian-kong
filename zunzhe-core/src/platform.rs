@@ -282,6 +282,16 @@ pub trait Platform: Send + Sync {
     fn expected_total(&self) -> Option<u32> {
         None
     }
+
+    /// 上一次 `list_videos` 期间「权威来源」（平台自己的投稿接口）为什么没给出
+    /// 完整列表；没有失败时返回 `None`。
+    ///
+    /// 兜底源（RSSHub / yt-dlp）经常只能给半截列表，而半截列表和完整列表在界面上
+    /// 长得一模一样。把失败原因翻译成用户能照着做的一句话交给上层，才不会出现
+    /// 「官方 46 条、界面 45 条，还查不出为什么」。
+    fn authoritative_hint(&self) -> Option<String> {
+        None
+    }
 }
 
 /// B站适配器：先解析 space.bilibili.com/<mid>，用 view 接口补全
@@ -299,6 +309,19 @@ pub struct BilibiliAdapter {
     /// 以前这个差值被静默丢弃，用户只看到「少了 1 条」却永远查不出为什么。
     /// 0 表示未知（RSSHub / yt-dlp 兜底路径拿不到总数）。
     expected_total: std::sync::atomic::AtomicU32,
+
+    /// 官方接口最近一次失败的业务码，0 表示没失败（成功或没调用）。
+    /// 负数直接是 B站业务码；`-1000` = HTTP 层失败（412 等），`-1001` = 网络/解析失败。
+    /// 上层用它把「官方接口为什么没给出完整列表」翻译成用户能照着做的提示。
+    last_official_code: std::sync::atomic::AtomicI64,
+
+    /// 最近一次请求官方接口时，请求里是否真的带上了 B站登录态
+    /// （`SESSDATA` / `DedeUserID`）。
+    ///
+    /// 用来区分两种「-403 访问权限不足」：**没登录**（提示去授权）与
+    /// **已经登录但仍被拒**（多为出口 IP 被限流/该接口额外校验，提示别再重复登录）。
+    /// 早期把两者混为一谈，用户明明授权过却一直被叫去「登录一次」。
+    last_official_had_login: std::sync::atomic::AtomicBool,
 }
 
 /// 请求 B站时使用的桌面 Chrome User-Agent。
@@ -344,11 +367,20 @@ impl Default for BilibiliAdapter {
             cookie: String::new(),
             project_dir: PathBuf::from("."),
             expected_total: std::sync::atomic::AtomicU32::new(0),
+            last_official_code: std::sync::atomic::AtomicI64::new(0),
+            last_official_had_login: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
 
 impl BilibiliAdapter {
+    /// 记录官方投稿接口最近一次的失败码（负数=B站业务码，`-1000`=HTTP 失败，
+    /// `-1001`=网络/解析失败，`0`=成功）。仅在失败时调用；成功路径显式记 0。
+    fn note_official_code(&self, code: i64) {
+        self.last_official_code
+            .store(code, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// 请求一次 B站官方投稿接口，解析完整元数据并返回可读失败原因。
     ///
     /// 返回 `((videos, total), reason)`：
@@ -370,18 +402,21 @@ impl BilibiliAdapter {
             .send()
             .await
         else {
+            self.note_official_code(-1001);
             return ((Vec::new(), None), "官方接口请求发送失败".to_string());
         };
         // HTTP 层必须是成功状态，B站 412/5xx 时继续走 RSSHub/yt-dlp，
         // 不能让 HTML 或错误 JSON 被当成“空列表”。
         let status = resp.status();
         if !status.is_success() {
+            self.note_official_code(-1000);
             return (
                 (Vec::new(), None),
                 format!("官方接口返回 HTTP {status}（多为 412 风控）"),
             );
         }
         let Ok(data) = resp.json::<serde_json::Value>().await else {
+            self.note_official_code(-1001);
             return (
                 (Vec::new(), None),
                 "官方接口返回非 JSON（可能被风控页替换）".to_string(),
@@ -389,6 +424,7 @@ impl BilibiliAdapter {
         };
         let code = data["code"].as_i64().unwrap_or(-1);
         if code != 0 {
+            self.note_official_code(code);
             let message = data["message"].as_str().unwrap_or("未知错误");
             let hint = match code {
                 -352 => "（风控校验失败：设备指纹或出口 IP 被拦）",
@@ -401,6 +437,8 @@ impl BilibiliAdapter {
                 format!("官方接口业务错误 code={code} {message}{hint}"),
             );
         }
+        // 这一页是干净的：清掉可能由上一页留下的失败码，避免成功之后仍报旧错。
+        self.note_official_code(0);
         let total = data["data"]["page"]["count"]
             .as_u64()
             .and_then(|n| u32::try_from(n).ok());
@@ -412,20 +450,16 @@ impl BilibiliAdapter {
 
     /// 取 B 站 wbi 图片并生成查询签名（w_rid/wts）。失败返回空串，调用方走无签名兜底。
     async fn wbi_query(&self, mid: &str, count: u32, page: u32) -> anyhow::Result<String> {
-        let client = crate::net::client_builder()
-            .timeout(std::time::Duration::from_secs(20))
-            .build()
-            .unwrap_or_default();
+        // 用统一的浏览器客户端：这里的 nav 请求同属 api.bilibili.com，UA 残缺
+        // 一样会被 412 拦。早期这里单写了一个「半截 UA」的客户端，导致就算
+        // 投稿接口那侧已修好，签名这一步仍可能先死，整条官方链路退化成兜底源。
+        let client = browser_client(20);
         // nav 是 WBI 图片 key 的来源；有配置/浏览器 Cookie 时也必须一并带上，
         // 否则即使用户已授权，这一步仍可能被 B站当成匿名出口并 412，导致
         // 官方投稿接口永远回退到 RSSHub/yt-dlp。
         let cookie = self.effective_cookie().await;
         let mut req = client
             .get("https://api.bilibili.com/x/web-interface/nav")
-            .header(
-                "User-Agent",
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-            )
             .header("Referer", "https://www.bilibili.com");
         if !cookie.is_empty()
             && let Ok(v) = reqwest::header::HeaderValue::from_str(&cookie)
@@ -566,6 +600,11 @@ impl BilibiliAdapter {
     async fn upload_list_cookie_with_fingerprint(&self) -> String {
         let base = self.upload_list_cookie();
         let Some(anon) = ensure_anon_cookie(&self.project_dir).await else {
+            tracing::debug!(
+                "B站投稿列表 Cookie（无匿名指纹）: 含登录态={} 字段数={}",
+                cookie_header_has_login(&base),
+                base.split(';').filter(|s| !s.trim().is_empty()).count()
+            );
             return base;
         };
         let Ok(text) = std::fs::read_to_string(anon) else {
@@ -575,7 +614,13 @@ impl BilibiliAdapter {
         if fingerprint.is_empty() {
             return base;
         }
-        merge_cookie_headers(&base, &fingerprint)
+        let merged = merge_cookie_headers(&base, &fingerprint);
+        tracing::debug!(
+            "B站投稿列表 Cookie: 含登录态={} 字段数={}",
+            cookie_header_has_login(&merged),
+            merged.split(';').filter(|s| !s.trim().is_empty()).count()
+        );
+        merged
     }
 
     pub fn with_cookie_and_project_dir(cookie: impl Into<String>, project_dir: PathBuf) -> Self {
@@ -688,15 +733,74 @@ impl Platform for BilibiliAdapter {
         }
     }
 
+    /// 把「官方接口这次为什么没给出完整列表」翻译成用户能照着做的一句话。
+    ///
+    /// 关键区分（顺序即严重度，越靠前越需要用户动手）：
+    /// - `-403` 访问权限不足：风控已过，**只差登录态**——这就是「官方 46 条、
+    ///   界面 45 条」在当前机器上的真实原因，用户点一次「B站授权」即可补齐；
+    /// - `-352` 风控校验失败：设备指纹或出口 IP 被拦，换网络/稍后重试或授权；
+    /// - `-799` 频率限制：出口 IP 被限流，只能等；
+    /// - `-1000` HTTP 层失败（412 等）、`-1001` 网络/签名失败：偏环境问题。
+    ///
+    /// 返回 `None` 表示官方接口这次没失败（成功，或压根没调用）。
+    fn authoritative_hint(&self) -> Option<String> {
+        let code = self
+            .last_official_code
+            .load(std::sync::atomic::Ordering::Relaxed);
+        match code {
+            0 => None,
+            -403 => Some(if self
+                .last_official_had_login
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                "已检测到 B站 登录态，但官方接口这次仍拒绝访问（多为出口 IP 被限流，\
+或该接口对本次请求额外校验）：稍后重试即可；本次列表来自兜底源，条目通常仍然齐全，\
+只是取数慢一些，不需要再去登录一次"
+                    .to_string()
+            } else {
+                "B站官方接口已放行但要求登录态：请到设置页点「B站授权」用浏览器登录一次，\
+之后就能拿到该主播的完整投稿列表（当前列表来自兜底源，可能少几条）"
+                    .to_string()
+            }),
+            -352 => Some(
+                "B站风控拦下了官方接口这次请求（设备指纹或出口 IP 被判定异常）：\
+可稍后重试、或换一个网络出口，也可以到设置页点「B站授权」登录一次降低被误判概率"
+                    .to_string(),
+            ),
+            -799 => Some(
+                "B站提示请求过于频繁（出口 IP 被限流）：稍等几分钟再点「列出历史」即可"
+                    .to_string(),
+            ),
+            -1000 => Some(
+                "B站官方接口返回了风控页（HTTP 412 等）：稍后重试，或到设置页点「B站授权」\
+登录一次（当前列表来自兜底源，可能少几条）"
+                    .to_string(),
+            ),
+            -1001 => Some(
+                "B站官方接口这次没能访问成功（网络或签名失败）：请检查网络后重试；\
+当前列表来自兜底源，可能少几条"
+                    .to_string(),
+            ),
+            other => Some(format!(
+                "B站官方接口报错 code={other}，本次列表来自兜底源，可能少几条：\
+稍后重试，或到设置页点「B站授权」登录一次"
+            )),
+        }
+    }
+
     fn list_videos<'a>(
         &'a self,
         url: &'a str,
         count: u32,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<VideoMeta>>> + Send + 'a>> {
         Box::pin(async move {
-            // 每次列历史都重置总数，避免把上一次的残留值当成这一次的答案。
+            // 每次列历史都重置总数与官方失败码，避免把上一次的残留值当成这一次的答案。
             self.expected_total
                 .store(0, std::sync::atomic::Ordering::Relaxed);
+            self.last_official_code
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            self.last_official_had_login
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             let mid = Self::mid_from_url(url).with_context(|| {
                 format!(
                     "这个地址不是 B站UP主主页，认不出是哪个 UP主：{url}。\
@@ -716,18 +820,23 @@ impl Platform for BilibiliAdapter {
             }
 
             // 官方 wbi/arc 接口是唯一能给出「总投稿数」（data.page.count）和完整
-            // 投稿列表的源。要不要在 RSSHub 之外再打一次，取决于两件事：
+            // 投稿列表的源。要不要在 RSSHub 之外再打一次，取决于三件事：
             //   - RSSHub 没结果 → 必须试（否则只剩 yt-dlp 一条路）；
+            //   - count == 0，即用户在界面上点「列出历史」要完整列表 → 必须试。
+            //     只有官方接口能给出完整列表和总数；「RSSHub 有返回就跳过官方」
+            //     等于默认接受「界面比官方少几条，而且不解释」。实测正是这条
+            //     捷径造成「官方 46 条、界面 45 条、用户查不出为什么」。
             //   - RSSHub 有结果但用户已「B站授权」→ 也要试。早期实现在这里
             //     「RSSHub 有返回就跳过官方」，导致用户授权了也永远只能看到
-            //     RSSHub 给的半截列表（官方 46 条 → 界面只列 34 条），授权形同虚设；
-            //   - RSSHub 有结果且没登录态 → 跳过。匿名请求几乎必被 412 拦，多打一次
-            //     只会给监控轮次白白增加一次风控暴露。
-            let try_official = rsshub_ids.is_empty() || self.has_login_cookie();
+            //     RSSHub 给的半截列表（官方 46 条 → 界面只列 34 条），授权形同虚设。
+            // 只有「按需取最近 N 条」这种轻量请求（例如监控轮次只取最近一屏）
+            // 才允许在 RSSHub 够用时省掉这次请求。
+            let try_official =
+                rsshub_ids.is_empty() || count == 0 || self.has_login_cookie();
             let (official_videos, official_err) = if try_official {
                 self.upload_ids_official(&mid, count).await
             } else {
-                tracing::debug!("B站 RSSHub 已返回结果且无登录态 Cookie，跳过官方接口");
+                tracing::debug!("B站按需取最近 {count} 条且 RSSHub 已返回结果，跳过官方接口");
                 (Vec::new(), String::new())
             };
             if official_videos.is_empty() {
@@ -813,6 +922,11 @@ impl BilibiliAdapter {
         //   buvid3+buvid4+b_lsid  → -403 访问权限不足（风控已过，仅差登录）
         // 补齐指纹能让错误提示准确区分“风控”与“需登录”，不再误导用户。
         let cookie = self.upload_list_cookie_with_fingerprint().await;
+        // 记下这次到底有没有带上登录态：同为 -403，原因完全不同，提示也必须不同。
+        self.last_official_had_login.store(
+            cookie_header_has_login(&cookie),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             reqwest::header::REFERER,
@@ -844,6 +958,7 @@ impl BilibiliAdapter {
             let signed = match self.wbi_query(mid, page_size, page).await {
                 Ok(q) => q,
                 Err(e) => {
+                    self.note_official_code(-1001);
                     if reason.is_empty() {
                         reason = format!("官方接口签名失败: {e:#}");
                     }
@@ -943,6 +1058,30 @@ impl BilibiliAdapter {
         )
     }
 
+    /// 把 Cookie 文件复制到 `<run>/ytdlp_cookies/` 下再交给 yt-dlp。
+    ///
+    /// yt-dlp 会把自己维护的 cookie jar 写回 `--cookies` 指向的文件。若直接
+    /// 指向「B站授权」导出的那份，一次匿名 buvid 刷新就会把用户登录得到的
+    /// SESSDATA 覆盖掉，表现是「设置页明明授权过，列历史还是匿名」且无声无息。
+    /// 复制失败时退回原路径：宁可冒被覆盖的风险，也不能让这次请求没 Cookie。
+    fn ytdlp_cookie_copy(&self, src: &std::path::Path) -> std::path::PathBuf {
+        let Some(name) = src.file_name() else {
+            return src.to_path_buf();
+        };
+        let dir = crate::paths::run_dir(&self.project_dir).join("ytdlp_cookies");
+        if std::fs::create_dir_all(&dir).is_err() {
+            return src.to_path_buf();
+        }
+        let dst = dir.join(name);
+        match std::fs::copy(src, &dst) {
+            Ok(_) => dst,
+            Err(e) => {
+                tracing::warn!("复制 yt-dlp Cookie 副本失败（继续使用原文件）: {e:#}");
+                src.to_path_buf()
+            }
+        }
+    }
+
     async fn upload_ids_ytdlp(&self, mid: &str, count: u32) -> (Vec<String>, String) {
         // 与旧 Python 一致：优先用户配置 Cookie，其次桌面端浏览器授权 Cookie，
         // 再补匿名 buvid 文件；全部没有时才裸请求一次。Cookie 一律转成
@@ -970,6 +1109,12 @@ impl BilibiliAdapter {
         // ManagedChild 统一回收进程组，不会让 412/网络卡顿无限拖住监控轮次。
         // 两次尝试之间加退避，避免风控/限流时立即连打同一出口加重 412。
         for cookie_file in cookie_options {
+            // yt-dlp 会把自己维护的 cookie jar **写回** `--cookies` 指向的文件
+            // （文件头会变成 "generated by yt-dlp. Do not edit."）。若直接指向
+            // 「B站授权」导出的那份，一次请求失败或一次匿名 buvid 刷新就可能把
+            // 用户登录得到的 SESSDATA 冲掉——于是「设置页明明授权过，列历史却
+            // 依然匿名」，且完全无声。这里统一只把**副本**交给 yt-dlp。
+            let cookie_file = cookie_file.map(|p| self.ytdlp_cookie_copy(&p));
             let label = cookie_file
                 .as_deref()
                 .map(|p| {
@@ -2693,6 +2838,63 @@ mod tests {
         // 完全无原因：给出通用提示，不崩溃。
         let empty = upload_list_failure_message("", "", "");
         assert!(empty.contains("三个兜底均未返回数据"), "{empty}");
+    }
+
+    #[test]
+    fn authoritative_hint_translates_official_failure_codes() {
+        // 成功：官方接口没失败，不该给用户任何提示。
+        let ok = BilibiliAdapter::default();
+        assert_eq!(ok.authoritative_hint(), None);
+
+        // -403 是「官方 46 条、界面 45 条」在这台机器上的真实原因：
+        // 风控已过、只差登录态 → 提示必须明确指向「B站授权」这个动作，
+        // 否则用户看到「少一条」也无从下手。
+        let login = BilibiliAdapter::default();
+        login.note_official_code(-403);
+        let hint = login.authoritative_hint().expect("-403 必须给出提示");
+        assert!(hint.contains("B站授权"), "{hint}");
+
+        // 已经带上登录态却仍被 -403：绝不能再叫用户「去登录一次」——
+        // 「我明明登录过」正是这样被反复误导出来的。
+        let logged_in = BilibiliAdapter::default();
+        logged_in.note_official_code(-403);
+        logged_in
+            .last_official_had_login
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let logged_hint = logged_in.authoritative_hint().unwrap();
+        assert_ne!(logged_hint, hint);
+        assert!(!logged_hint.contains("请到设置页"), "{logged_hint}");
+        assert!(logged_hint.contains("限流"), "{logged_hint}");
+
+        // -352 / -799 / HTTP 层 / 网络层各自给出不同的话，不能被混成一句，
+        // 否则用户按错的建议去操作（例如明明是限流却去登录）。
+        let risk = BilibiliAdapter::default();
+        risk.note_official_code(-352);
+        let risk_hint = risk.authoritative_hint().unwrap();
+        assert!(risk_hint.contains("风控"), "{risk_hint}");
+        assert_ne!(risk_hint, hint);
+
+        let limited = BilibiliAdapter::default();
+        limited.note_official_code(-799);
+        assert!(limited.authoritative_hint().unwrap().contains("频繁"));
+
+        let http = BilibiliAdapter::default();
+        http.note_official_code(-1000);
+        assert!(http.authoritative_hint().unwrap().contains("412"));
+
+        let net = BilibiliAdapter::default();
+        net.note_official_code(-1001);
+        assert!(net.authoritative_hint().unwrap().contains("网络"));
+
+        // 未收录的业务码也要带上码本身和可行动作，不能返回空串。
+        let other = BilibiliAdapter::default();
+        other.note_official_code(-509);
+        let other_hint = other.authoritative_hint().unwrap();
+        assert!(other_hint.contains("-509"), "{other_hint}");
+
+        // 成功一次之后旧失败码必须被清掉，否则界面上会一直挂着过期提示。
+        other.note_official_code(0);
+        assert_eq!(other.authoritative_hint(), None);
     }
 
     #[test]

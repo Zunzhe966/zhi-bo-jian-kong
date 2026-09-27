@@ -831,6 +831,27 @@ app.whenReady().then(async () => {
   registerLocalFileProtocol()
   createTray()
 
+  // ---------- B站登录态：把浏览器分区里的 Cookie 静默同步成后台程序读的文件 ----------
+  // 纯本地搬运：不联网、不开窗口、不需要用户再点一次授权。
+  //
+  // 这一步是 2026-09-27 事故的根治：用户 09-24 登录成功后，登录态只存在
+  // Electron 分区里，从没被导出成 daemon 读的 `<run>/bilibili_browser_cookies.txt`
+  // ——而且授权文件的落点跟着「产物根目录」走，产物根一改（`~/Documents/尊者产物`
+  // → `/Volumes/A区/尊者产物`）凭据就被甩在旧目录。两者叠加的后果是「我明明登录过，
+  // 界面还是 45 条」，且界面上看不出任何异常。
+  // 每次启动同步一次，让浏览器分区成为唯一事实来源，落点/覆写/重登都能自愈。
+  try {
+    const { exportSessionCookies } = require('./bili-cookie.cjs')
+    const runDir = runDirResolved()
+    process.env.ZUNZHE_RUN_DIR = runDir
+    const outFile = path.join(runDir, 'bilibili_browser_cookies.txt')
+    const r = await exportSessionCookies(app, outFile)
+    if (r.ok) console.log(`[B站授权] 已从浏览器会话同步 ${r.count} 项登录状态 → ${r.file}`)
+    else console.log('[B站授权] 浏览器会话里没有 B站 Cookie（尚未授权过），跳过同步')
+  } catch (e) {
+    console.warn('[B站授权] 同步登录状态失败:', e && e.message)
+  }
+
   // ---------- 安全加固：IPC 入参校验（纵深防御） ----------
   // renderer 仅加载本地打包页面，但一旦被 XSS/恶意内容污染，未校验的
   // open-external / read-text / open-path 可被滥用为任意 URL 打开、
