@@ -110,9 +110,52 @@ fn rsshub_candidates(configured: &str, mid: &str) -> Vec<String> {
         .collect()
 }
 
+/// JS `encodeURIComponent` 的 Rust 等价实现。
+///
+/// B站的 `w_rid` 是对**已 URL 编码**的查询串求 MD5，而且真正发出去的请求必须
+/// 是同一份编码后的串。`dm_img_*` 这类风控参数的值是 JSON，含 `{` `"` `[` `]`
+/// 等字符，不编码服务端会直接判成非法请求。
+fn encode_uri_component(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.as_bytes() {
+        let b = *byte;
+        let unreserved = b.is_ascii_alphanumeric()
+            || matches!(b, b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')');
+        if unreserved {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// 网页端 `x/space/wbi/arc/search` 一起发出的本地化头（参与 w_rid 签名）。
+const X_BILI_LOCALE_JSON: &str =
+    "{\"c_locale\":{\"language\":\"zh\",\"script\":\"Hans\"},\"always_translate\":false}";
+/// 网页端 `x/space/wbi/arc/search` 一起发出的设备头（参与 w_rid 签名）。
+const X_BILI_DEVICE_REQ_JSON: &str =
+    "{\"platform\":\"web\",\"device\":\"pc\",\"spmid\":\"333.1387\",\"mobi_app\":\"web_cn\"}";
+/// 风险控制参数：鼠标轨迹。网页端由 JS 采集，这里给通用占位值——
+/// 服务端主要校验「有没有参与签名」，不校验轨迹内容。
+const DM_IMG_LIST: &str = "[{\"x\":0,\"y\":0,\"z\":0,\"timestamp\":1,\"k\":1,\"type\":1}]";
+/// 风险控制参数：WebGL 渲染器信息（base64）。
+const DM_IMG_STR: &str = "V2ViR0wgMS4wIChPcGVuR0wgRVMgMi4wIENocm9taXVtKQ";
+/// 风险控制参数：显卡/渲染器描述（base64）。
+const DM_COVER_IMG_STR: &str = "QU5HTEUgKEFwcGxlLCBBTkdMRSBNZXRhbCBSZW5kZXJlcjogQXBwbGUgTTEsIFVuc3BlY2lmaWVkIFZlcnNpb24pR29vZ2xlIEluYy4gKEFwcGxl";
+/// 风险控制参数：页面交互采样。
+const DM_IMG_INTER: &str = "{\"ds\":[],\"wh\":[0,0,0],\"of\":[0,0,0]}";
+
 /// 用 B 站 WBI 公钥和投稿列表参数生成签名查询串。
 ///
-/// 纯函数便于单测；排序、拼参、`w_rid` 均按官方 WBI 规则执行。
+/// 纯函数便于单测；排序、URL 编码、拼参、`w_rid` 均按官方 WBI 规则执行。
+///
+/// 参数表必须与网页端 `x/space/wbi/arc/search` 保持一致：B站把整串参与
+/// `w_rid` 签名，少一个都会被判成 `code=-352`「风控校验失败」。尤其是
+/// `dm_img_list` / `dm_img_str` / `dm_cover_img_str` / `dm_img_inter` 这四个
+/// 由网页端 JS 采集的风险控制字段——早期实现漏了它们，官方投稿接口永远
+/// 打不通，「列出主播历史」只能退回 RSSHub/yt-dlp 的半截列表，于是官方
+/// 46 条只列出 45 条，用户怎么点都补不上那一条。
 fn build_wbi_query(
     img_key: &str,
     sub_key: &str,
@@ -121,19 +164,30 @@ fn build_wbi_query(
     page: u32,
     wts: u64,
 ) -> String {
-    let mut params = [
-        ("mid".to_string(), mid.to_string()),
-        ("ps".to_string(), count.to_string()),
-        ("pn".to_string(), page.to_string()),
-        ("order".to_string(), "pubdate".to_string()),
-        ("platform".to_string(), "web".to_string()),
-        ("web_location".to_string(), "1550101".to_string()),
-        ("wts".to_string(), wts.to_string()),
+    let mut params = vec![
+        ("mid", mid.to_string()),
+        ("ps", count.to_string()),
+        ("pn", page.to_string()),
+        ("tid", "0".to_string()),
+        ("special_type", String::new()),
+        ("order", "pubdate".to_string()),
+        ("index", "0".to_string()),
+        ("keyword", String::new()),
+        ("order_avoided", "true".to_string()),
+        ("platform", "web".to_string()),
+        ("web_location", "333.1387".to_string()),
+        ("x-bili-locale-json", X_BILI_LOCALE_JSON.to_string()),
+        ("x-bili-device-req-json", X_BILI_DEVICE_REQ_JSON.to_string()),
+        ("dm_img_list", DM_IMG_LIST.to_string()),
+        ("dm_img_str", DM_IMG_STR.to_string()),
+        ("dm_cover_img_str", DM_COVER_IMG_STR.to_string()),
+        ("dm_img_inter", DM_IMG_INTER.to_string()),
+        ("wts", wts.to_string()),
     ];
-    params.sort();
+    params.sort_by(|a, b| a.0.cmp(b.0));
     let query = params
         .iter()
-        .map(|(k, v)| format!("{k}={v}"))
+        .map(|(k, v)| format!("{}={}", encode_uri_component(k), encode_uri_component(v)))
         .collect::<Vec<_>>()
         .join("&");
     let mixin = mixin_key(img_key, sub_key);
@@ -247,14 +301,46 @@ pub struct BilibiliAdapter {
     expected_total: std::sync::atomic::AtomicU32,
 }
 
+/// 请求 B站时使用的桌面 Chrome User-Agent。
+///
+/// 必须是**完整**的 UA。早期这里只写了
+/// `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36`，
+/// 缺掉 `(KHTML, like Gecko) Chrome/… Safari/537.36` 这一段——这不是一个合法
+/// 的浏览器 UA，B站会直接判定成爬虫并返回 412 风控。后果很隐蔽：官方投稿
+/// 接口永远打不通，「列出主播历史」只能退回 RSSHub 的半截列表，于是官方
+/// 46 条只列出 45 条，用户怎么点都补不上那一条。
+const DESKTOP_CHROME_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
+
+/// B站相关请求统一使用的中文语言偏好（真实浏览器都会带，缺了更像爬虫）。
+const ZH_ACCEPT_LANGUAGE: &str = "zh-CN,zh;q=0.9,en;q=0.8";
+
+/// B站相关请求统一的默认头：UA + Accept-Language。
+fn bilibili_default_headers() -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Ok(v) = reqwest::header::HeaderValue::from_str(DESKTOP_CHROME_UA) {
+        headers.insert(reqwest::header::USER_AGENT, v);
+    }
+    if let Ok(v) = reqwest::header::HeaderValue::from_str(ZH_ACCEPT_LANGUAGE) {
+        headers.insert(reqwest::header::ACCEPT_LANGUAGE, v);
+    }
+    headers
+}
+
+/// 构造一个带完整浏览器头的 reqwest 客户端。B站接口对 UA/语言头敏感，
+/// 统一从这里出，避免各处再写出残缺的 UA。
+fn browser_client(timeout_secs: u64) -> reqwest::Client {
+    crate::net::client_builder()
+        .default_headers(bilibili_default_headers())
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .build()
+        .unwrap_or_default()
+}
+
 impl Default for BilibiliAdapter {
     fn default() -> Self {
         Self {
-            client: crate::net::client_builder()
-                .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
-                .timeout(std::time::Duration::from_secs(20))
-                .build()
-                .unwrap_or_default(),
+            client: browser_client(20),
             cookie: String::new(),
             project_dir: PathBuf::from("."),
             expected_total: std::sync::atomic::AtomicU32::new(0),
@@ -748,11 +834,12 @@ impl BilibiliAdapter {
         let mut out = Vec::new();
         let mut page = 1u32;
         let mut total = None;
-        // 官方单页最多约 30 条；固定每页请求 50（B站上限），count=0 时
-        // 表示“全部历史视频”，循环直到 total 读完或 50 页护栏。
+        // 官方网页端每页就是 40 条（`ps=40`）；跟着它走最稳，取 50 反而可能
+        // 被服务端当异常参数。count=0 表示“全部历史视频”，循环直到 total 读完
+        // 或 50 页护栏。
         // 分页失败时把已收集的视频交给上层兜底判断，不能把“只拿到半截”
         // 当作完整成功。
-        let page_size = if count == 0 { 50 } else { count };
+        let page_size = if count == 0 { 40 } else { count };
         loop {
             let signed = match self.wbi_query(mid, page_size, page).await {
                 Ok(q) => q,
@@ -1166,11 +1253,7 @@ fn is_bilibili_short_link(url: &str) -> bool {
 
 /// 跟随跳转拿到最终 URL（短链 → 真实地址）。失败返回 None，调用方退回原地址。
 async fn follow_redirect(url: &str) -> Option<String> {
-    let client = crate::net::client_builder()
-        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
-        .timeout(Duration::from_secs(15))
-        .build()
-        .ok()?;
+    let client = browser_client(15);
     let resp = client.get(url).send().await.ok()?;
     Some(resp.url().to_string())
 }
@@ -1250,11 +1333,7 @@ pub struct RssAdapter {
 impl Default for RssAdapter {
     fn default() -> Self {
         Self {
-            client: crate::net::client_builder()
-                .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
-                .timeout(std::time::Duration::from_secs(20))
-                .build()
-                .unwrap_or_default(),
+            client: browser_client(20),
         }
     }
 }
@@ -2451,21 +2530,69 @@ mod tests {
     }
 
     #[test]
-    fn wbi_query_sorts_params_and_appends_w_rid() {
-        // 固定时间戳和图片 key，验证签名串与官方 WBI 拼接规则一致。
+    fn wbi_query_matches_web_client_parameter_set() {
+        // 参数表必须与网页端 `x/space/wbi/arc/search` 一致：B站把整串参与
+        // w_rid 签名，缺一个都会被判成 code=-352「风控校验失败」。
+        // 特别是 dm_img_* 这四个风险控制字段，早期实现漏了它们，官方接口
+        // 永远打不通，「列出主播历史」只能退回半截列表（官方 46 → 45）。
         let query = build_wbi_query(
             "1234567890abcdefghijklmnopqrstuvwxyz",
             "ABCDEFGHIJKLMNOPQRSTUVWXYZ01",
             "946974",
-            10,
+            40,
             1,
             1786550400,
         );
+        for key in [
+            "dm_cover_img_str=",
+            "dm_img_inter=",
+            "dm_img_list=",
+            "dm_img_str=",
+            "index=0",
+            "keyword=",
+            "mid=946974",
+            "order=pubdate",
+            "order_avoided=true",
+            "platform=web",
+            "pn=1",
+            "ps=40",
+            "special_type=",
+            "tid=0",
+            "web_location=333.1387",
+            "wts=1786550400",
+            "x-bili-device-req-json=",
+            "x-bili-locale-json=",
+        ] {
+            assert!(query.contains(key), "缺少 {key}：{query}");
+        }
+        assert!(query.contains("&w_rid="), "{query}");
+        // JSON 值必须整体 encodeURIComponent 后再签名，否则请求本身非法。
+        assert!(query.contains("%7B%22platform%22"), "JSON 未编码：{query}");
+        assert!(!query.contains('{'), "不应残留未编码的大括号：{query}");
+        // 参数按 key 升序拼接（末尾的 w_rid 是签名结果，不参与排序）。
+        let keys: Vec<&str> = query
+            .split('&')
+            .filter_map(|kv| kv.split('=').next())
+            .filter(|k| *k != "w_rid")
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted, "参数必须按 key 升序");
+        // 固定输入 → 固定签名，防止编码/拼接规则被改坏。
         assert_eq!(
             query,
-            "mid=946974&order=pubdate&platform=web&pn=1&ps=10&web_location=1550101&wts=1786550400&w_rid=1b8f0e19353b02df0a82591de339a31f"
+            "dm_cover_img_str=QU5HTEUgKEFwcGxlLCBBTkdMRSBNZXRhbCBSZW5kZXJlcjogQXBwbGUgTTEsIFVuc3BlY2lmaWVkIFZlcnNpb24pR29vZ2xlIEluYy4gKEFwcGxl&dm_img_inter=%7B%22ds%22%3A%5B%5D%2C%22wh%22%3A%5B0%2C0%2C0%5D%2C%22of%22%3A%5B0%2C0%2C0%5D%7D&dm_img_list=%5B%7B%22x%22%3A0%2C%22y%22%3A0%2C%22z%22%3A0%2C%22timestamp%22%3A1%2C%22k%22%3A1%2C%22type%22%3A1%7D%5D&dm_img_str=V2ViR0wgMS4wIChPcGVuR0wgRVMgMi4wIENocm9taXVtKQ&index=0&keyword=&mid=946974&order=pubdate&order_avoided=true&platform=web&pn=1&ps=40&special_type=&tid=0&web_location=333.1387&wts=1786550400&x-bili-device-req-json=%7B%22platform%22%3A%22web%22%2C%22device%22%3A%22pc%22%2C%22spmid%22%3A%22333.1387%22%2C%22mobi_app%22%3A%22web_cn%22%7D&x-bili-locale-json=%7B%22c_locale%22%3A%7B%22language%22%3A%22zh%22%2C%22script%22%3A%22Hans%22%7D%2C%22always_translate%22%3Afalse%7D&w_rid=4c4e9ed6108a92589e6e26d9810558c4"
         );
-        assert!(query.contains("&w_rid="));
+    }
+
+    #[test]
+    fn encode_uri_component_matches_javascript() {
+        // 与 JS encodeURIComponent 的保留字符集一致（含 `!~*'()` 不编码）。
+        assert_eq!(encode_uri_component("a-b_c.d!e~f*g'h(i)"), "a-b_c.d!e~f*g'h(i)");
+        assert_eq!(encode_uri_component("{\"a\":1}"), "%7B%22a%22%3A1%7D");
+        assert_eq!(encode_uri_component("中"), "%E4%B8%AD");
+        assert_eq!(encode_uri_component("a b"), "a%20b");
+        assert_eq!(encode_uri_component("/+="), "%2F%2B%3D");
     }
 
     #[test]
