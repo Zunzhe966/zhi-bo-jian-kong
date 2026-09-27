@@ -264,6 +264,35 @@ fn should_fetch_more(count: u32, fetched: usize, total: Option<u32>, page: u32) 
     }
 }
 
+/// 解析 yt-dlp `--print "%(id)s\t%(playlist_count)s"` 的 stdout。
+///
+/// 返回 `(BV 号列表, 播放列表总数)`：
+/// - 每行形如 `<bv号>\t<总数>`，`playlist_count` 不可用时 yt-dlp 会打印 `NA`；
+/// - 总数取所有行里的最大值（每行都重复同一个 `playlist_count`，取最大对
+///   单条异常值也更稳）；全部缺失/不可解析时为 `None`，绝不能瞎猜成 0；
+/// - `count > 0`（只取最近 N 条）时按 `count` 截断，与官方路径语义一致。
+///
+/// 抽成纯函数是为了可测：这个总数直接决定界面会不会弹「列表可能不完整」，
+/// 解析错了就是又一次假警报或又一次静默漏条。
+fn parse_ytdlp_flat_playlist(text: &str, count: u32) -> (Vec<String>, Option<u32>) {
+    let mut total: Option<u32> = None;
+    let mut ids: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let mut parts = line.trim().split('\t');
+        let id = parts.next().unwrap_or("").trim();
+        if let Some(n) = parts.next().and_then(|s| s.trim().parse::<u32>().ok()) {
+            total = Some(total.map_or(n, |cur: u32| cur.max(n)));
+        }
+        if is_plausible_bvid(id) {
+            ids.push(id.to_string());
+        }
+    }
+    if count > 0 {
+        ids.truncate(count as usize);
+    }
+    (ids, total)
+}
+
 pub trait Platform: Send + Sync {
     fn name(&self) -> &'static str;
 
@@ -1133,7 +1162,11 @@ impl BilibiliAdapter {
                 } else {
                     cmd.arg("--flat-playlist");
                 }
-                cmd.args(["--print", "%(id)s"])
+                // 让 yt-dlp 顺带报出播放列表总数（`playlist_count`，实测这台机器
+                // 上就是 46，与官方 `page.count` 一致）。这是官方接口打不通时
+                // 唯一能拿到的权威总数——有了它才敢说「列表是全的」，而不是
+                // 一边明明列全了 46 条、一边给用户弹「本次列表可能不完整」的假警报。
+                cmd.args(["--print", "%(id)s\t%(playlist_count)s"])
                     .arg(format!("https://space.bilibili.com/{mid}/video"));
                 // 出站分流：按目标 URL 决定直连或走用户配置的出站代理。
                 cmd.args(
@@ -1154,17 +1187,22 @@ impl BilibiliAdapter {
                     break;
                 };
                 let text = String::from_utf8_lossy(&out.stdout);
-                let ids: Vec<String> = text
-                    .lines()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| is_plausible_bvid(s))
-                    .take(if count == 0 {
-                        usize::MAX
-                    } else {
-                        count as usize
-                    })
-                    .collect();
+                let (ids, total) = parse_ytdlp_flat_playlist(&text, count);
                 if !ids.is_empty() {
+                    // 官方接口没给出总数时用兜底源的总数补上，让「总数 vs 实取」
+                    // 的比对在任何路径下都成立。compare_exchange(0 → t) 保证不会
+                    // 覆盖官方给出的、更权威的那个总数。
+                    if count == 0
+                        && let Some(t) = total
+                        && t > 0
+                    {
+                        let _ = self.expected_total.compare_exchange(
+                            0,
+                            t,
+                            std::sync::atomic::Ordering::Relaxed,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
                     // 之前尝试可能被 412 挡掉，但只要本次 stdout 有完整 BV 列表
                     // 就按成功处理；必须清空旧错误，否则顶层日志会把成功误报成失败。
                     return (ids, String::new());
@@ -2764,6 +2802,36 @@ mod tests {
         );
         assert!(query.contains("pn=2"), "{query}");
         assert!(query.contains("ps=30"), "{query}");
+    }
+
+    #[test]
+    fn parses_ytdlp_flat_playlist_ids_and_total() {
+        // 正常：每行都带同一个 playlist_count（实测这台机器上就是 46）。
+        let text = "BV1abcdefghi\t46\nBV1abcdefghj\t46\nBV1abcdefghk\t46\n";
+        let (ids, total) = parse_ytdlp_flat_playlist(text, 0);
+        assert_eq!(ids, vec!["BV1abcdefghi", "BV1abcdefghj", "BV1abcdefghk"]);
+        assert_eq!(total, Some(46));
+
+        // count > 0（只取最近 N 条）时按 count 截断，但总数仍是完整总数。
+        let (ids, total) = parse_ytdlp_flat_playlist(text, 2);
+        assert_eq!(ids.len(), 2);
+        assert_eq!(total, Some(46));
+
+        // playlist_count 不可用（yt-dlp 打印 NA）→ 总数未知。
+        // 绝不能当成 0：那会比对出「共 0 条、列出 2 条」这种荒谬结论。
+        let (ids, total) = parse_ytdlp_flat_playlist("BV1abcdefghi\tNA\nBV1abcdefghj\tNA\n", 0);
+        assert_eq!(ids.len(), 2);
+        assert_eq!(total, None);
+
+        // 老版本 yt-dlp 只打印裸 id 时也要能解析，总数保持未知。
+        let (ids, total) = parse_ytdlp_flat_playlist("BV1abcdefghi\nBV1abcdefghj\n", 0);
+        assert_eq!(ids.len(), 2);
+        assert_eq!(total, None);
+
+        // 空输出：既无 id 也无总数，调用方据此换下一组兜底。
+        let (ids, total) = parse_ytdlp_flat_playlist("", 0);
+        assert!(ids.is_empty());
+        assert_eq!(total, None);
     }
 
     #[test]

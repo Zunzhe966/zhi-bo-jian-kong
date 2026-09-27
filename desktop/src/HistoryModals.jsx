@@ -47,25 +47,37 @@ export default function HistoryModals({
         <p style={{ marginBottom: 12, color: '#666' }}>
           勾选想要的视频，点「下载选中」批量保存到 <b>{paths.video_root || paths.media_root || "产物根目录"}/{blogger?.name || "博主名"}/批量下载/</b> 并自动转写复盘。
         </p>
-        {Number(expectedTotal) > videos.length ? (
-          <p style={{ marginBottom: 12, color: '#d46b08' }}>
-            官方共 {expectedTotal} 条，本次列出 {videos.length} 条，差 {Number(expectedTotal) - videos.length} 条。
-            {hint
-              ? '原因见下方提示。'
-              : '少的这些是 B站自己没返回的（已下架 / 设为仅自己可见 / 审核中 / 联合投稿），不是文件丢了。'}
-          </p>
-        ) : null}
-        {hint ? (
-          <p style={{ marginBottom: 12, color: '#d46b08' }}>
-            {hint}
-            {hint.includes('授权') ? (
-              <>
-                {' '}
-                <Button size="small" onClick={onBiliLogin}>去 B站 授权</Button>
-              </>
-            ) : null}
-          </p>
-        ) : null}
+        {(() => {
+          // 只有「确实短了」或「连官方总数都没拿到」才提示。
+          // 条数已经齐全时一个字都不说——列表本来就是对的，再弹一句
+          // 「可能不完整」是用假警报盖住真结果，用户会以为又出问题了。
+          const total = Number(expectedTotal) || 0
+          const shortfall = total > videos.length
+          const showHint = !!hint && (total === 0 || shortfall)
+          return (
+            <>
+              {shortfall ? (
+                <p style={{ marginBottom: 12, color: '#d46b08' }}>
+                  官方共 {total} 条，本次列出 {videos.length} 条，差 {total - videos.length} 条。
+                  {hint
+                    ? '原因见下方提示。'
+                    : '少的这些是 B站自己没返回的（已下架 / 设为仅自己可见 / 审核中 / 联合投稿），不是文件丢了。'}
+                </p>
+              ) : null}
+              {showHint ? (
+                <p style={{ marginBottom: 12, color: '#d46b08' }}>
+                  {hint}
+                  {hint.includes('授权') ? (
+                    <>
+                      {' '}
+                      <Button size="small" onClick={onBiliLogin}>去 B站 授权</Button>
+                    </>
+                  ) : null}
+                </p>
+              ) : null}
+            </>
+          )
+        })()}
         <Table
           rowKey="key"
           loading={loading}

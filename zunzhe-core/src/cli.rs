@@ -719,10 +719,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
             match shortfall_note {
                 Some(note) => notes.push(note),
-                // 官方接口这次没成功（拿不到总数、比不出差额），但失败原因照样
-                // 要让用户看到：兜底源给的半截列表和完整列表在界面上长得一模一样，
-                // 不说就等于让用户以为「本来就只有这么多」。
-                None if !outcome.from_cache => {
+                // 拿到总数且实取条数不少 → 列表就是全的，安静通过。
+                //
+                // 旧实现在这里「官方接口一失败就提示」，结果用户明明看到正确的
+                // 46 条，界面还弹一句「本次列表可能不完整」——用假警报盖住了
+                // 真结果，比不说更糟。只有**连总数都拿不到**（官方接口与兜底源
+                // 都没报出条数，说明列表只来自 RSSHub 这类无法计数的源）才提醒，
+                // 因为那种情况确实可能被截断。
+                None if !outcome.from_cache && expected_total.is_none() => {
                     if let Some(hint) = &authoritative_hint {
                         notes.push(format!("本次列表可能不完整：{hint}"));
                     }
